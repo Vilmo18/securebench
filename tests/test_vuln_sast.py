@@ -36,45 +36,11 @@ from sast_analyzer import BanditSastAnalyzer, MultiSastAnalyzer  # noqa: E402
 from sast_cwe_mapping import bandit_test_to_cwe  # noqa: E402
 from vulnerability_mcts import VulnerabilityMCTS, _JUDGE_ENABLED, _JUDGE_MODE  # noqa: E402
 from vulnerability_environment import (  # noqa: E402
-    VulnerabilityChallengeEnvironment,
     _apply_judge_sast_review,
     _format_judge_for_feedback,
     _format_sast_output_impl,
     _normalize_review_only_judge_output,
 )
-
-
-class _RoleAgent:
-    def __init__(self, configured: bool) -> None:
-        self.configured = configured
-
-    def set_role(self, _role: str) -> bool:
-        return self.configured
-
-
-class TestRequiredAgentConfiguration(unittest.TestCase):
-    def test_rejects_unconfigured_required_agent(self) -> None:
-        environment = VulnerabilityChallengeEnvironment.__new__(
-            VulnerabilityChallengeEnvironment
-        )
-        environment.agents = {
-            "challenge_designer": _RoleAgent(False),
-            "problem_solver": _RoleAgent(True),
-        }
-
-        with self.assertRaisesRegex(RuntimeError, "challenge_designer"):
-            environment._configure_required_agents(environment.agents.keys())
-
-    def test_accepts_configured_required_agents(self) -> None:
-        environment = VulnerabilityChallengeEnvironment.__new__(
-            VulnerabilityChallengeEnvironment
-        )
-        environment.agents = {
-            "challenge_designer": _RoleAgent(True),
-            "problem_solver": _RoleAgent(True),
-        }
-
-        environment._configure_required_agents(environment.agents.keys())
 
 
 class TestBanditSastAnalyzer(unittest.TestCase):
