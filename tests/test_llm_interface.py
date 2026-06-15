@@ -59,7 +59,7 @@ class TestLLMInterface(unittest.TestCase):
 
             def get_llm_config(self, _role):
                 return {
-                    "model_name": "openai/gpt-oss-20b:fastest",
+                    "model_name": "openai/gpt-oss-20b:nscale",
                     "provider": "huggingface",
                     "params": {},
                     "local": False,
@@ -76,6 +76,14 @@ class TestLLMInterface(unittest.TestCase):
         with patch("llm_interface.ChatOpenAI") as chat_openai:
             self.assertFalse(interface.set_role("challenge_designer"))
             chat_openai.assert_not_called()
+
+    def test_local_huggingface_provider_is_not_openai_compatible_api(self) -> None:
+        interface = LLMInterface.__new__(LLMInterface)
+
+        for provider in ("local-hf", "hf-local", "huggingface-local", "transformers"):
+            self.assertTrue(interface._is_local_hf_provider({"provider": provider}))
+
+        self.assertFalse(interface._is_local_hf_provider({"provider": "huggingface"}))
 
     def test_interact_falls_back_to_ainvoke_when_sync_client_is_unavailable(self) -> None:
         interface = LLMInterface.__new__(LLMInterface)

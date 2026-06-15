@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import threading
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.callbacks import StdOutCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -14,6 +14,142 @@ from prompt_manager import PromptManager
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_HF_MODEL_CACHE: Dict[str, Any] = {}
+_HF_MODEL_CACHE_LOCK = threading.Lock()
+
+
+class LocalHuggingFaceChatModel:
+    """Minimal LangChain-like chat wrapper for local Transformers causal LMs."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        params: Optional[Dict[str, Any]] = None,
+        hf_local: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.model_name = model_name
+        self.params = dict(params or {})
+        self.hf_local = dict(hf_local or {})
+        self.tokenizer, self.model = self._load_model()
+
+    def _load_model(self):
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except Exception as exc:
+            raise RuntimeError(
+                "Local Hugging Face backend requires torch and transformers. "
+                "Install them with: pip install torch transformers accelerate"
+            ) from exc
+
+        cache_key = json.dumps(
+            {
+                "model_name": self.model_name,
+                "device_map": self.hf_local.get("device_map", "auto"),
+                "torch_dtype": self.hf_local.get("torch_dtype", "auto"),
+                "trust_remote_code": bool(self.hf_local.get("trust_remote_code", False)),
+                "local_files_only": bool(self.hf_local.get("local_files_only", False)),
+            },
+            sort_keys=True,
+        )
+        with _HF_MODEL_CACHE_LOCK:
+            cached = _HF_MODEL_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
+            torch_dtype = self.hf_local.get("torch_dtype", "auto")
+            if isinstance(torch_dtype, str) and torch_dtype != "auto":
+                torch_dtype = getattr(torch, torch_dtype)
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                trust_remote_code=bool(self.hf_local.get("trust_remote_code", False)),
+                local_files_only=bool(self.hf_local.get("local_files_only", False)),
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                device_map=self.hf_local.get("device_map", "auto"),
+                dtype=torch_dtype,
+                trust_remote_code=bool(self.hf_local.get("trust_remote_code", False)),
+                local_files_only=bool(self.hf_local.get("local_files_only", False)),
+            )
+            model.eval()
+            _HF_MODEL_CACHE[cache_key] = (tokenizer, model)
+            return tokenizer, model
+
+    def _message_to_dict(self, message) -> Dict[str, str]:
+        if isinstance(message, SystemMessage):
+            role = "system"
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+        else:
+            role = "user"
+        return {"role": role, "content": str(message.content or "")}
+
+    def _generation_kwargs(self) -> Dict[str, Any]:
+        allowed = {
+            "do_sample",
+            "temperature",
+            "top_p",
+            "top_k",
+            "repetition_penalty",
+            "num_beams",
+        }
+        out = {k: v for k, v in self.params.items() if k in allowed}
+        max_new_tokens = self.params.get("max_new_tokens", self.params.get("max_tokens", 1024))
+        out["max_new_tokens"] = int(max_new_tokens)
+        temperature = float(out.get("temperature", 0.0) or 0.0)
+        if temperature <= 0.0:
+            out.pop("temperature", None)
+            out["do_sample"] = False
+        elif "do_sample" not in out:
+            out["do_sample"] = True
+        return out
+
+    def invoke(self, messages):
+        import torch
+
+        chat_messages = [self._message_to_dict(message) for message in messages]
+        try:
+            input_ids = self.tokenizer.apply_chat_template(
+                chat_messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            attention_mask = torch.ones_like(input_ids)
+        except Exception:
+            prompt = "\n".join(
+                f"{item['role'].upper()}: {item['content']}" for item in chat_messages
+            )
+            prompt = prompt + "\nASSISTANT:"
+            encoded = self.tokenizer(prompt, return_tensors="pt")
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded.get("attention_mask")
+        device = next(self.model.parameters()).device
+        input_ids = input_ids.to(device)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        else:
+            attention_mask = attention_mask.to(device)
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        with torch.inference_mode():
+            generated = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                **self._generation_kwargs(),
+            )
+
+        new_tokens = generated[0][input_ids.shape[-1] :]
+        text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        return AIMessage(content=text)
 
 
 class LLMInterface:
@@ -104,6 +240,15 @@ class LLMInterface:
             return self.api_keys["lamma-chat"], self.api_bases["lamma-chat"]
         return self.api_keys["openai"], self.api_bases["openai"]
 
+    def _is_local_hf_provider(self, llm_config) -> bool:
+        provider = str(llm_config.get("provider", "")).lower()
+        return provider in {
+            "local-hf",
+            "hf-local",
+            "huggingface-local",
+            "transformers",
+        }
+
     def set_role(self, role: str) -> bool:
         """
         Set the current role and configure the LLM accordingly.
@@ -124,9 +269,22 @@ class LLMInterface:
 
         if self.system_prompt and llm_config:
             callbacks = [StdOutCallbackHandler()] if self.verbose else None
+            provider = str(llm_config.get("provider", "")).lower()
+
+            if self._is_local_hf_provider(llm_config):
+                self.llm = LocalHuggingFaceChatModel(
+                    model_name=llm_config["model_name"],
+                    params=llm_config.get("params", {}),
+                    hf_local=llm_config.get("hf_local", {}),
+                )
+                self.conversation_history = []
+                logger.info(
+                    f"Local Hugging Face model '{llm_config['model_name']}' loaded "
+                    f"for role '{role}'."
+                )
+                return True
 
             api_key, api_base = self._resolve_api_credentials(llm_config)
-            provider = str(llm_config.get("provider", "")).lower()
             if provider in {"huggingface", "hf"} and not api_key:
                 logger.error(
                     "HF_TOKEN is required for Hugging Face Inference Providers."

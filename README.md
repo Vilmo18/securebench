@@ -56,18 +56,31 @@ curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 ```
 
 ### Setting up the environment variables
-This migrated copy uses [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers/index) through its OpenAI-compatible chat endpoint. Create a fine-grained Hugging Face token with permission to call Inference Providers.
+This migrated copy supports two Hugging Face model modes:
 
-Add `HF_TOKEN` to the copied `.env`; `.env.example` is a safe reference template:
+- `agent_config_vul.yml`: Hugging Face Inference Providers API.
+- `agent_config_vul_hf_local.yml`: local Hugging Face Transformers model loading, no Ollama and no HF Inference Providers credits.
+
+For the local Hugging Face Transformers mode, `.env` only needs DeepSeek for the judge/analyzer roles:
 
 ```bash
-HF_TOKEN=hf_your_token_here
-HUGGINGFACE_BASE_URL=https://router.huggingface.co/v1
 DEEPSEEK_API_KEY=your_deepseek_api_key
+HF_HOME=~/.cache/huggingface
 ```
 
 ### Selecting the models
-Select models in `agent_config_v7.yml` for benchmark mode and `agent_config_vul.yml` for vulnerability mode. Hugging Face roles must include `provider: huggingface` and use a model ID exposed by the Inference Providers router. The migrated defaults use `openai/gpt-oss-20b:nscale` for design and analysis, and `Qwen/Qwen2.5-Coder-32B-Instruct:nscale` for code generation and repair.
+Select models in `agent_config_v7.yml` for benchmark mode and `agent_config_vul.yml` for vulnerability mode. For a no-Ollama local Hugging Face run, use `agent_config_vul_hf_local.yml`: challenge design, scenario validation, solving, and fixing run locally through Transformers, while `llm_judge` and `pattern_analyzer` still use DeepSeek.
+
+Local Hugging Face Transformers vulnerability mode defaults:
+
+```yaml
+challenge_designer: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
+scenario_validator: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
+problem_solver: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
+security_fixer: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
+llm_judge: deepseek-chat
+pattern_analyzer: deepseek-chat
+```
 
 ### Running the PrismBench Framework
 To run the PrismBench framework, you can use the following command:
@@ -82,6 +95,18 @@ PrismBench also includes a vulnerability benchmarking mode that uses SAST (CodeQ
 ```bash
 pip install -r requirements.txt
 python src/main.py --mode vuln
+```
+
+Local Hugging Face Transformers smoke run:
+
+```bash
+python src/main.py \
+  --mode vuln \
+  --agent-config agent_config_vul_hf_local.yml \
+  --iterations 1 \
+  --max-depth 1 \
+  --stop-after-phase 1 \
+  --run-label hf-local-smoke
 ```
 
 You can customize the CWE concept list in `data/cwe_database.yml` and SAST settings in `configs.yml` (tool + thresholds + CodeQL/Semgrep settings).
