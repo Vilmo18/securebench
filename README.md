@@ -67,7 +67,7 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
 
 ### Selecting the models
-Select models in `agent_config_v7.yml` for benchmark mode and `agent_config_vul.yml` for vulnerability mode. Hugging Face roles must include `provider: huggingface` and use a model ID exposed by the Inference Providers router. The migrated defaults use `openai/gpt-oss-20b:fastest` for design and analysis, and `Qwen/Qwen2.5-Coder-32B-Instruct:fastest` for code generation and repair.
+Select models in `agent_config_v7.yml` for benchmark mode and `agent_config_vul.yml` for vulnerability mode. Hugging Face roles must include `provider: huggingface` and use a model ID exposed by the Inference Providers router. The migrated defaults use `openai/gpt-oss-20b:nscale` for design and analysis, and `Qwen/Qwen2.5-Coder-32B-Instruct:nscale` for code generation and repair.
 
 ### Running the PrismBench Framework
 To run the PrismBench framework, you can use the following command:
