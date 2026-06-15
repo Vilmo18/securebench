@@ -1,0 +1,2535 @@
+{
+  "target_cwes": [
+    "CWE-20",
+    "CWE-78",
+    "CWE-611"
+  ],
+  "problem_statement": "## XML Configuration Importer Attack Surface: Storage & Filesystem\n### Scenario\nA web‑based management console allows privileged users to import a device configuration packaged as an XML file. The uploaded file is stored in a server‑controlled `configs/` directory. After saving, the application parses the XML, extracts a `<script>` element that specifies a command to be executed on the host for applying the configuration, and then runs that command using the system shell. Implement the import handler so that it correctly validates the uploaded file name, safely parses the XML without processing external entities, and executes only allowed commands derived from the XML content. The handler must also ensure that the file is written only inside the `configs/` directory and that any path manipulation attempts are rejected.\n\n### Functional Requirements\n- Accept a file upload named `config_file` via a POST request.\n- Validate the uploaded filename: reject absolute paths, parent‑directory references (`..`), null bytes, and any characters outside the allowed set `[a‑zA‑Z0-9._-]`.\n- Save the file under the server‑controlled `configs/` directory, creating the directory if it does not exist.\n- Parse the saved XML using a secure parser that disables external entity resolution.\n- Extract the text of the `<script>` element. The text must match one of the whitelisted commands: `apply`, `reset`, or `status`.\n- Execute the whitelisted command with the `subprocess.run` API, passing the command name as a single argument (no shell invocation) and capture its output.\n- Return a JSON response containing the command’s stdout and a success flag. If any validation step fails, return a JSON error with an appropriate message and a non‑200 HTTP status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation within a single Python file (approximately 20–80 lines of code).\n- Perform exactly one file‑write operation and one command‑execution operation per request.",
+  "test_cases": "",
+  "solution_code": "import os\nimport re\nimport subprocess\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\nALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\nWHITELISTED_COMMANDS = {'apply', 'reset', 'status'}\nCONFIG_DIR = os.path.abspath('configs/')\n\nclass SecureXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target_element = None\n\n    def start(self, tag, attrs):\n        if tag == 'script':\n            self._target_element = []\n\n    def end(self, tag):\n        if tag == 'script' and self._target_element:\n            return b''.join(self._target_element).decode()\n\n    def data(self, data):\n        if self._target_element is not None:\n            self._target_element.append(data)\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers['Content-Length'])\n        form_data = self.rfile.read(length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = form_data.split(boundary)\n        for part in parts:\n            if b'config_file' in part:\n                filename_bytes = re.search(b'filename=\"(.+?)\"', part)\n                if not filename_bytes:\n                    self.send_error(400, 'Invalid file upload')\n                    return\n\n                filename = filename_bytes.group(1).decode()\n                if not ALLOWED_FILENAME_CHARS.match(filename) or \\\n                   os.path.isabs(filename) or '..' in filename.split(os.sep):\n                    self.send_error(400, 'Invalid filename')\n                    return\n\n                config_path = os.path.join(CONFIG_DIR, filename)\n                if not os.path.exists(CONFIG_DIR):\n                    os.makedirs(CONFIG_DIR)\n\n                content_disposition = part.split(b'\\r\\n\\r\\n')[0]\n                file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n                file_content = part[file_content_start:]\n\n                with open(config_path, 'wb') as f:\n                    f.write(file_content)\n\n                parser = SecureXMLParser()\n                try:\n                    parser.feed(open(config_path, 'rb').read())\n                    command = parser.close().strip()\n                except Exception as e:\n                    self.send_error(500, str(e))\n                    return\n\n                if command not in WHITELISTED_COMMANDS:\n                    self.send_error(400, 'Invalid command')\n                    return\n\n                try:\n                    result = subprocess.run([command], capture_output=True, text=True)\n                    response_content = {\n                        'stdout': result.stdout,\n                        'success': True\n                    }\n                except Exception as e:\n                    response_content = {'error': str(e), 'success': False}\n\n                self.send_response(200 if response_content['success'] else 500)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response_content), 'utf-8'))\n                return\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 57\n   desc: This path depends on a [user-provided value](1).\n   code: with open(config_path, 'wb') as f:\n   judge: The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.\n2. [TP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 6\n   desc: Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 5 from http.server import BaseHTTPRequestHandler, HTTPServer\\n6 from xml.etree.ElementTree import XMLParser\\n7\n   judge: The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import re\\n3 import subprocess\\n4 import json\n   judge: This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 73\n   desc: subprocess call - check for execution of untrusted input.\n   code: 72                 try:\\n73                     result = subprocess.run([command], capture_output=True, text=True)\\n74                     response_content = {\n   judge: The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 73,
+            "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmpq6_rheec.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 77,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 77,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+        "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "code": "                with open(config_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.",
+        "judge_duplicate_of": "codeql:py/path-injection:57",
+        "dedup_test_ids": [
+          "codeql:py/path-injection"
+        ],
+        "dedup_tools": [
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-22"
+        ],
+        "dedup_count": 1
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 3,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import re\n3 import subprocess\n4 import json\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 73,
+        "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "FP",
+        "judge_reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection."
+      }
+    ],
+    "duplicate_findings": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 62,
+        "code": "                    parser.feed(open(config_path, 'rb').read())",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "Same path injection vulnerability as line 57, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+        "judge_duplicate_of": "codeql:py/path-injection:57",
+        "duplicate_of": "codeql:py/path-injection:57"
+      }
+    ],
+    "total_issues_raw": 5,
+    "total_false_positives": 2,
+    "total_duplicates_removed": 1,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 73,
+            "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmpq6_rheec.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 77,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 77,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import re\n3 import subprocess\n4 import json\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+        "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 73,
+        "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "code": "                with open(config_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 62,
+        "code": "                    parser.feed(open(config_path, 'rb').read())",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 5,
+    "severity_breakdown": {
+      "LOW": 3,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.7,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=5, false_pos=2, duplicates=1, review_duplicates=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 57,
+        "verdict": "TP",
+        "reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B405",
+        "line_number": 6,
+        "verdict": "TP",
+        "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 73,
+        "verdict": "FP",
+        "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.7,
+      "security_score": 0.4,
+      "overall_risk": 0.6,
+      "target_cwe_risk": 0.6,
+      "confidence": "HIGH",
+      "summary": "The code has two significant security issues: the path validation is still bypassable (os.sep on Windows), and the XML parser does not actually disable external entities. The command whitelist and subprocess usage are safe. SAST findings are mostly valid with one FP for the subprocess import blacklist.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 57,
+          "verdict": "TP",
+          "reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 62,
+          "verdict": "TP",
+          "reason": "Same path injection vulnerability as line 57, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+          "fix": "",
+          "duplicate_of": "codeql:py/path-injection#57"
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "bandit:B405",
+          "line_number": 6,
+          "verdict": "TP",
+          "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 73,
+          "verdict": "FP",
+          "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 5,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=57 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(config_path, 'wb') as f:\n3. bandit:B405 | line=6 | verdict=TP | CWE-20 | LOW/HIGH\n   code: 5 from http.server import BaseHTTPRequestHandler, HTTPServer\\n6 from xml.etree.ElementTree import XMLParser\\n7\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 57\n   desc: This path depends on a [user-provided value](1).\n   code: with open(config_path, 'wb') as f:\n2. [TP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 6\n   desc: Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 5 from http.server import BaseHTTPRequestHandler, HTTPServer\\n6 from xml.etree.ElementTree import XMLParser\\n7\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## XML Configuration Importer Attack Surface: Storage & Filesystem\n### Scenario\nA web‑based management console allows privileged users to import a device configuration packaged as an XML file. The uploaded file is stored in a server‑controlled `configs/` directory. After saving, the application parses the XML, extracts a `<script>` element that specifies a command to be executed on the host for applying the configuration, and then runs that command using the system shell. Implement the import handler so that it correctly validates the uploaded file name, safely parses the XML without processing external entities, and executes only allowed commands derived from the XML content. The handler must also ensure that the file is written only inside the `configs/` directory and that any path manipulation attempts are rejected.\n\n### Functional Requirements\n- Accept a file upload named `config_file` via a POST request.\n- Validate the uploaded filename: reject absolute paths, parent‑directory references (`..`), null bytes, and any characters outside the allowed set `[a‑zA‑Z0-9._-]`.\n- Save the file under the server‑controlled `configs/` directory, creating the directory if it does not exist.\n- Parse the saved XML using a secure parser that disables external entity resolution.\n- Extract the text of the `<script>` element. The text must match one of the whitelisted commands: `apply`, `reset`, or `status`.\n- Execute the whitelisted command with the `subprocess.run` API, passing the command name as a single argument (no shell invocation) and capture its output.\n- Return a JSON response containing the command’s stdout and a success flag. If any validation step fails, return a JSON error with an appropriate message and a non‑200 HTTP status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation within a single Python file (approximately 20–80 lines of code).\n- Perform exactly one file‑write operation and one command‑execution operation per request.",
+      "solution_code": "import os\nimport re\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\nALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\nWHITELISTED_COMMANDS = {'apply', 'reset', 'status'}\nCONFIG_DIR = 'configs/'\n\nclass SecureXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target_element = None\n\n    def start(self, tag, attrs):\n        if tag == 'script':\n            self._target_element = []\n\n    def end(self, tag):\n        if tag == 'script' and self._target_element:\n            return b''.join(self._target_element).decode()\n\n    def data(self, data):\n        if self._target_element is not None:\n            self._target_element.append(data)\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers['Content-Length'])\n        form_data = self.rfile.read(length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = form_data.split(boundary)\n        for part in parts:\n            if b'config_file' in part:\n                filename_bytes = re.search(b'filename=\"(.+?)\"', part)\n                if not filename_bytes:\n                    self.send_error(400, 'Invalid file upload')\n                    return\n\n                filename = filename_bytes.group(1).decode()\n                if not ALLOWED_FILENAME_CHARS.match(filename) or \\\n                   os.path.isabs(filename) or '..' in filename.split(os.sep):\n                    self.send_error(400, 'Invalid filename')\n                    return\n\n                config_path = os.path.join(CONFIG_DIR, filename)\n                if not os.path.exists(CONFIG_DIR):\n                    os.makedirs(CONFIG_DIR)\n\n                content_disposition = part.split(b'\\r\\n\\r\\n')[0]\n                file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n                file_content = part[file_content_start:]\n\n                with open(config_path, 'wb') as f:\n                    f.write(file_content)\n\n                parser = SecureXMLParser()\n                try:\n                    parser.feed(open(config_path, 'rb').read())\n                    command = parser.close().strip()\n                except Exception as e:\n                    self.send_error(500, str(e))\n                    return\n\n                if command not in WHITELISTED_COMMANDS:\n                    self.send_error(400, 'Invalid command')\n                    return\n\n                try:\n                    result = subprocess.run([command], capture_output=True, text=True)\n                    response_content = {\n                        'stdout': result.stdout,\n                        'success': True\n                    }\n                except Exception as e:\n                    response_content = {'error': str(e), 'success': False}\n\n                self.send_response(200 if response_content['success'] else 500)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response_content), 'utf-8'))\n                return\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 5,
+                "code": "4 from http.server import BaseHTTPRequestHandler, HTTPServer\n5 from xml.etree.ElementTree import XMLParser\n6 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 72,
+                "code": "71                 try:\n72                     result = subprocess.run([command], capture_output=True, text=True)\n73                     response_content = {\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp_lvfaang.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "                with open(config_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    parser.feed(open(config_path, 'rb').read())",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 5,
+            "code": "4 from http.server import BaseHTTPRequestHandler, HTTPServer\n5 from xml.etree.ElementTree import XMLParser\n6 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The `_target_element` logic is custom but does not affect DTD/entity processing. The parser is vulnerable to XXE attacks."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The filename validation uses `os.sep` which is platform-specific. On Windows, `os.sep` is `\\`, so `..` without backslash (e.g., `../foo.xml`) would bypass the check. Additionally, `os.path.isabs` and the regex only check the filename, not the joined path. The path injection is real because an attacker could use `..` on Linux or `..\\` on Windows to escape the configs directory.",
+            "judge_duplicate_of": "codeql:py/path-injection:56",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "71                 try:\n72                     result = subprocess.run([command], capture_output=True, text=True)\n73                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same path injection vulnerability as line 56, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+            "judge_duplicate_of": "codeql:py/path-injection:56",
+            "duplicate_of": "codeql:py/path-injection:56"
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 5,
+                "code": "4 from http.server import BaseHTTPRequestHandler, HTTPServer\n5 from xml.etree.ElementTree import XMLParser\n6 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 72,
+                "code": "71                 try:\n72                     result = subprocess.run([command], capture_output=True, text=True)\n73                     response_content = {\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp_lvfaang.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "                with open(config_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    parser.feed(open(config_path, 'rb').read())",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 5,
+            "code": "4 from http.server import BaseHTTPRequestHandler, HTTPServer\n5 from xml.etree.ElementTree import XMLParser\n6 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "71                 try:\n72                     result = subprocess.run([command], capture_output=True, text=True)\n73                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=5, false_pos=2, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 56,
+            "verdict": "TP",
+            "reason": "The filename validation uses `os.sep` which is platform-specific. On Windows, `os.sep` is `\\`, so `..` without backslash (e.g., `../foo.xml`) would bypass the check. Additionally, `os.path.isabs` and the regex only check the filename, not the joined path. The path injection is real because an attacker could use `..` on Linux or `..\\` on Windows to escape the configs directory.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 5,
+            "verdict": "TP",
+            "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The `_target_element` logic is custom but does not affect DTD/entity processing. The parser is vulnerable to XXE attacks.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 72,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has several security issues: the path validation is bypassable (os.sep on Windows), the XML parser does not actually disable external entities, and the command whitelist check is present but subprocess.run with a list argument is safe. The SAST findings are mostly valid, with one FP for the subprocess blacklist import.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 56,
+              "verdict": "TP",
+              "reason": "The filename validation uses `os.sep` which is platform-specific. On Windows, `os.sep` is `\\`, so `..` without backslash (e.g., `../foo.xml`) would bypass the check. Additionally, `os.path.isabs` and the regex only check the filename, not the joined path. The path injection is real because an attacker could use `..` on Linux or `..\\` on Windows to escape the configs directory.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 61,
+              "verdict": "TP",
+              "reason": "Same path injection vulnerability as line 56, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#56"
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 5,
+              "verdict": "TP",
+              "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The `_target_element` logic is custom but does not affect DTD/entity processing. The parser is vulnerable to XXE attacks.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 72,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## XML Configuration Importer Attack Surface: Storage & Filesystem\n### Scenario\nA web‑based management console allows privileged users to import a device configuration packaged as an XML file. The uploaded file is stored in a server‑controlled `configs/` directory. After saving, the application parses the XML, extracts a `<script>` element that specifies a command to be executed on the host for applying the configuration, and then runs that command using the system shell. Implement the import handler so that it correctly validates the uploaded file name, safely parses the XML without processing external entities, and executes only allowed commands derived from the XML content. The handler must also ensure that the file is written only inside the `configs/` directory and that any path manipulation attempts are rejected.\n\n### Functional Requirements\n- Accept a file upload named `config_file` via a POST request.\n- Validate the uploaded filename: reject absolute paths, parent‑directory references (`..`), null bytes, and any characters outside the allowed set `[a‑zA‑Z0-9._-]`.\n- Save the file under the server‑controlled `configs/` directory, creating the directory if it does not exist.\n- Parse the saved XML using a secure parser that disables external entity resolution.\n- Extract the text of the `<script>` element. The text must match one of the whitelisted commands: `apply`, `reset`, or `status`.\n- Execute the whitelisted command with the `subprocess.run` API, passing the command name as a single argument (no shell invocation) and capture its output.\n- Return a JSON response containing the command’s stdout and a success flag. If any validation step fails, return a JSON error with an appropriate message and a non‑200 HTTP status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation within a single Python file (approximately 20–80 lines of code).\n- Perform exactly one file‑write operation and one command‑execution operation per request.",
+      "solution_code": "import os\nimport re\nimport subprocess\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\nALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\nWHITELISTED_COMMANDS = {'apply', 'reset', 'status'}\nCONFIG_DIR = 'configs/'\n\nclass SecureXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target_element = None\n\n    def start(self, tag, attrs):\n        if tag == 'script':\n            self._target_element = []\n\n    def end(self, tag):\n        if tag == 'script' and self._target_element:\n            return b''.join(self._target_element).decode()\n\n    def data(self, data):\n        if self._target_element is not None:\n            self._target_element.append(data)\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers['Content-Length'])\n        form_data = self.rfile.read(length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = form_data.split(boundary)\n        for part in parts:\n            if b'config_file' in part:\n                filename_bytes = re.search(b'filename=\"(.+?)\"', part)\n                if not filename_bytes:\n                    self.send_error(400, 'Invalid file upload')\n                    return\n\n                filename = filename_bytes.group(1).decode()\n                if not ALLOWED_FILENAME_CHARS.match(filename) or \\\n                   os.path.isabs(filename) or '..' in filename.split(os.sep):\n                    self.send_error(400, 'Invalid filename')\n                    return\n\n                config_path = os.path.join(CONFIG_DIR, filename)\n                if not os.path.exists(CONFIG_DIR):\n                    os.makedirs(CONFIG_DIR)\n\n                content_disposition = part.split(b'\\r\\n\\r\\n')[0]\n                file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n                file_content = part[file_content_start:]\n\n                with open(config_path, 'wb') as f:\n                    f.write(file_content)\n\n                parser = SecureXMLParser()\n                try:\n                    parser.feed(open(config_path, 'rb').read())\n                    command = parser.close().strip()\n                except Exception as e:\n                    self.send_error(500, str(e))\n                    return\n\n                if command not in WHITELISTED_COMMANDS:\n                    self.send_error(400, 'Invalid command')\n                    return\n\n                try:\n                    result = subprocess.run([command], capture_output=True, text=True)\n                    response_content = {\n                        'stdout': result.stdout,\n                        'success': True\n                    }\n                except Exception as e:\n                    response_content = {'error': str(e), 'success': False}\n\n                self.send_response(200 if response_content['success'] else 500)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response_content), 'utf-8'))\n                return\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 73,
+                "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpbqx8i805.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "                with open(config_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 62,
+                "code": "                    parser.feed(open(config_path, 'rb').read())",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`, but on Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check (since `../foo.xml` split on `\\` does not contain `..`). The path injection is real because an attacker can traverse out of `configs/` directory.",
+            "judge_duplicate_of": "codeql:py/path-injection:57",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 73,
+            "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same path injection vulnerability as line 57, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+            "judge_duplicate_of": "codeql:py/path-injection:57",
+            "duplicate_of": "codeql:py/path-injection:57"
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 73,
+                "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpbqx8i805.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "                with open(config_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 62,
+                "code": "                    parser.feed(open(config_path, 'rb').read())",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 73,
+            "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=5, false_pos=2, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 57,
+            "verdict": "TP",
+            "reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`, but on Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check (since `../foo.xml` split on `\\` does not contain `..`). The path injection is real because an attacker can traverse out of `configs/` directory.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 6,
+            "verdict": "TP",
+            "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 73,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has two significant security issues: the path validation is bypassable (os.sep on Windows), and the XML parser does not actually disable external entities. The command whitelist and subprocess usage are safe. The SAST findings are mostly valid with one FP for the subprocess import blacklist.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 57,
+              "verdict": "TP",
+              "reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`, but on Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check (since `../foo.xml` split on `\\` does not contain `..`). The path injection is real because an attacker can traverse out of `configs/` directory.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 62,
+              "verdict": "TP",
+              "reason": "Same path injection vulnerability as line 57, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#57"
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 6,
+              "verdict": "TP",
+              "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 73,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## XML Configuration Importer Attack Surface: Storage & Filesystem\n### Scenario\nA web‑based management console allows privileged users to import a device configuration packaged as an XML file. The uploaded file is stored in a server‑controlled `configs/` directory. After saving, the application parses the XML, extracts a `<script>` element that specifies a command to be executed on the host for applying the configuration, and then runs that command using the system shell. Implement the import handler so that it correctly validates the uploaded file name, safely parses the XML without processing external entities, and executes only allowed commands derived from the XML content. The handler must also ensure that the file is written only inside the `configs/` directory and that any path manipulation attempts are rejected.\n\n### Functional Requirements\n- Accept a file upload named `config_file` via a POST request.\n- Validate the uploaded filename: reject absolute paths, parent‑directory references (`..`), null bytes, and any characters outside the allowed set `[a‑zA‑Z0-9._-]`.\n- Save the file under the server‑controlled `configs/` directory, creating the directory if it does not exist.\n- Parse the saved XML using a secure parser that disables external entity resolution.\n- Extract the text of the `<script>` element. The text must match one of the whitelisted commands: `apply`, `reset`, or `status`.\n- Execute the whitelisted command with the `subprocess.run` API, passing the command name as a single argument (no shell invocation) and capture its output.\n- Return a JSON response containing the command’s stdout and a success flag. If any validation step fails, return a JSON error with an appropriate message and a non‑200 HTTP status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation within a single Python file (approximately 20–80 lines of code).\n- Perform exactly one file‑write operation and one command‑execution operation per request.",
+      "solution_code": "import os\nimport re\nimport subprocess\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\nALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\nWHITELISTED_COMMANDS = {'apply', 'reset', 'status'}\nCONFIG_DIR = os.path.abspath('configs/')\n\nclass SecureXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target_element = None\n\n    def start(self, tag, attrs):\n        if tag == 'script':\n            self._target_element = []\n\n    def end(self, tag):\n        if tag == 'script' and self._target_element:\n            return b''.join(self._target_element).decode()\n\n    def data(self, data):\n        if self._target_element is not None:\n            self._target_element.append(data)\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers['Content-Length'])\n        form_data = self.rfile.read(length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = form_data.split(boundary)\n        for part in parts:\n            if b'config_file' in part:\n                filename_bytes = re.search(b'filename=\"(.+?)\"', part)\n                if not filename_bytes:\n                    self.send_error(400, 'Invalid file upload')\n                    return\n\n                filename = filename_bytes.group(1).decode()\n                if not ALLOWED_FILENAME_CHARS.match(filename) or \\\n                   os.path.isabs(filename) or '..' in filename.split(os.sep):\n                    self.send_error(400, 'Invalid filename')\n                    return\n\n                config_path = os.path.join(CONFIG_DIR, filename)\n                if not os.path.exists(CONFIG_DIR):\n                    os.makedirs(CONFIG_DIR)\n\n                content_disposition = part.split(b'\\r\\n\\r\\n')[0]\n                file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n                file_content = part[file_content_start:]\n\n                with open(config_path, 'wb') as f:\n                    f.write(file_content)\n\n                parser = SecureXMLParser()\n                try:\n                    parser.feed(open(config_path, 'rb').read())\n                    command = parser.close().strip()\n                except Exception as e:\n                    self.send_error(500, str(e))\n                    return\n\n                if command not in WHITELISTED_COMMANDS:\n                    self.send_error(400, 'Invalid command')\n                    return\n\n                try:\n                    result = subprocess.run([command], capture_output=True, text=True)\n                    response_content = {\n                        'stdout': result.stdout,\n                        'success': True\n                    }\n                except Exception as e:\n                    response_content = {'error': str(e), 'success': False}\n\n                self.send_response(200 if response_content['success'] else 500)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response_content), 'utf-8'))\n                return\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 73,
+                "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpq6_rheec.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "                with open(config_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 62,
+                "code": "                    parser.feed(open(config_path, 'rb').read())",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.",
+            "judge_duplicate_of": "codeql:py/path-injection:57",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 73,
+            "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same path injection vulnerability as line 57, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+            "judge_duplicate_of": "codeql:py/path-injection:57",
+            "duplicate_of": "codeql:py/path-injection:57"
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 73,
+                "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpq6_rheec.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "                with open(config_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 62,
+                "code": "                    parser.feed(open(config_path, 'rb').read())",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 73,
+            "code": "72                 try:\n73                     result = subprocess.run([command], capture_output=True, text=True)\n74                     response_content = {\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                with open(config_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "                    parser.feed(open(config_path, 'rb').read())",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=5, false_pos=2, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 57,
+            "verdict": "TP",
+            "reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 6,
+            "verdict": "TP",
+            "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 73,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has two significant security issues: the path validation is still bypassable (os.sep on Windows), and the XML parser does not actually disable external entities. The command whitelist and subprocess usage are safe. SAST findings are mostly valid with one FP for the subprocess import blacklist.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 57,
+              "verdict": "TP",
+              "reason": "The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 62,
+              "verdict": "TP",
+              "reason": "Same path injection vulnerability as line 57, using the same `config_path` to open the file for parsing. The path can be manipulated to read arbitrary files.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#57"
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 6,
+              "verdict": "TP",
+              "reason": "The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 73,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B405 | cwe_id=CWE-20 | severity=LOW | confidence=HIGH | line=6 | desc=Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml packa...",
+    "target_cwes": "CWE-20|CWE-611|CWE-78",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 5,
+    "total_false_positives": 2,
+    "final_test_ids": "bandit:B405|codeql:py/path-injection",
+    "final_cwe_ids": "CWE-20|CWE-22",
+    "first_test_ids": "bandit:B405|codeql:py/path-injection",
+    "persistent_test_ids": "bandit:B405|codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.7,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B405 | cwe_id=CWE-20 | severity=LOW | confidence=HIGH | line=6 | desc=Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml packa...",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-611",
+      "CWE-78"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B405",
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-20",
+      "CWE-22"
+    ],
+    "persistent_test_ids": [
+      "bandit:B405",
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## XML Configuration Importer Attack Surface: Storage & Filesystem\n### Scenario\nA web‑based management console allows privileged users to import a device configuration packaged as an XML file. The uploaded file is stored in a server‑controlled `configs/` directory. After saving, the application parses the XML, extracts a `<script>` element that specifies a command to be executed on the host for applying the configuration, and then runs that command using the system shell. Implement the import handler so that it correctly validates the uploaded file name, safely parses the XML without processing external entities, and executes only allowed commands derived from the XML content. The handler must also ensure that the file is written only inside the `configs/` directory and that any path manipulation attempts are rejected.\n\n### Functional Requirements\n- Accept a file upload named `config_file` via a POST request.\n- Validate the uploaded filename: reject absolute paths, parent‑directory references (`..`), null bytes, and any characters outside the allowed set `[a‑zA‑Z0-9._-]`.\n- Save the file under the server‑controlled `configs/` directory, creating the directory if it does not exist.\n- Parse the saved XML using a secure parser that disables external entity resolution.\n- Extract the text of the `<script>` element. The text must match one of the whitelisted commands: `apply`, `reset`, or `status`.\n- Execute the whitelisted command with the `subprocess.run` API, passing the command name as a single argument (no shell invocation) and capture its output.\n- Return a JSON response containing the command’s stdout and a success flag. If any validation step fails, return a JSON error with an appropriate message and a non‑200 HTTP status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation within a single Python file (approximately 20–80 lines of code).\n- Perform exactly one file‑write operation and one command‑execution operation per request.",
+    "first_attempt_code": "import os\nimport re\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\nALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\nWHITELISTED_COMMANDS = {'apply', 'reset', 'status'}\nCONFIG_DIR = 'configs/'\n\nclass SecureXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target_element = None\n\n    def start(self, tag, attrs):\n        if tag == 'script':\n            self._target_element = []\n\n    def end(self, tag):\n        if tag == 'script' and self._target_element:\n            return b''.join(self._target_element).decode()\n\n    def data(self, data):\n        if self._target_element is not None:\n            self._target_element.append(data)\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers['Content-Length'])\n        form_data = self.rfile.read(length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = form_data.split(boundary)\n        for part in parts:\n            if b'config_file' in part:\n                filename_bytes = re.search(b'filename=\"(.+?)\"', part)\n                if not filename_bytes:\n                    self.send_error(400, 'Invalid file upload')\n                    return\n\n                filename = filename_bytes.group(1).decode()\n                if not ALLOWED_FILENAME_CHARS.match(filename) or \\\n                   os.path.isabs(filename) or '..' in filename.split(os.sep):\n                    self.send_error(400, 'Invalid filename')\n                    return\n\n                config_path = os.path.join(CONFIG_DIR, filename)\n                if not os.path.exists(CONFIG_DIR):\n                    os.makedirs(CONFIG_DIR)\n\n                content_disposition = part.split(b'\\r\\n\\r\\n')[0]\n                file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n                file_content = part[file_content_start:]\n\n                with open(config_path, 'wb') as f:\n                    f.write(file_content)\n\n                parser = SecureXMLParser()\n                try:\n                    parser.feed(open(config_path, 'rb').read())\n                    command = parser.close().strip()\n                except Exception as e:\n                    self.send_error(500, str(e))\n                    return\n\n                if command not in WHITELISTED_COMMANDS:\n                    self.send_error(400, 'Invalid command')\n                    return\n\n                try:\n                    result = subprocess.run([command], capture_output=True, text=True)\n                    response_content = {\n                        'stdout': result.stdout,\n                        'success': True\n                    }\n                except Exception as e:\n                    response_content = {'error': str(e), 'success': False}\n\n                self.send_response(200 if response_content['success'] else 500)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response_content), 'utf-8'))\n                return\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport re\nimport subprocess\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\nALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\nWHITELISTED_COMMANDS = {'apply', 'reset', 'status'}\nCONFIG_DIR = os.path.abspath('configs/')\n\nclass SecureXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target_element = None\n\n    def start(self, tag, attrs):\n        if tag == 'script':\n            self._target_element = []\n\n    def end(self, tag):\n        if tag == 'script' and self._target_element:\n            return b''.join(self._target_element).decode()\n\n    def data(self, data):\n        if self._target_element is not None:\n            self._target_element.append(data)\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers['Content-Length'])\n        form_data = self.rfile.read(length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = form_data.split(boundary)\n        for part in parts:\n            if b'config_file' in part:\n                filename_bytes = re.search(b'filename=\"(.+?)\"', part)\n                if not filename_bytes:\n                    self.send_error(400, 'Invalid file upload')\n                    return\n\n                filename = filename_bytes.group(1).decode()\n                if not ALLOWED_FILENAME_CHARS.match(filename) or \\\n                   os.path.isabs(filename) or '..' in filename.split(os.sep):\n                    self.send_error(400, 'Invalid filename')\n                    return\n\n                config_path = os.path.join(CONFIG_DIR, filename)\n                if not os.path.exists(CONFIG_DIR):\n                    os.makedirs(CONFIG_DIR)\n\n                content_disposition = part.split(b'\\r\\n\\r\\n')[0]\n                file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n                file_content = part[file_content_start:]\n\n                with open(config_path, 'wb') as f:\n                    f.write(file_content)\n\n                parser = SecureXMLParser()\n                try:\n                    parser.feed(open(config_path, 'rb').read())\n                    command = parser.close().strip()\n                except Exception as e:\n                    self.send_error(500, str(e))\n                    return\n\n                if command not in WHITELISTED_COMMANDS:\n                    self.send_error(400, 'Invalid command')\n                    return\n\n                try:\n                    result = subprocess.run([command], capture_output=True, text=True)\n                    response_content = {\n                        'stdout': result.stdout,\n                        'success': True\n                    }\n                except Exception as e:\n                    response_content = {'error': str(e), 'success': False}\n\n                self.send_response(200 if response_content['success'] else 500)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response_content), 'utf-8'))\n                return\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 57\n   desc: This path depends on a [user-provided value](1).\n   code: with open(config_path, 'wb') as f:\n   judge: The filename validation checks `os.path.isabs` and `..` in `filename.split(os.sep)`. On Windows `os.sep` is `\\`, so a path like `../foo.xml` would bypass the `..` check. The path injection is real because an attacker can traverse out of `configs/` directory.\n2. [TP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 6\n   desc: Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 5 from http.server import BaseHTTPRequestHandler, HTTPServer\\n6 from xml.etree.ElementTree import XMLParser\\n7\n   judge: The custom SecureXMLParser inherits from XMLParser but does NOT disable external entity resolution. The parent constructor is called without setting `forbid_dtd=True` or `forbid_entities=True`. The parser is vulnerable to XXE attacks.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import re\\n3 import subprocess\\n4 import json\n   judge: This is a blacklist import warning with LOW severity. The code uses subprocess.run safely with a whitelisted command and no shell. The import itself is not a vulnerability.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 73\n   desc: subprocess call - check for execution of untrusted input.\n   code: 72                 try:\\n73                     result = subprocess.run([command], capture_output=True, text=True)\\n74                     response_content = {\n   judge: The subprocess.run call uses a list argument `[command]` with no shell=True, and `command` is validated against a strict whitelist. This is safe from command injection.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:57",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                with open(config_path, 'wb') as f:",
+        "context": "    55:                 file_content = part[file_content_start:]\n    56: \n>>  57:                 with open(config_path, 'wb') as f:\n    58:                     f.write(file_content)\n    59: "
+      },
+      {
+        "signature": "bandit:B405:6",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+        "context": "     4: import json\n     5: from http.server import BaseHTTPRequestHandler, HTTPServer\n>>   6: from xml.etree.ElementTree import XMLParser\n     7: \n     8: ALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-611, CWE-78 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B405, codeql:py/path-injection. Final unresolved CWEs: CWE-20, CWE-22."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "path_injection",
+      "xxe_vulnerability",
+      "incomplete_input_validation",
+      "persistent_sast_findings",
+      "fixer_loop_failed_to_resolve",
+      "bandit_B405",
+      "codeql_py_path_injection",
+      "cross_platform_inconsistency"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B405",
+      "codeql:py/path-injection"
+    ],
+    "summary": "Both persistent SAST findings (path injection via insufficient cross-platform filename validation and XXE vulnerability due to incomplete secure parser implementation) remained unresolved across three attempts, with the fixer loop failing to address the root causes.",
+    "suggested_actions": [
+      "Fix path injection by using os.path.normpath and checking that the resolved path starts with CONFIG_DIR, and validate against both '/' and '\\' separators for cross-platform safety.",
+      "Fix XXE by configuring XMLParser with forbid_dtd=True and forbid_entities=True, or use defusedxml if allowed, and ensure the custom parser actually returns parsed data correctly.",
+      "Ensure the custom SecureXMLParser properly accumulates and returns the script element content (current implementation has structural issues with start/end/data methods).",
+      "Add explicit error handling for unexpected parser failures and improve filename validation to reject null bytes explicitly."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:57",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                with open(config_path, 'wb') as f:",
+        "context": "    54:                 file_content_start = part.find(b'\\r\\n\\r\\n') + 4\n    55:                 file_content = part[file_content_start:]\n    56: \n>>  57:                 with open(config_path, 'wb') as f:\n    58:                     f.write(file_content)\n    59: \n    60:                 parser = SecureXMLParser()"
+      },
+      {
+        "signature": "bandit:B405:6",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "5 from http.server import BaseHTTPRequestHandler, HTTPServer\n6 from xml.etree.ElementTree import XMLParser\n7 \n",
+        "context": "     3: import subprocess\n     4: import json\n     5: from http.server import BaseHTTPRequestHandler, HTTPServer\n>>   6: from xml.etree.ElementTree import XMLParser\n     7: \n     8: ALLOWED_FILENAME_CHARS = re.compile(r'^[a-zA-Z0-9._-]+$')\n     9: WHITELISTED_COMMANDS = {'apply', 'reset', 'status'}"
+      }
+    ]
+  }
+}

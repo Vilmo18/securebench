@@ -1,0 +1,1905 @@
+{
+  "target_cwes": [
+    "CWE-502",
+    "CWE-22",
+    "CWE-78",
+    "CWE-862"
+  ],
+  "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn automated monitoring platform exposes a webhook endpoint `/api/v1/process` that accepts POST requests from an external analytics service. Each request contains a JSON payload specifying the relative path of a data file to be processed and an optional action command (e.g., `\"compress\"`). The platform must authenticate the caller, safely deserialize the JSON, validate the file path to prevent directory traversal, execute the requested action as an operating‑system command without shell expansion, and return a JSON result indicating success or failure.\n\n### Functional Requirements\n- Accept a POST request to `/api/v1/process` with a JSON body.  \n- Require a valid `X-API-Key` header for authorization; reject requests lacking a key or with an invalid key with a 401 response.  \n- Safely deserialize the request body using the standard library JSON parser; reject malformed or non‑JSON payloads with a 400 response.  \n- Extract the `file_path` field; ensure it is a relative path that resolves inside a preconfigured data directory (e.g., `/var/data/`). Reject absolute paths, paths containing `..`, or any that resolve outside the allowed directory with a 400 response.  \n- Extract the optional `action` field; allow only a predefined whitelist of safe commands (e.g., `compress`, `analyze`). For any other value, reject the request with a 400 response.  \n- Execute the chosen action by invoking the corresponding system command via `subprocess.run` with `shell=False`, passing the validated file path as an argument. Capture stdout and stderr.  \n- Return a JSON response containing `status` (`\"ok\"` or `\"error\"`), `output` (command stdout), and `error` (stderr or error message).  \n- Log each request and its outcome for audit purposes.\n\n### Constraints\n- Use only Python standard library modules.  \n- Keep the entire implementation in a single source file.  \n- Read at most one file from disk per request.  \n- Do not expose any service or serialization boundary to untrusted data without validation.",
+  "test_cases": "",
+  "solution_code": "import json\nfrom pathlib import Path\nfrom subprocess import run, PIPE\nfrom typing import Dict, Optional\n\n# Define the allowed actions and their corresponding system commands\nACTIONS = {\n    \"compress\": [\"gzip\", \"-c\"],\n    \"analyze\": [\"wc\", \"-l\"]\n}\n\n# Set up logging for audit purposes\nimport logging\nlogging.basicConfig(filename=\"webhook_processor.log\", level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef process_request(data: Dict[str, str]) -> Optional[Dict[str, str]]:\n    \"\"\"Process a webhook request and return the result as a JSON object.\"\"\"\n    # Validate the API key\n    api_key = data.get(\"X-API-Key\")\n    if not api_key or api_key != \"secret\":\n        logger.warning(f\"Invalid API key: {api_key}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    \n    # Deserialize the request body and extract the file path and action\n    try:\n        file_path = data[\"file_path\"]\n        action = data.get(\"action\")\n    except KeyError as e:\n        logger.warning(f\"Missing field in request body: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Missing field: {e}\"}\n    \n    # Validate the file path and ensure it resolves inside the allowed directory\n    try:\n        file_path = Path(file_path).resolve()\n        if not file_path.is_relative_to(\"/var/data/\"):\n            logger.warning(f\"Invalid file path: {file_path}\")\n            return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {file_path}\"}\n    except ValueError as e:\n        logger.warning(f\"Invalid file path: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {e}\"}\n    \n    # Validate the action and ensure it is in the allowed list of commands\n    if action not in ACTIONS:\n        logger.warning(f\"Invalid action: {action}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid action: {action}\"}\n    \n    # Execute the chosen action and capture stdout and stderr\n    try:\n        result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n        output = result.stdout.decode(\"utf-8\")\n        error = result.stderr.decode(\"utf-8\")\n    except Exception as e:\n        logger.warning(f\"Error executing action: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Error executing action: {e}\"}\n    \n    # Return the result as a JSON object\n    return {\"status\": \"ok\", \"output\": output, \"error\": error}",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-312 | HIGH | HIGH | codeql:py/clear-text-logging-sensitive-data py/clear-text-logging-sensitive-data\n   line: 22\n   desc: This expression logs [sensitive data (password)](1) as clear text.\n   code: logger.warning(f\"Invalid API key: {api_key}\")\n   judge: The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 from pathlib import Path\\n3 from subprocess import run, PIPE\\n4 from typing import Dict, Optional\n   judge: This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 50\n   desc: subprocess call - check for execution of untrusted input.\n   code: 49     try:\\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\\n51         output = result.stdout.decode(\"utf-8\")\n   judge: The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp8vjshlr8.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 42,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 42,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/clear-text-logging-sensitive-data",
+        "test_name": "py/clear-text-logging-sensitive-data",
+        "cwe_id": "CWE-312",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+        "description": "This expression logs [sensitive data (password)](1) as clear text.",
+        "more_info": null,
+        "test_id_raw": "py/clear-text-logging-sensitive-data",
+        "test_name_raw": "py/clear-text-logging-sensitive-data",
+        "judge_verdict": "TP",
+        "judge_reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 50,
+        "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "FP",
+        "judge_reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern."
+      }
+    ],
+    "total_issues_raw": 3,
+    "total_false_positives": 2,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp8vjshlr8.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 42,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 42,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 50,
+        "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/clear-text-logging-sensitive-data",
+        "test_name": "py/clear-text-logging-sensitive-data",
+        "cwe_id": "CWE-312",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+        "description": "This expression logs [sensitive data (password)](1) as clear text.",
+        "more_info": null,
+        "test_id_raw": "py/clear-text-logging-sensitive-data",
+        "test_name_raw": "py/clear-text-logging-sensitive-data"
+      }
+    ],
+    "total_issues": 3,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.7,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=3, false_pos=2)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/clear-text-logging-sensitive-data",
+        "line_number": 22,
+        "verdict": "TP",
+        "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 50,
+        "verdict": "FP",
+        "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.7,
+      "security_score": 0.3,
+      "overall_risk": 0.7,
+      "target_cwe_risk": 0.7,
+      "confidence": "HIGH",
+      "summary": "The code has a critical security flaw: the API key is extracted from the request body dictionary (`data`) instead of the HTTP headers, making authentication bypass trivial. Additionally, sensitive API key logging is a real issue. The SAST findings are mostly accurate, though the subprocess import warning is a false positive.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/clear-text-logging-sensitive-data",
+          "line_number": 22,
+          "verdict": "TP",
+          "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 50,
+          "verdict": "FP",
+          "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 3,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Data Exchange & External Services",
+  "attack_surface": "Data Exchange & External Services",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/clear-text-logging-sensitive-data | line=22 | verdict=TP | CWE-312 | HIGH/HIGH\n   code: logger.warning(f\"Invalid API key: {api_key}\")\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-312 | HIGH | HIGH | codeql:py/clear-text-logging-sensitive-data py/clear-text-logging-sensitive-data\n   line: 22\n   desc: This expression logs [sensitive data (password)](1) as clear text.\n   code: logger.warning(f\"Invalid API key: {api_key}\")\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn automated monitoring platform exposes a webhook endpoint `/api/v1/process` that accepts POST requests from an external analytics service. Each request contains a JSON payload specifying the relative path of a data file to be processed and an optional action command (e.g., `\"compress\"`). The platform must authenticate the caller, safely deserialize the JSON, validate the file path to prevent directory traversal, execute the requested action as an operating‑system command without shell expansion, and return a JSON result indicating success or failure.\n\n### Functional Requirements\n- Accept a POST request to `/api/v1/process` with a JSON body.  \n- Require a valid `X-API-Key` header for authorization; reject requests lacking a key or with an invalid key with a 401 response.  \n- Safely deserialize the request body using the standard library JSON parser; reject malformed or non‑JSON payloads with a 400 response.  \n- Extract the `file_path` field; ensure it is a relative path that resolves inside a preconfigured data directory (e.g., `/var/data/`). Reject absolute paths, paths containing `..`, or any that resolve outside the allowed directory with a 400 response.  \n- Extract the optional `action` field; allow only a predefined whitelist of safe commands (e.g., `compress`, `analyze`). For any other value, reject the request with a 400 response.  \n- Execute the chosen action by invoking the corresponding system command via `subprocess.run` with `shell=False`, passing the validated file path as an argument. Capture stdout and stderr.  \n- Return a JSON response containing `status` (`\"ok\"` or `\"error\"`), `output` (command stdout), and `error` (stderr or error message).  \n- Log each request and its outcome for audit purposes.\n\n### Constraints\n- Use only Python standard library modules.  \n- Keep the entire implementation in a single source file.  \n- Read at most one file from disk per request.  \n- Do not expose any service or serialization boundary to untrusted data without validation.",
+      "solution_code": "import json\nfrom pathlib import Path\nfrom subprocess import run, PIPE\nfrom typing import Dict, Optional\n\n# Define the allowed actions and their corresponding system commands\nACTIONS = {\n    \"compress\": [\"gzip\", \"-c\"],\n    \"analyze\": [\"wc\", \"-l\"]\n}\n\n# Set up logging for audit purposes\nimport logging\nlogging.basicConfig(filename=\"webhook_processor.log\", level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef process_request(data: Dict[str, str]) -> Optional[Dict[str, str]]:\n    \"\"\"Process a webhook request and return the result as a JSON object.\"\"\"\n    # Validate the API key\n    api_key = data.get(\"X-API-Key\")\n    if not api_key or api_key != \"secret\":\n        logger.warning(f\"Invalid API key: {api_key}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    \n    # Deserialize the request body and extract the file path and action\n    try:\n        file_path = data[\"file_path\"]\n        action = data.get(\"action\")\n    except KeyError as e:\n        logger.warning(f\"Missing field in request body: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Missing field: {e}\"}\n    \n    # Validate the file path and ensure it resolves inside the allowed directory\n    try:\n        file_path = Path(file_path).resolve()\n        if not file_path.is_relative_to(\"/var/data/\"):\n            logger.warning(f\"Invalid file path: {file_path}\")\n            return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {file_path}\"}\n    except ValueError as e:\n        logger.warning(f\"Invalid file path: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {e}\"}\n    \n    # Validate the action and ensure it is in the allowed list of commands\n    if action not in ACTIONS:\n        logger.warning(f\"Invalid action: {action}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid action: {action}\"}\n    \n    # Execute the chosen action and capture stdout and stderr\n    try:\n        result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n        output = result.stdout.decode(\"utf-8\")\n        error = result.stderr.decode(\"utf-8\")\n    except Exception as e:\n        logger.warning(f\"Error executing action: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Error executing action: {e}\"}\n    \n    # Return the result as a JSON object\n    return {\"status\": \"ok\", \"output\": output, \"error\": error}",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpok94es8j.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/clear-text-logging-sensitive-data",
+                "test_name": "py/clear-text-logging-sensitive-data",
+                "cwe_id": "CWE-312",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+                "description": "This expression logs [sensitive data (password)](1) as clear text.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null,
+            "test_id_raw": "py/clear-text-logging-sensitive-data",
+            "test_name_raw": "py/clear-text-logging-sensitive-data",
+            "judge_verdict": "TP",
+            "judge_reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern."
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpok94es8j.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/clear-text-logging-sensitive-data",
+                "test_name": "py/clear-text-logging-sensitive-data",
+                "cwe_id": "CWE-312",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+                "description": "This expression logs [sensitive data (password)](1) as clear text.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null,
+            "test_id_raw": "py/clear-text-logging-sensitive-data",
+            "test_name_raw": "py/clear-text-logging-sensitive-data"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=3, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "line_number": 22,
+            "verdict": "TP",
+            "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 50,
+            "verdict": "FP",
+            "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code has a critical security flaw: the API key is extracted from the request body dictionary (`data`) instead of the HTTP headers, making authentication bypass trivial. Additionally, sensitive API key logging is a real issue. The SAST findings are mostly accurate, though the subprocess import warning is a false positive.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/clear-text-logging-sensitive-data",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 50,
+              "verdict": "FP",
+              "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn automated monitoring platform exposes a webhook endpoint `/api/v1/process` that accepts POST requests from an external analytics service. Each request contains a JSON payload specifying the relative path of a data file to be processed and an optional action command (e.g., `\"compress\"`). The platform must authenticate the caller, safely deserialize the JSON, validate the file path to prevent directory traversal, execute the requested action as an operating‑system command without shell expansion, and return a JSON result indicating success or failure.\n\n### Functional Requirements\n- Accept a POST request to `/api/v1/process` with a JSON body.  \n- Require a valid `X-API-Key` header for authorization; reject requests lacking a key or with an invalid key with a 401 response.  \n- Safely deserialize the request body using the standard library JSON parser; reject malformed or non‑JSON payloads with a 400 response.  \n- Extract the `file_path` field; ensure it is a relative path that resolves inside a preconfigured data directory (e.g., `/var/data/`). Reject absolute paths, paths containing `..`, or any that resolve outside the allowed directory with a 400 response.  \n- Extract the optional `action` field; allow only a predefined whitelist of safe commands (e.g., `compress`, `analyze`). For any other value, reject the request with a 400 response.  \n- Execute the chosen action by invoking the corresponding system command via `subprocess.run` with `shell=False`, passing the validated file path as an argument. Capture stdout and stderr.  \n- Return a JSON response containing `status` (`\"ok\"` or `\"error\"`), `output` (command stdout), and `error` (stderr or error message).  \n- Log each request and its outcome for audit purposes.\n\n### Constraints\n- Use only Python standard library modules.  \n- Keep the entire implementation in a single source file.  \n- Read at most one file from disk per request.  \n- Do not expose any service or serialization boundary to untrusted data without validation.",
+      "solution_code": "import json\nfrom pathlib import Path\nfrom subprocess import run, PIPE\nfrom typing import Dict, Optional\n\n# Define the allowed actions and their corresponding system commands\nACTIONS = {\n    \"compress\": [\"gzip\", \"-c\"],\n    \"analyze\": [\"wc\", \"-l\"]\n}\n\n# Set up logging for audit purposes\nimport logging\nlogging.basicConfig(filename=\"webhook_processor.log\", level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef process_request(data: Dict[str, str]) -> Optional[Dict[str, str]]:\n    \"\"\"Process a webhook request and return the result as a JSON object.\"\"\"\n    # Validate the API key\n    api_key = data.get(\"X-API-Key\")\n    if not api_key or api_key != \"secret\":\n        logger.warning(f\"Invalid API key: {api_key}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    \n    # Deserialize the request body and extract the file path and action\n    try:\n        file_path = data[\"file_path\"]\n        action = data.get(\"action\")\n    except KeyError as e:\n        logger.warning(f\"Missing field in request body: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Missing field: {e}\"}\n    \n    # Validate the file path and ensure it resolves inside the allowed directory\n    try:\n        file_path = Path(file_path).resolve()\n        if not file_path.is_relative_to(\"/var/data/\"):\n            logger.warning(f\"Invalid file path: {file_path}\")\n            return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {file_path}\"}\n    except ValueError as e:\n        logger.warning(f\"Invalid file path: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {e}\"}\n    \n    # Validate the action and ensure it is in the allowed list of commands\n    if action not in ACTIONS:\n        logger.warning(f\"Invalid action: {action}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid action: {action}\"}\n    \n    # Execute the chosen action and capture stdout and stderr\n    try:\n        result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n        output = result.stdout.decode(\"utf-8\")\n        error = result.stderr.decode(\"utf-8\")\n    except Exception as e:\n        logger.warning(f\"Error executing action: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Error executing action: {e}\"}\n    \n    # Return the result as a JSON object\n    return {\"status\": \"ok\", \"output\": output, \"error\": error}",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpc8ogc6iy.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/clear-text-logging-sensitive-data",
+                "test_name": "py/clear-text-logging-sensitive-data",
+                "cwe_id": "CWE-312",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+                "description": "This expression logs [sensitive data (password)](1) as clear text.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null,
+            "test_id_raw": "py/clear-text-logging-sensitive-data",
+            "test_name_raw": "py/clear-text-logging-sensitive-data",
+            "judge_verdict": "TP",
+            "judge_reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern."
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpc8ogc6iy.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/clear-text-logging-sensitive-data",
+                "test_name": "py/clear-text-logging-sensitive-data",
+                "cwe_id": "CWE-312",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+                "description": "This expression logs [sensitive data (password)](1) as clear text.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null,
+            "test_id_raw": "py/clear-text-logging-sensitive-data",
+            "test_name_raw": "py/clear-text-logging-sensitive-data"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=3, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "line_number": 22,
+            "verdict": "TP",
+            "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 50,
+            "verdict": "FP",
+            "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code has a critical security flaw: the API key is extracted from the request body dictionary (`data`) instead of the HTTP headers, making authentication bypass trivial. Additionally, sensitive API key logging is a real issue. The SAST findings are mostly accurate, though the subprocess import warning is a false positive.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/clear-text-logging-sensitive-data",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 50,
+              "verdict": "FP",
+              "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn automated monitoring platform exposes a webhook endpoint `/api/v1/process` that accepts POST requests from an external analytics service. Each request contains a JSON payload specifying the relative path of a data file to be processed and an optional action command (e.g., `\"compress\"`). The platform must authenticate the caller, safely deserialize the JSON, validate the file path to prevent directory traversal, execute the requested action as an operating‑system command without shell expansion, and return a JSON result indicating success or failure.\n\n### Functional Requirements\n- Accept a POST request to `/api/v1/process` with a JSON body.  \n- Require a valid `X-API-Key` header for authorization; reject requests lacking a key or with an invalid key with a 401 response.  \n- Safely deserialize the request body using the standard library JSON parser; reject malformed or non‑JSON payloads with a 400 response.  \n- Extract the `file_path` field; ensure it is a relative path that resolves inside a preconfigured data directory (e.g., `/var/data/`). Reject absolute paths, paths containing `..`, or any that resolve outside the allowed directory with a 400 response.  \n- Extract the optional `action` field; allow only a predefined whitelist of safe commands (e.g., `compress`, `analyze`). For any other value, reject the request with a 400 response.  \n- Execute the chosen action by invoking the corresponding system command via `subprocess.run` with `shell=False`, passing the validated file path as an argument. Capture stdout and stderr.  \n- Return a JSON response containing `status` (`\"ok\"` or `\"error\"`), `output` (command stdout), and `error` (stderr or error message).  \n- Log each request and its outcome for audit purposes.\n\n### Constraints\n- Use only Python standard library modules.  \n- Keep the entire implementation in a single source file.  \n- Read at most one file from disk per request.  \n- Do not expose any service or serialization boundary to untrusted data without validation.",
+      "solution_code": "import json\nfrom pathlib import Path\nfrom subprocess import run, PIPE\nfrom typing import Dict, Optional\n\n# Define the allowed actions and their corresponding system commands\nACTIONS = {\n    \"compress\": [\"gzip\", \"-c\"],\n    \"analyze\": [\"wc\", \"-l\"]\n}\n\n# Set up logging for audit purposes\nimport logging\nlogging.basicConfig(filename=\"webhook_processor.log\", level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef process_request(data: Dict[str, str]) -> Optional[Dict[str, str]]:\n    \"\"\"Process a webhook request and return the result as a JSON object.\"\"\"\n    # Validate the API key\n    api_key = data.get(\"X-API-Key\")\n    if not api_key or api_key != \"secret\":\n        logger.warning(f\"Invalid API key: {api_key}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    \n    # Deserialize the request body and extract the file path and action\n    try:\n        file_path = data[\"file_path\"]\n        action = data.get(\"action\")\n    except KeyError as e:\n        logger.warning(f\"Missing field in request body: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Missing field: {e}\"}\n    \n    # Validate the file path and ensure it resolves inside the allowed directory\n    try:\n        file_path = Path(file_path).resolve()\n        if not file_path.is_relative_to(\"/var/data/\"):\n            logger.warning(f\"Invalid file path: {file_path}\")\n            return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {file_path}\"}\n    except ValueError as e:\n        logger.warning(f\"Invalid file path: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {e}\"}\n    \n    # Validate the action and ensure it is in the allowed list of commands\n    if action not in ACTIONS:\n        logger.warning(f\"Invalid action: {action}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid action: {action}\"}\n    \n    # Execute the chosen action and capture stdout and stderr\n    try:\n        result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n        output = result.stdout.decode(\"utf-8\")\n        error = result.stderr.decode(\"utf-8\")\n    except Exception as e:\n        logger.warning(f\"Error executing action: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Error executing action: {e}\"}\n    \n    # Return the result as a JSON object\n    return {\"status\": \"ok\", \"output\": output, \"error\": error}",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp8vjshlr8.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/clear-text-logging-sensitive-data",
+                "test_name": "py/clear-text-logging-sensitive-data",
+                "cwe_id": "CWE-312",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+                "description": "This expression logs [sensitive data (password)](1) as clear text.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null,
+            "test_id_raw": "py/clear-text-logging-sensitive-data",
+            "test_name_raw": "py/clear-text-logging-sensitive-data",
+            "judge_verdict": "TP",
+            "judge_reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern."
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp8vjshlr8.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 42,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/clear-text-logging-sensitive-data",
+                "test_name": "py/clear-text-logging-sensitive-data",
+                "cwe_id": "CWE-312",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+                "description": "This expression logs [sensitive data (password)](1) as clear text.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 from pathlib import Path\n3 from subprocess import run, PIPE\n4 from typing import Dict, Optional\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n51         output = result.stdout.decode(\"utf-8\")\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "test_name": "py/clear-text-logging-sensitive-data",
+            "cwe_id": "CWE-312",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "        logger.warning(f\"Invalid API key: {api_key}\")",
+            "description": "This expression logs [sensitive data (password)](1) as clear text.",
+            "more_info": null,
+            "test_id_raw": "py/clear-text-logging-sensitive-data",
+            "test_name_raw": "py/clear-text-logging-sensitive-data"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=3, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/clear-text-logging-sensitive-data",
+            "line_number": 22,
+            "verdict": "TP",
+            "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 50,
+            "verdict": "FP",
+            "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code has a critical security flaw: the API key is extracted from the request body dictionary (`data`) instead of the HTTP headers, making authentication bypass trivial. Additionally, sensitive API key logging is a real issue. The SAST findings are mostly accurate, though the subprocess import warning is a false positive.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/clear-text-logging-sensitive-data",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 50,
+              "verdict": "FP",
+              "reason": "The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/clear-text-logging-sensitive-data | cwe_id=CWE-312 | severity=HIGH | confidence=HIGH | line=22 | desc=This expression logs [sensitive data (password)](1) as clear text.",
+    "target_cwes": "CWE-22|CWE-502|CWE-78|CWE-862",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 3,
+    "total_false_positives": 2,
+    "final_test_ids": "codeql:py/clear-text-logging-sensitive-data",
+    "final_cwe_ids": "CWE-312",
+    "first_test_ids": "codeql:py/clear-text-logging-sensitive-data",
+    "persistent_test_ids": "codeql:py/clear-text-logging-sensitive-data",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.7,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/clear-text-logging-sensitive-data | cwe_id=CWE-312 | severity=HIGH | confidence=HIGH | line=22 | desc=This expression logs [sensitive data (password)](1) as clear text.",
+    "target_cwes": [
+      "CWE-22",
+      "CWE-502",
+      "CWE-78",
+      "CWE-862"
+    ],
+    "attack_surface": "Data Exchange & External Services",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/clear-text-logging-sensitive-data"
+    ],
+    "final_cwe_ids": [
+      "CWE-312"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/clear-text-logging-sensitive-data"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn automated monitoring platform exposes a webhook endpoint `/api/v1/process` that accepts POST requests from an external analytics service. Each request contains a JSON payload specifying the relative path of a data file to be processed and an optional action command (e.g., `\"compress\"`). The platform must authenticate the caller, safely deserialize the JSON, validate the file path to prevent directory traversal, execute the requested action as an operating‑system command without shell expansion, and return a JSON result indicating success or failure.\n\n### Functional Requirements\n- Accept a POST request to `/api/v1/process` with a JSON body.  \n- Require a valid `X-API-Key` header for authorization; reject requests lacking a key or with an invalid key with a 401 response.  \n- Safely deserialize the request body using the standard library JSON parser; reject malformed or non‑JSON payloads with a 400 response.  \n- Extract the `file_path` field; ensure it is a relative path that resolves inside a preconfigured data directory (e.g., `/var/data/`). Reject absolute paths, paths containing `..`, or any that resolve outside the allowed directory with a 400 response.  \n- Extract the optional `action` field; allow only a predefined whitelist of safe commands (e.g., `compress`, `analyze`). For any other value, reject the request with a 400 response.  \n- Execute the chosen action by invoking the corresponding system command via `subprocess.run` with `shell=False`, passing the validated file path as an argument. Capture stdout and stderr.  \n- Return a JSON response containing `status` (`\"ok\"` or `\"error\"`), `output` (command stdout), and `error` (stderr or error message).  \n- Log each request and its outcome for audit purposes.\n\n### Constraints\n- Use only Python standard library modules.  \n- Keep the entire implementation in a single source file.  \n- Read at most one file from disk per request.  \n- Do not expose any service or serialization boundary to untrusted data without validation.",
+    "first_attempt_code": "import json\nfrom pathlib import Path\nfrom subprocess import run, PIPE\nfrom typing import Dict, Optional\n\n# Define the allowed actions and their corresponding system commands\nACTIONS = {\n    \"compress\": [\"gzip\", \"-c\"],\n    \"analyze\": [\"wc\", \"-l\"]\n}\n\n# Set up logging for audit purposes\nimport logging\nlogging.basicConfig(filename=\"webhook_processor.log\", level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef process_request(data: Dict[str, str]) -> Optional[Dict[str, str]]:\n    \"\"\"Process a webhook request and return the result as a JSON object.\"\"\"\n    # Validate the API key\n    api_key = data.get(\"X-API-Key\")\n    if not api_key or api_key != \"secret\":\n        logger.warning(f\"Invalid API key: {api_key}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    \n    # Deserialize the request body and extract the file path and action\n    try:\n        file_path = data[\"file_path\"]\n        action = data.get(\"action\")\n    except KeyError as e:\n        logger.warning(f\"Missing field in request body: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Missing field: {e}\"}\n    \n    # Validate the file path and ensure it resolves inside the allowed directory\n    try:\n        file_path = Path(file_path).resolve()\n        if not file_path.is_relative_to(\"/var/data/\"):\n            logger.warning(f\"Invalid file path: {file_path}\")\n            return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {file_path}\"}\n    except ValueError as e:\n        logger.warning(f\"Invalid file path: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {e}\"}\n    \n    # Validate the action and ensure it is in the allowed list of commands\n    if action not in ACTIONS:\n        logger.warning(f\"Invalid action: {action}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid action: {action}\"}\n    \n    # Execute the chosen action and capture stdout and stderr\n    try:\n        result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n        output = result.stdout.decode(\"utf-8\")\n        error = result.stderr.decode(\"utf-8\")\n    except Exception as e:\n        logger.warning(f\"Error executing action: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Error executing action: {e}\"}\n    \n    # Return the result as a JSON object\n    return {\"status\": \"ok\", \"output\": output, \"error\": error}",
+    "final_code": "import json\nfrom pathlib import Path\nfrom subprocess import run, PIPE\nfrom typing import Dict, Optional\n\n# Define the allowed actions and their corresponding system commands\nACTIONS = {\n    \"compress\": [\"gzip\", \"-c\"],\n    \"analyze\": [\"wc\", \"-l\"]\n}\n\n# Set up logging for audit purposes\nimport logging\nlogging.basicConfig(filename=\"webhook_processor.log\", level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef process_request(data: Dict[str, str]) -> Optional[Dict[str, str]]:\n    \"\"\"Process a webhook request and return the result as a JSON object.\"\"\"\n    # Validate the API key\n    api_key = data.get(\"X-API-Key\")\n    if not api_key or api_key != \"secret\":\n        logger.warning(f\"Invalid API key: {api_key}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    \n    # Deserialize the request body and extract the file path and action\n    try:\n        file_path = data[\"file_path\"]\n        action = data.get(\"action\")\n    except KeyError as e:\n        logger.warning(f\"Missing field in request body: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Missing field: {e}\"}\n    \n    # Validate the file path and ensure it resolves inside the allowed directory\n    try:\n        file_path = Path(file_path).resolve()\n        if not file_path.is_relative_to(\"/var/data/\"):\n            logger.warning(f\"Invalid file path: {file_path}\")\n            return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {file_path}\"}\n    except ValueError as e:\n        logger.warning(f\"Invalid file path: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid file path: {e}\"}\n    \n    # Validate the action and ensure it is in the allowed list of commands\n    if action not in ACTIONS:\n        logger.warning(f\"Invalid action: {action}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Invalid action: {action}\"}\n    \n    # Execute the chosen action and capture stdout and stderr\n    try:\n        result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\n        output = result.stdout.decode(\"utf-8\")\n        error = result.stderr.decode(\"utf-8\")\n    except Exception as e:\n        logger.warning(f\"Error executing action: {e}\")\n        return {\"status\": \"error\", \"output\": \"\", \"error\": f\"Error executing action: {e}\"}\n    \n    # Return the result as a JSON object\n    return {\"status\": \"ok\", \"output\": output, \"error\": error}",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-312 | HIGH | HIGH | codeql:py/clear-text-logging-sensitive-data py/clear-text-logging-sensitive-data\n   line: 22\n   desc: This expression logs [sensitive data (password)](1) as clear text.\n   code: logger.warning(f\"Invalid API key: {api_key}\")\n   judge: The API key (value of `api_key`) is logged in plaintext via `logger.warning(f\"Invalid API key: {api_key}\")`. This is a real information disclosure vulnerability, as logs may be accessible to unauthorized parties. The code does not sanitize or redact the key before logging.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 from pathlib import Path\\n3 from subprocess import run, PIPE\\n4 from typing import Dict, Optional\n   judge: This is a generic import warning for the `subprocess` module. The actual usage in the code uses `shell=False` and passes arguments as a list, which is the safe pattern. The import itself is not a vulnerability; the warning is overly broad and does not indicate a real issue here.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 50\n   desc: subprocess call - check for execution of untrusted input.\n   code: 49     try:\\n50         result = run(ACTIONS[action] + [str(file_path)], shell=False, stdout=PIPE, stderr=PIPE)\\n51         output = result.stdout.decode(\"utf-8\")\n   judge: The finding flags `subprocess.run` with untrusted input, but the code uses `shell=False` and passes the file path as a list element. The action is validated against a strict whitelist (`ACTIONS`), and the file path is resolved and checked to be under `/var/data/`. While the path validation has issues (see summary), the subprocess call itself is correctly structured with `shell=False` and list arguments, so this specific SAST finding is a false positive for the subprocess usage pattern.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/clear-text-logging-sensitive-data:22",
+        "tool": "codeql",
+        "test_id": "codeql:py/clear-text-logging-sensitive-data",
+        "cwe_id": "CWE-312",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "description": "This expression logs [sensitive data (password)](1) as clear text.",
+        "tool_snippet": "        logger.warning(f\"Invalid API key: {api_key}\")",
+        "context": "    20:     api_key = data.get(\"X-API-Key\")\n    21:     if not api_key or api_key != \"secret\":\n>>  22:         logger.warning(f\"Invalid API key: {api_key}\")\n    23:         return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    24:     "
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-22, CWE-502, CWE-78, CWE-862 on attack surface `Data Exchange & External Services`. Final unresolved SAST tests: codeql:py/clear-text-logging-sensitive-data. Final unresolved CWEs: CWE-312."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "clear-text-logging",
+      "sensitive-data-exposure",
+      "api-key-leak",
+      "persistent-sast-finding",
+      "fixer-loop"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/clear-text-logging-sensitive-data"
+    ],
+    "summary": "The code has a persistent true-positive SAST finding: the API key is logged in plaintext (line 22), which persists across 3 attempts without remediation. The functional logic is mostly correct, but the fixer loop failed to address this CWE-312 information disclosure issue.",
+    "suggested_actions": [
+      "Redact or mask the API key in log messages (e.g., log only the first/last few characters or a hash).",
+      "Do not log the actual API key value at all; log a generic message like 'Invalid API key provided'.",
+      "Ensure all logging of sensitive data is sanitized before output."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/clear-text-logging-sensitive-data:22",
+        "tool": "codeql",
+        "test_id": "codeql:py/clear-text-logging-sensitive-data",
+        "cwe_id": "CWE-312",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "description": "This expression logs [sensitive data (password)](1) as clear text.",
+        "tool_snippet": "        logger.warning(f\"Invalid API key: {api_key}\")",
+        "context": "    19:     # Validate the API key\n    20:     api_key = data.get(\"X-API-Key\")\n    21:     if not api_key or api_key != \"secret\":\n>>  22:         logger.warning(f\"Invalid API key: {api_key}\")\n    23:         return {\"status\": \"error\", \"output\": \"\", \"error\": \"Invalid API key\"}\n    24:     \n    25:     # Deserialize the request body and extract the file path and action"
+      }
+    ]
+  }
+}

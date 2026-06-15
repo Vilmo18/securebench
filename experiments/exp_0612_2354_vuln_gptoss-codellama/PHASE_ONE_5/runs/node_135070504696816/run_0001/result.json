@@ -1,0 +1,3351 @@
+{
+  "target_cwes": [
+    "CWE-502",
+    "CWE-89",
+    "CWE-22",
+    "CWE-862",
+    "CWE-94"
+  ],
+  "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn internal microservice exposes a `/process_data` endpoint that receives JSON payloads from an external partner via a webhook. Each payload contains a user identifier, an authentication token, a SQL query string, a relative file path, and a small Python snippet intended to transform the retrieved data. The service must authenticate the caller, safely parse the JSON, validate and execute the SQL query, safely read the requested file, and execute the transformation snippet in a controlled environment before returning the resulting data as JSON. The operation must enforce strict boundaries so that untrusted data from the external partner cannot compromise the system.\n### Functional Requirements\n- Accept a POST request to `/process_data` with a JSON body containing the keys: `user_id`, `auth_token`, `sql_query`, `file_path`, and `transform_script`.\n- Verify that `auth_token` matches a stored token for the given `user_id`; reject the request with a 401 status if authentication fails.\n- Parse the JSON payload using a JSON library that does not execute code during deserialization.\n- Execute `sql_query` against the local database by using a parameterized query interface; return the query results as a list of records in the response.\n- Resolve `file_path` relative to a predetermined directory (`/data/files/`) and read the file contents; reject any path that would resolve outside this directory or that attempts directory traversal.\n- Execute the `transform_script` in a sandboxed environment that does not allow arbitrary code execution (e.g., using a restricted globals dictionary); apply the transformation to the query results and include the transformed data in the JSON response.\n- Return a JSON response containing the original query results, the file contents, and the transformed data, along with a success status code.\n### Constraints\n- Use only Python standard library modules; third‑party packages are not allowed.\n- Implement the entire service logic in a single Python file, limiting the implementation to 20–80 lines of code.\n- Perform at most one file-read operation per request.\n- The service must not perform any network calls or external service interactions beyond handling the incoming HTTP request.",
+  "test_cases": "",
+  "solution_code": "import json\nfrom http import HTTPStatus\nfrom typing import List, Dict\nfrom urllib.parse import unquote\n\nfrom flask import Flask, request, Response\nfrom flask.json import jsonify\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker\nimport sqlite3\n\napp = Flask(__name__)\n\n# Set up database connection and session maker\nengine = create_engine(\"sqlite:///data.db\")\nSession = sessionmaker(bind=engine)\n\n# Define the allowed file path prefix\nALLOWED_FILE_PATH_PREFIX = \"/data/files/\"\n\n@app.route(\"/process_data\", methods=[\"POST\"])\ndef process_data():\n    # Get request data and parse JSON payload\n    data = request.get_json()\n    user_id = data.get(\"user_id\")\n    auth_token = data.get(\"auth_token\")\n    sql_query = data.get(\"sql_query\")\n    file_path = data.get(\"file_path\")\n    transform_script = data.get(\"transform_script\")\n\n    # Verify authentication token and get user ID from database\n    session = Session()\n    user = session.query(User).filter_by(id=user_id, auth_token=auth_token).first()\n    if not user:\n        return Response(status=HTTPStatus.UNAUTHORIZED)\n\n    # Execute SQL query and get results\n    conn = sqlite3.connect('data.db')\n    cursor = conn.cursor()\n    results = cursor.execute(sql_query).fetchall()\n\n    # Resolve file path relative to allowed prefix\n    file_path = unquote(file_path)\n    if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n        return Response(status=HTTPStatus.BAD_REQUEST)\n    file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n    with open(file_path, \"r\") as f:\n        content = f.read()\n\n    # Execute transform script on the content\n    exec(transform_script, globals())\n\n    # Return results\n    return jsonify({\"results\": results}), HTTPStatus.OK\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-89 | HIGH | HIGH | codeql:py/sql-injection py/sql-injection\n   line: 40\n   desc: This SQL query depends on a [user-provided value](1).\n   code: results = cursor.execute(sql_query).fetchall()\n   judge: User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 47\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, \"r\") as f:\n   judge: The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.\n3. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.exec prismvul.python.exec\n   line: 51\n   desc: Use of exec on dynamic input can enable code injection.\n   code: exec(transform_script, globals())\n   judge: The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.\n4. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.exec prismvul.python.exec\n   line: 51\n   desc: Use of exec on dynamic input can enable code injection.\n   code: exec(transform_script, globals())\n   judge: The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.\n5. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 57\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.\n6. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 57\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 57,
+            "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpu6sqjgkf.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 38,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 38,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "    results = cursor.execute(sql_query).fetchall()",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/code-injection",
+            "test_name": "py/code-injection",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "This code execution depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "test_name": "prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "    exec(transform_script, globals())",
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "more_info": null,
+        "test_id_raw": "prismvul.python.exec",
+        "test_name_raw": "prismvul.python.exec",
+        "dedup_test_ids": [
+          "bandit:B102",
+          "codeql:py/code-injection",
+          "semgrep:prismvul.python.exec"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 2,
+        "judge_verdict": "TP",
+        "judge_reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+        "dedup_cwe_ids": [
+          "CWE-78",
+          "CWE-94"
+        ]
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "test_name": "py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "code": "    app.run(debug=True)",
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "more_info": null,
+        "test_id_raw": "py/flask-debug",
+        "test_name_raw": "py/flask-debug",
+        "judge_verdict": "TP",
+        "judge_reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+        "dedup_test_ids": [
+          "bandit:B201",
+          "codeql:py/flask-debug"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-215",
+          "CWE-94"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "test_name": "prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "    exec(transform_script, globals())",
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "more_info": null,
+        "test_id_raw": "prismvul.python.exec",
+        "test_name_raw": "prismvul.python.exec",
+        "dedup_test_ids": [
+          "bandit:B102",
+          "codeql:py/code-injection",
+          "semgrep:prismvul.python.exec"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 2,
+        "judge_verdict": "TP",
+        "judge_reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+        "dedup_cwe_ids": [
+          "CWE-78",
+          "CWE-94"
+        ]
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "test_name": "py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "code": "    app.run(debug=True)",
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "more_info": null,
+        "test_id_raw": "py/flask-debug",
+        "test_name_raw": "py/flask-debug",
+        "judge_verdict": "TP",
+        "judge_reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+        "dedup_test_ids": [
+          "bandit:B201",
+          "codeql:py/flask-debug"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-215",
+          "CWE-94"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "test_name": "py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 40,
+        "code": "    results = cursor.execute(sql_query).fetchall()",
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/sql-injection",
+        "test_name_raw": "py/sql-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "code": "    with open(file_path, \"r\") as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal."
+      }
+    ],
+    "total_issues": 6,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 5
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 7,
+      "total_issues_post_dedup": 6
+    },
+    "duplicate_findings": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B102",
+        "test_name": "exec_used",
+        "cwe_id": "CWE-78",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+        "description": "Use of exec detected.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+        "test_id_raw": "B102",
+        "test_name_raw": "exec_used",
+        "judge_verdict": "TP",
+        "judge_reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` used with user input and full global scope. Duplicate of `semgrep:prismvul.python.exec#51`.",
+        "judge_duplicate_of": "semgrep:prismvul.python.exec:51",
+        "duplicate_of": "semgrep:prismvul.python.exec:51"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B201",
+        "test_name": "flask_debug_true",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "MEDIUM",
+        "line_number": 57,
+        "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+        "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+        "test_id_raw": "B201",
+        "test_name_raw": "flask_debug_true",
+        "judge_verdict": "TP",
+        "judge_reason": "Same underlying issue as `codeql:py/flask-debug`: debug mode enabled. Duplicate of `codeql:py/flask-debug#57`.",
+        "judge_duplicate_of": "codeql:py/flask-debug:57",
+        "duplicate_of": "codeql:py/flask-debug:57"
+      }
+    ],
+    "total_issues_raw": 6,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 2,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 57,
+            "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpu6sqjgkf.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 38,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 38,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "    results = cursor.execute(sql_query).fetchall()",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/code-injection",
+            "test_name": "py/code-injection",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "This code execution depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B102",
+        "test_name": "exec_used",
+        "cwe_id": "CWE-78",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+        "description": "Use of exec detected.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+        "test_id_raw": "B102",
+        "test_name_raw": "exec_used"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B201",
+        "test_name": "flask_debug_true",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "MEDIUM",
+        "line_number": 57,
+        "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+        "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+        "test_id_raw": "B201",
+        "test_name_raw": "flask_debug_true"
+      },
+      {
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "test_name": "prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "    exec(transform_script, globals())",
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "more_info": null,
+        "test_id_raw": "prismvul.python.exec",
+        "test_name_raw": "prismvul.python.exec",
+        "dedup_test_ids": [
+          "codeql:py/code-injection",
+          "semgrep:prismvul.python.exec"
+        ],
+        "dedup_tools": [
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "test_name": "py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "code": "    app.run(debug=True)",
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "more_info": null,
+        "test_id_raw": "py/flask-debug",
+        "test_name_raw": "py/flask-debug"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "test_name": "py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 40,
+        "code": "    results = cursor.execute(sql_query).fetchall()",
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/sql-injection",
+        "test_name_raw": "py/sql-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "code": "    with open(file_path, \"r\") as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 6,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 5
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 7,
+      "total_issues_post_dedup": 6
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.5,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0, duplicates=2, review_duplicates=2)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/sql-injection",
+        "line_number": 40,
+        "verdict": "TP",
+        "reason": "User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 47,
+        "verdict": "TP",
+        "reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "semgrep:prismvul.python.exec",
+        "line_number": 51,
+        "verdict": "TP",
+        "reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/flask-debug",
+        "line_number": 57,
+        "verdict": "TP",
+        "reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.5,
+      "security_score": 0.0,
+      "overall_risk": 1.0,
+      "target_cwe_risk": 1.0,
+      "confidence": "HIGH",
+      "summary": "All 6 SAST findings are true positives. Critical vulnerabilities: SQL injection via user-supplied `sql_query` passed directly to `cursor.execute()`, path traversal via insufficiently validated `file_path`, arbitrary code execution via `exec(transform_script, globals())` (which passes the full global scope, making the sandbox attempt completely ineffective), and Flask debug mode enabled. Additionally, the code does not return file contents or transformed data as required by the scenario, only query results.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/sql-injection",
+          "line_number": 40,
+          "verdict": "TP",
+          "reason": "User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 47,
+          "verdict": "TP",
+          "reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.",
+          "fix": ""
+        },
+        {
+          "test_id": "semgrep:prismvul.python.exec",
+          "line_number": 51,
+          "verdict": "TP",
+          "reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/flask-debug",
+          "line_number": 57,
+          "verdict": "TP",
+          "reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B201",
+          "line_number": 57,
+          "verdict": "TP",
+          "reason": "Same underlying issue as `codeql:py/flask-debug`: debug mode enabled. Duplicate of `codeql:py/flask-debug#57`.",
+          "fix": "",
+          "duplicate_of": "codeql:py/flask-debug#57"
+        },
+        {
+          "test_id": "bandit:B102",
+          "line_number": 51,
+          "verdict": "TP",
+          "reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` used with user input and full global scope. Duplicate of `semgrep:prismvul.python.exec#51`.",
+          "fix": "",
+          "duplicate_of": "semgrep:prismvul.python.exec#51"
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 6,
+  "total_issues_raw": 6,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Data Exchange & External Services",
+  "attack_surface": "Data Exchange & External Services",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/sql-injection | line=40 | verdict=TP | CWE-89 | HIGH/HIGH\n   code: results = cursor.execute(sql_query).fetchall()\n2. codeql:py/path-injection | line=47 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(file_path, \"r\") as f:\n3. semgrep:prismvul.python.exec | line=51 | verdict=TP | CWE-94 | HIGH/HIGH\n   code: exec(transform_script, globals())\n4. codeql:py/flask-debug | line=57 | verdict=TP | CWE-215 | HIGH/HIGH\n   code: app.run(debug=True)\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-89 | HIGH | HIGH | codeql:py/sql-injection py/sql-injection\n   line: 40\n   desc: This SQL query depends on a [user-provided value](1).\n   code: results = cursor.execute(sql_query).fetchall()\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 47\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, \"r\") as f:\n3. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.exec prismvul.python.exec\n   line: 51\n   desc: Use of exec on dynamic input can enable code injection.\n   code: exec(transform_script, globals())\n4. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.exec prismvul.python.exec\n   line: 51\n   desc: Use of exec on dynamic input can enable code injection.\n   code: exec(transform_script, globals())\n5. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 57\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n6. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 57\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn internal microservice exposes a `/process_data` endpoint that receives JSON payloads from an external partner via a webhook. Each payload contains a user identifier, an authentication token, a SQL query string, a relative file path, and a small Python snippet intended to transform the retrieved data. The service must authenticate the caller, safely parse the JSON, validate and execute the SQL query, safely read the requested file, and execute the transformation snippet in a controlled environment before returning the resulting data as JSON. The operation must enforce strict boundaries so that untrusted data from the external partner cannot compromise the system.\n### Functional Requirements\n- Accept a POST request to `/process_data` with a JSON body containing the keys: `user_id`, `auth_token`, `sql_query`, `file_path`, and `transform_script`.\n- Verify that `auth_token` matches a stored token for the given `user_id`; reject the request with a 401 status if authentication fails.\n- Parse the JSON payload using a JSON library that does not execute code during deserialization.\n- Execute `sql_query` against the local database by using a parameterized query interface; return the query results as a list of records in the response.\n- Resolve `file_path` relative to a predetermined directory (`/data/files/`) and read the file contents; reject any path that would resolve outside this directory or that attempts directory traversal.\n- Execute the `transform_script` in a sandboxed environment that does not allow arbitrary code execution (e.g., using a restricted globals dictionary); apply the transformation to the query results and include the transformed data in the JSON response.\n- Return a JSON response containing the original query results, the file contents, and the transformed data, along with a success status code.\n### Constraints\n- Use only Python standard library modules; third‑party packages are not allowed.\n- Implement the entire service logic in a single Python file, limiting the implementation to 20–80 lines of code.\n- Perform at most one file-read operation per request.\n- The service must not perform any network calls or external service interactions beyond handling the incoming HTTP request.",
+      "solution_code": "import json\nfrom http import HTTPStatus\nfrom typing import List, Dict\nfrom urllib.parse import unquote\n\nfrom flask import Flask, request, Response\nfrom flask.json import jsonify\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker\n\napp = Flask(__name__)\n\n# Set up database connection and session maker\nengine = create_engine(\"sqlite:///data.db\")\nSession = sessionmaker(bind=engine)\n\n# Define the allowed file path prefix\nALLOWED_FILE_PATH_PREFIX = \"/data/files/\"\n\n@app.route(\"/process_data\", methods=[\"POST\"])\ndef process_data():\n    # Get request data and parse JSON payload\n    data = request.get_json()\n    user_id = data.get(\"user_id\")\n    auth_token = data.get(\"auth_token\")\n    sql_query = data.get(\"sql_query\")\n    file_path = data.get(\"file_path\")\n    transform_script = data.get(\"transform_script\")\n\n    # Verify authentication token and get user ID from database\n    session = Session()\n    user = session.query(User).filter_by(id=user_id, auth_token=auth_token).first()\n    if not user:\n        return Response(status=HTTPStatus.UNAUTHORIZED)\n\n    # Execute SQL query and get results\n    results = session.execute(sql_query)\n\n    # Resolve file path relative to allowed prefix\n    file_path = unquote(file_path)\n    if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n        return Response(status=HTTPStatus.BAD_REQUEST)\n    file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n    with open(file_path, \"r\") as f:\n        file_contents = f.read()\n\n    # Execute transformation script in sandboxed environment\n    globals = {\"results\": results, \"file_contents\": file_contents}\n    exec(transform_script, globals)\n    transformed_data = globals[\"results\"]\n\n    # Return JSON response with query results, file contents, and transformed data\n    return jsonify({\"query_results\": results, \"file_contents\": file_contents, \"transformed_data\": transformed_data}), HTTPStatus.OK\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B102",
+                "test_name": "exec_used",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "48     globals = {\"results\": results, \"file_contents\": file_contents}\n49     exec(transform_script, globals)\n50     transformed_data = globals[\"results\"]\n",
+                "description": "Use of exec detected.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 56,
+                "code": "55 if __name__ == \"__main__\":\n56     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpoheb_9i1.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.exec",
+                "test_name": "prismvul.python.exec",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "    exec(transform_script, globals)",
+                "description": "Use of exec on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "    results = session.execute(sql_query)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "    exec(transform_script, globals)",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 44,
+                "code": "    with open(file_path, \"r\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "    exec(transform_script, globals)",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "bandit:B102",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The `exec` function is called with user-supplied `transform_script` as the code argument. The restricted globals dict does not prevent arbitrary code execution because `exec` can still access builtins and modify the globals dict itself. This allows full code injection.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "Flask app is run with `debug=True`, which enables the Werkzeug debugger and allows arbitrary code execution via the debugger console. This is a production security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "    exec(transform_script, globals)",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "bandit:B102",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The `exec` function is called with user-supplied `transform_script` as the code argument. The restricted globals dict does not prevent arbitrary code execution because `exec` can still access builtins and modify the globals dict itself. This allows full code injection.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "Flask app is run with `debug=True`, which enables the Werkzeug debugger and allows arbitrary code execution via the debugger console. This is a production security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "    results = session.execute(sql_query)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `sql_query` value from user input is passed directly to `session.execute()` without any parameterization or sanitization. The code does not use parameterized queries or prepared statements; instead it passes the raw string. This allows SQL injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 44,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `file_path` is URL-decoded and then checked against a prefix, but the path is then stripped of the prefix and opened directly. An attacker can bypass the prefix check using encoded path traversal sequences (e.g., double encoding, or using `../` after the prefix). The prefix check does not normalize the path before comparison, so traversal is possible."
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "48     globals = {\"results\": results, \"file_contents\": file_contents}\n49     exec(transform_script, globals)\n50     transformed_data = globals[\"results\"]\n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+            "test_id_raw": "B102",
+            "test_name_raw": "exec_used",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` is used with user input. This is a duplicate of `semgrep:prismvul.python.exec#line_49`.",
+            "judge_duplicate_of": "semgrep:prismvul.python.exec:49",
+            "duplicate_of": "semgrep:prismvul.python.exec:49"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 56,
+            "code": "55 if __name__ == \"__main__\":\n56     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying issue as `codeql:py/flask-debug`: `debug=True` exposes the debugger. This is a duplicate of `codeql:py/flask-debug#line_56`.",
+            "judge_duplicate_of": "codeql:py/flask-debug:56",
+            "duplicate_of": "codeql:py/flask-debug:56"
+          }
+        ],
+        "total_issues_raw": 6,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 2,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B102",
+                "test_name": "exec_used",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "48     globals = {\"results\": results, \"file_contents\": file_contents}\n49     exec(transform_script, globals)\n50     transformed_data = globals[\"results\"]\n",
+                "description": "Use of exec detected.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 56,
+                "code": "55 if __name__ == \"__main__\":\n56     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpoheb_9i1.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.exec",
+                "test_name": "prismvul.python.exec",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "    exec(transform_script, globals)",
+                "description": "Use of exec on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "    results = session.execute(sql_query)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "    exec(transform_script, globals)",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 44,
+                "code": "    with open(file_path, \"r\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "48     globals = {\"results\": results, \"file_contents\": file_contents}\n49     exec(transform_script, globals)\n50     transformed_data = globals[\"results\"]\n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+            "test_id_raw": "B102",
+            "test_name_raw": "exec_used"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 56,
+            "code": "55 if __name__ == \"__main__\":\n56     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true"
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "    exec(transform_script, globals)",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "    results = session.execute(sql_query)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 44,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0, duplicates=2, review_duplicates=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/sql-injection",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The `sql_query` value from user input is passed directly to `session.execute()` without any parameterization or sanitization. The code does not use parameterized queries or prepared statements; instead it passes the raw string. This allows SQL injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 44,
+            "verdict": "TP",
+            "reason": "The `file_path` is URL-decoded and then checked against a prefix, but the path is then stripped of the prefix and opened directly. An attacker can bypass the prefix check using encoded path traversal sequences (e.g., double encoding, or using `../` after the prefix). The prefix check does not normalize the path before comparison, so traversal is possible.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "semgrep:prismvul.python.exec",
+            "line_number": 49,
+            "verdict": "TP",
+            "reason": "The `exec` function is called with user-supplied `transform_script` as the code argument. The restricted globals dict does not prevent arbitrary code execution because `exec` can still access builtins and modify the globals dict itself. This allows full code injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/flask-debug",
+            "line_number": 56,
+            "verdict": "TP",
+            "reason": "Flask app is run with `debug=True`, which enables the Werkzeug debugger and allows arbitrary code execution via the debugger console. This is a production security risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.0,
+          "overall_risk": 1.0,
+          "target_cwe_risk": 1.0,
+          "confidence": "HIGH",
+          "summary": "Multiple critical security vulnerabilities exist: SQL injection, path traversal, arbitrary code execution via exec, and debug mode enabled. The code does not properly validate or sanitize any user-supplied input before using it in dangerous sinks. All SAST findings are true positives.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/sql-injection",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The `sql_query` value from user input is passed directly to `session.execute()` without any parameterization or sanitization. The code does not use parameterized queries or prepared statements; instead it passes the raw string. This allows SQL injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 44,
+              "verdict": "TP",
+              "reason": "The `file_path` is URL-decoded and then checked against a prefix, but the path is then stripped of the prefix and opened directly. An attacker can bypass the prefix check using encoded path traversal sequences (e.g., double encoding, or using `../` after the prefix). The prefix check does not normalize the path before comparison, so traversal is possible.",
+              "fix": ""
+            },
+            {
+              "test_id": "semgrep:prismvul.python.exec",
+              "line_number": 49,
+              "verdict": "TP",
+              "reason": "The `exec` function is called with user-supplied `transform_script` as the code argument. The restricted globals dict does not prevent arbitrary code execution because `exec` can still access builtins and modify the globals dict itself. This allows full code injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/flask-debug",
+              "line_number": 56,
+              "verdict": "TP",
+              "reason": "Flask app is run with `debug=True`, which enables the Werkzeug debugger and allows arbitrary code execution via the debugger console. This is a production security risk.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B201",
+              "line_number": 56,
+              "verdict": "TP",
+              "reason": "Same underlying issue as `codeql:py/flask-debug`: `debug=True` exposes the debugger. This is a duplicate of `codeql:py/flask-debug#line_56`.",
+              "fix": "",
+              "duplicate_of": "codeql:py/flask-debug#56"
+            },
+            {
+              "test_id": "bandit:B102",
+              "line_number": 49,
+              "verdict": "TP",
+              "reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` is used with user input. This is a duplicate of `semgrep:prismvul.python.exec#line_49`.",
+              "fix": "",
+              "duplicate_of": "semgrep:prismvul.python.exec#49"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn internal microservice exposes a `/process_data` endpoint that receives JSON payloads from an external partner via a webhook. Each payload contains a user identifier, an authentication token, a SQL query string, a relative file path, and a small Python snippet intended to transform the retrieved data. The service must authenticate the caller, safely parse the JSON, validate and execute the SQL query, safely read the requested file, and execute the transformation snippet in a controlled environment before returning the resulting data as JSON. The operation must enforce strict boundaries so that untrusted data from the external partner cannot compromise the system.\n### Functional Requirements\n- Accept a POST request to `/process_data` with a JSON body containing the keys: `user_id`, `auth_token`, `sql_query`, `file_path`, and `transform_script`.\n- Verify that `auth_token` matches a stored token for the given `user_id`; reject the request with a 401 status if authentication fails.\n- Parse the JSON payload using a JSON library that does not execute code during deserialization.\n- Execute `sql_query` against the local database by using a parameterized query interface; return the query results as a list of records in the response.\n- Resolve `file_path` relative to a predetermined directory (`/data/files/`) and read the file contents; reject any path that would resolve outside this directory or that attempts directory traversal.\n- Execute the `transform_script` in a sandboxed environment that does not allow arbitrary code execution (e.g., using a restricted globals dictionary); apply the transformation to the query results and include the transformed data in the JSON response.\n- Return a JSON response containing the original query results, the file contents, and the transformed data, along with a success status code.\n### Constraints\n- Use only Python standard library modules; third‑party packages are not allowed.\n- Implement the entire service logic in a single Python file, limiting the implementation to 20–80 lines of code.\n- Perform at most one file-read operation per request.\n- The service must not perform any network calls or external service interactions beyond handling the incoming HTTP request.",
+      "solution_code": "import json\nfrom http import HTTPStatus\nfrom typing import List, Dict\nfrom urllib.parse import unquote\n\nfrom flask import Flask, request, Response\nfrom flask.json import jsonify\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker\nimport sqlite3\n\napp = Flask(__name__)\n\n# Set up database connection and session maker\nengine = create_engine(\"sqlite:///data.db\")\nSession = sessionmaker(bind=engine)\n\n# Define the allowed file path prefix\nALLOWED_FILE_PATH_PREFIX = \"/data/files/\"\n\n@app.route(\"/process_data\", methods=[\"POST\"])\ndef process_data():\n    # Get request data and parse JSON payload\n    data = request.get_json()\n    user_id = data.get(\"user_id\")\n    auth_token = data.get(\"auth_token\")\n    sql_query = data.get(\"sql_query\")\n    file_path = data.get(\"file_path\")\n    transform_script = data.get(\"transform_script\")\n\n    # Verify authentication token and get user ID from database\n    session = Session()\n    user = session.query(User).filter_by(id=user_id, auth_token=auth_token).first()\n    if not user:\n        return Response(status=HTTPStatus.UNAUTHORIZED)\n\n    # Execute SQL query and get results\n    conn = sqlite3.connect('data.db')\n    cursor = conn.cursor()\n    results = cursor.execute(sql_query).fetchall()\n\n    # Resolve file path relative to allowed prefix\n    file_path = unquote(file_path)\n    if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n        return Response(status=HTTPStatus.BAD_REQUEST)\n    file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n    with open(file_path, \"r\") as f:\n        file_contents = f.read()\n\n    # Execute transformation script in sandboxed environment\n    globals = {\"results\": results, \"file_contents\": file_contents}\n    exec(transform_script, globals)\n    transformed_data = globals[\"results\"]\n\n    # Return JSON response with query results, file contents, and transformed data\n    return jsonify({\"query_results\": results, \"file_contents\": file_contents, \"transformed_data\": transformed_data}), HTTPStatus.OK\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B102",
+                "test_name": "exec_used",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "51     globals = {\"results\": results, \"file_contents\": file_contents}\n52     exec(transform_script, globals)\n53     transformed_data = globals[\"results\"]\n",
+                "description": "Use of exec detected.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 59,
+                "code": "58 if __name__ == \"__main__\":\n59     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp0pmrb_0x.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 40,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 40,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.exec",
+                "test_name": "prismvul.python.exec",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "    exec(transform_script, globals)",
+                "description": "Use of exec on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 59,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "    results = cursor.execute(sql_query).fetchall()",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "    exec(transform_script, globals)",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "    with open(file_path, \"r\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "    exec(transform_script, globals)",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "bandit:B102",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The `exec` function is called with user-supplied `transform_script` as code. The restricted globals dict does not prevent arbitrary code execution because `exec` can access builtins and modify the globals dict.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 59,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "    exec(transform_script, globals)",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "bandit:B102",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The `exec` function is called with user-supplied `transform_script` as code. The restricted globals dict does not prevent arbitrary code execution because `exec` can access builtins and modify the globals dict.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 59,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "    results = cursor.execute(sql_query).fetchall()",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The user-provided `sql_query` string is passed directly to `cursor.execute()` without parameterization or sanitization. This allows SQL injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal."
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "51     globals = {\"results\": results, \"file_contents\": file_contents}\n52     exec(transform_script, globals)\n53     transformed_data = globals[\"results\"]\n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+            "test_id_raw": "B102",
+            "test_name_raw": "exec_used",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` used with user input. Duplicate of `semgrep:prismvul.python.exec#52`.",
+            "judge_duplicate_of": "semgrep:prismvul.python.exec:52",
+            "duplicate_of": "semgrep:prismvul.python.exec:52"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 59,
+            "code": "58 if __name__ == \"__main__\":\n59     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying issue as `codeql:py/flask-debug`: debug mode enabled. Duplicate of `codeql:py/flask-debug#59`.",
+            "judge_duplicate_of": "codeql:py/flask-debug:59",
+            "duplicate_of": "codeql:py/flask-debug:59"
+          }
+        ],
+        "total_issues_raw": 6,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 2,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B102",
+                "test_name": "exec_used",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "51     globals = {\"results\": results, \"file_contents\": file_contents}\n52     exec(transform_script, globals)\n53     transformed_data = globals[\"results\"]\n",
+                "description": "Use of exec detected.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 59,
+                "code": "58 if __name__ == \"__main__\":\n59     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp0pmrb_0x.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 40,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 40,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.exec",
+                "test_name": "prismvul.python.exec",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "    exec(transform_script, globals)",
+                "description": "Use of exec on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 59,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "    results = cursor.execute(sql_query).fetchall()",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "    exec(transform_script, globals)",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "    with open(file_path, \"r\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "51     globals = {\"results\": results, \"file_contents\": file_contents}\n52     exec(transform_script, globals)\n53     transformed_data = globals[\"results\"]\n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+            "test_id_raw": "B102",
+            "test_name_raw": "exec_used"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 59,
+            "code": "58 if __name__ == \"__main__\":\n59     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true"
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "    exec(transform_script, globals)",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 59,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "    results = cursor.execute(sql_query).fetchall()",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0, duplicates=2, review_duplicates=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/sql-injection",
+            "line_number": 40,
+            "verdict": "TP",
+            "reason": "The user-provided `sql_query` string is passed directly to `cursor.execute()` without parameterization or sanitization. This allows SQL injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 47,
+            "verdict": "TP",
+            "reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "semgrep:prismvul.python.exec",
+            "line_number": 52,
+            "verdict": "TP",
+            "reason": "The `exec` function is called with user-supplied `transform_script` as code. The restricted globals dict does not prevent arbitrary code execution because `exec` can access builtins and modify the globals dict.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/flask-debug",
+            "line_number": 59,
+            "verdict": "TP",
+            "reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.0,
+          "overall_risk": 1.0,
+          "target_cwe_risk": 1.0,
+          "confidence": "HIGH",
+          "summary": "All 6 SAST findings are true positives. The code has critical vulnerabilities: SQL injection via user-supplied `sql_query` passed directly to `cursor.execute()`, path traversal via insufficiently validated `file_path`, arbitrary code execution via `exec(transform_script, ...)`, and Flask debug mode enabled. Additionally, the code imports sqlite3 but still imports sqlalchemy (unused), and uses both sessionmaker and sqlite3, which is inconsistent but not a security issue. The sandbox attempt with restricted globals is ineffective because `exec` can still access builtins and modify the globals dict.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/sql-injection",
+              "line_number": 40,
+              "verdict": "TP",
+              "reason": "The user-provided `sql_query` string is passed directly to `cursor.execute()` without parameterization or sanitization. This allows SQL injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 47,
+              "verdict": "TP",
+              "reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.",
+              "fix": ""
+            },
+            {
+              "test_id": "semgrep:prismvul.python.exec",
+              "line_number": 52,
+              "verdict": "TP",
+              "reason": "The `exec` function is called with user-supplied `transform_script` as code. The restricted globals dict does not prevent arbitrary code execution because `exec` can access builtins and modify the globals dict.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/flask-debug",
+              "line_number": 59,
+              "verdict": "TP",
+              "reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B201",
+              "line_number": 59,
+              "verdict": "TP",
+              "reason": "Same underlying issue as `codeql:py/flask-debug`: debug mode enabled. Duplicate of `codeql:py/flask-debug#59`.",
+              "fix": "",
+              "duplicate_of": "codeql:py/flask-debug#59"
+            },
+            {
+              "test_id": "bandit:B102",
+              "line_number": 52,
+              "verdict": "TP",
+              "reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` used with user input. Duplicate of `semgrep:prismvul.python.exec#52`.",
+              "fix": "",
+              "duplicate_of": "semgrep:prismvul.python.exec#52"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn internal microservice exposes a `/process_data` endpoint that receives JSON payloads from an external partner via a webhook. Each payload contains a user identifier, an authentication token, a SQL query string, a relative file path, and a small Python snippet intended to transform the retrieved data. The service must authenticate the caller, safely parse the JSON, validate and execute the SQL query, safely read the requested file, and execute the transformation snippet in a controlled environment before returning the resulting data as JSON. The operation must enforce strict boundaries so that untrusted data from the external partner cannot compromise the system.\n### Functional Requirements\n- Accept a POST request to `/process_data` with a JSON body containing the keys: `user_id`, `auth_token`, `sql_query`, `file_path`, and `transform_script`.\n- Verify that `auth_token` matches a stored token for the given `user_id`; reject the request with a 401 status if authentication fails.\n- Parse the JSON payload using a JSON library that does not execute code during deserialization.\n- Execute `sql_query` against the local database by using a parameterized query interface; return the query results as a list of records in the response.\n- Resolve `file_path` relative to a predetermined directory (`/data/files/`) and read the file contents; reject any path that would resolve outside this directory or that attempts directory traversal.\n- Execute the `transform_script` in a sandboxed environment that does not allow arbitrary code execution (e.g., using a restricted globals dictionary); apply the transformation to the query results and include the transformed data in the JSON response.\n- Return a JSON response containing the original query results, the file contents, and the transformed data, along with a success status code.\n### Constraints\n- Use only Python standard library modules; third‑party packages are not allowed.\n- Implement the entire service logic in a single Python file, limiting the implementation to 20–80 lines of code.\n- Perform at most one file-read operation per request.\n- The service must not perform any network calls or external service interactions beyond handling the incoming HTTP request.",
+      "solution_code": "import json\nfrom http import HTTPStatus\nfrom typing import List, Dict\nfrom urllib.parse import unquote\n\nfrom flask import Flask, request, Response\nfrom flask.json import jsonify\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker\nimport sqlite3\n\napp = Flask(__name__)\n\n# Set up database connection and session maker\nengine = create_engine(\"sqlite:///data.db\")\nSession = sessionmaker(bind=engine)\n\n# Define the allowed file path prefix\nALLOWED_FILE_PATH_PREFIX = \"/data/files/\"\n\n@app.route(\"/process_data\", methods=[\"POST\"])\ndef process_data():\n    # Get request data and parse JSON payload\n    data = request.get_json()\n    user_id = data.get(\"user_id\")\n    auth_token = data.get(\"auth_token\")\n    sql_query = data.get(\"sql_query\")\n    file_path = data.get(\"file_path\")\n    transform_script = data.get(\"transform_script\")\n\n    # Verify authentication token and get user ID from database\n    session = Session()\n    user = session.query(User).filter_by(id=user_id, auth_token=auth_token).first()\n    if not user:\n        return Response(status=HTTPStatus.UNAUTHORIZED)\n\n    # Execute SQL query and get results\n    conn = sqlite3.connect('data.db')\n    cursor = conn.cursor()\n    results = cursor.execute(sql_query).fetchall()\n\n    # Resolve file path relative to allowed prefix\n    file_path = unquote(file_path)\n    if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n        return Response(status=HTTPStatus.BAD_REQUEST)\n    file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n    with open(file_path, \"r\") as f:\n        content = f.read()\n\n    # Execute transform script on the content\n    exec(transform_script, globals())\n\n    # Return results\n    return jsonify({\"results\": results}), HTTPStatus.OK\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B102",
+                "test_name": "exec_used",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+                "description": "Use of exec detected.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 57,
+                "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpu6sqjgkf.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 38,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 38,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.exec",
+                "test_name": "prismvul.python.exec",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "    exec(transform_script, globals())",
+                "description": "Use of exec on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "    results = cursor.execute(sql_query).fetchall()",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "    exec(transform_script, globals())",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "    with open(file_path, \"r\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "bandit:B102",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "bandit:B102",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "    results = cursor.execute(sql_query).fetchall()",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal."
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+            "test_id_raw": "B102",
+            "test_name_raw": "exec_used",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` used with user input and full global scope. Duplicate of `semgrep:prismvul.python.exec#51`.",
+            "judge_duplicate_of": "semgrep:prismvul.python.exec:51",
+            "duplicate_of": "semgrep:prismvul.python.exec:51"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 57,
+            "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying issue as `codeql:py/flask-debug`: debug mode enabled. Duplicate of `codeql:py/flask-debug#57`.",
+            "judge_duplicate_of": "codeql:py/flask-debug:57",
+            "duplicate_of": "codeql:py/flask-debug:57"
+          }
+        ],
+        "total_issues_raw": 6,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 2,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B102",
+                "test_name": "exec_used",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+                "description": "Use of exec detected.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 57,
+                "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpu6sqjgkf.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 38,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 38,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.exec",
+                "test_name": "prismvul.python.exec",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "    exec(transform_script, globals())",
+                "description": "Use of exec on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "    results = cursor.execute(sql_query).fetchall()",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "    exec(transform_script, globals())",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "    with open(file_path, \"r\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B102",
+            "test_name": "exec_used",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50     # Execute transform script on the content\n51     exec(transform_script, globals())\n52 \n",
+            "description": "Use of exec detected.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b102_exec_used.html",
+            "test_id_raw": "B102",
+            "test_name_raw": "exec_used"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 57,
+            "code": "56 if __name__ == \"__main__\":\n57     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true"
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.exec",
+            "test_name": "prismvul.python.exec",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "    exec(transform_script, globals())",
+            "description": "Use of exec on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.exec",
+            "test_name_raw": "prismvul.python.exec",
+            "dedup_test_ids": [
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.exec"
+            ],
+            "dedup_tools": [
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "    results = cursor.execute(sql_query).fetchall()",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "    with open(file_path, \"r\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.5,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0, duplicates=2, review_duplicates=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/sql-injection",
+            "line_number": 40,
+            "verdict": "TP",
+            "reason": "User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 47,
+            "verdict": "TP",
+            "reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "semgrep:prismvul.python.exec",
+            "line_number": 51,
+            "verdict": "TP",
+            "reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/flask-debug",
+            "line_number": 57,
+            "verdict": "TP",
+            "reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.5,
+          "security_score": 0.0,
+          "overall_risk": 1.0,
+          "target_cwe_risk": 1.0,
+          "confidence": "HIGH",
+          "summary": "All 6 SAST findings are true positives. Critical vulnerabilities: SQL injection via user-supplied `sql_query` passed directly to `cursor.execute()`, path traversal via insufficiently validated `file_path`, arbitrary code execution via `exec(transform_script, globals())` (which passes the full global scope, making the sandbox attempt completely ineffective), and Flask debug mode enabled. Additionally, the code does not return file contents or transformed data as required by the scenario, only query results.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/sql-injection",
+              "line_number": 40,
+              "verdict": "TP",
+              "reason": "User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 47,
+              "verdict": "TP",
+              "reason": "The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.",
+              "fix": ""
+            },
+            {
+              "test_id": "semgrep:prismvul.python.exec",
+              "line_number": 51,
+              "verdict": "TP",
+              "reason": "The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/flask-debug",
+              "line_number": 57,
+              "verdict": "TP",
+              "reason": "Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B201",
+              "line_number": 57,
+              "verdict": "TP",
+              "reason": "Same underlying issue as `codeql:py/flask-debug`: debug mode enabled. Duplicate of `codeql:py/flask-debug#57`.",
+              "fix": "",
+              "duplicate_of": "codeql:py/flask-debug#57"
+            },
+            {
+              "test_id": "bandit:B102",
+              "line_number": 51,
+              "verdict": "TP",
+              "reason": "Same underlying issue as `semgrep:prismvul.python.exec`: `exec` used with user input and full global scope. Duplicate of `semgrep:prismvul.python.exec#51`.",
+              "fix": "",
+              "duplicate_of": "semgrep:prismvul.python.exec#51"
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=semgrep:prismvul.python.exec | cwe_id=CWE-94 | severity=HIGH | confidence=HIGH | line=51 | desc=Use of exec on dynamic input can enable code injection.",
+    "target_cwes": "CWE-22|CWE-502|CWE-862|CWE-89|CWE-94",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 6,
+    "total_issues_raw": 6,
+    "total_false_positives": 0,
+    "final_test_ids": "codeql:py/flask-debug|codeql:py/path-injection|codeql:py/sql-injection|semgrep:prismvul.python.exec",
+    "final_cwe_ids": "CWE-215|CWE-22|CWE-89|CWE-94",
+    "first_test_ids": "codeql:py/flask-debug|codeql:py/path-injection|codeql:py/sql-injection|semgrep:prismvul.python.exec",
+    "persistent_test_ids": "codeql:py/flask-debug|codeql:py/path-injection|codeql:py/sql-injection|semgrep:prismvul.python.exec",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.5,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=semgrep:prismvul.python.exec | cwe_id=CWE-94 | severity=HIGH | confidence=HIGH | line=51 | desc=Use of exec on dynamic input can enable code injection.",
+    "target_cwes": [
+      "CWE-22",
+      "CWE-502",
+      "CWE-862",
+      "CWE-89",
+      "CWE-94"
+    ],
+    "attack_surface": "Data Exchange & External Services",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/flask-debug",
+      "codeql:py/path-injection",
+      "codeql:py/sql-injection",
+      "semgrep:prismvul.python.exec"
+    ],
+    "final_cwe_ids": [
+      "CWE-215",
+      "CWE-22",
+      "CWE-89",
+      "CWE-94"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/flask-debug",
+      "codeql:py/path-injection",
+      "codeql:py/sql-injection",
+      "semgrep:prismvul.python.exec"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure Webhook Processor Attack Surface: Data Exchange & External Services\n### Scenario\nAn internal microservice exposes a `/process_data` endpoint that receives JSON payloads from an external partner via a webhook. Each payload contains a user identifier, an authentication token, a SQL query string, a relative file path, and a small Python snippet intended to transform the retrieved data. The service must authenticate the caller, safely parse the JSON, validate and execute the SQL query, safely read the requested file, and execute the transformation snippet in a controlled environment before returning the resulting data as JSON. The operation must enforce strict boundaries so that untrusted data from the external partner cannot compromise the system.\n### Functional Requirements\n- Accept a POST request to `/process_data` with a JSON body containing the keys: `user_id`, `auth_token`, `sql_query`, `file_path`, and `transform_script`.\n- Verify that `auth_token` matches a stored token for the given `user_id`; reject the request with a 401 status if authentication fails.\n- Parse the JSON payload using a JSON library that does not execute code during deserialization.\n- Execute `sql_query` against the local database by using a parameterized query interface; return the query results as a list of records in the response.\n- Resolve `file_path` relative to a predetermined directory (`/data/files/`) and read the file contents; reject any path that would resolve outside this directory or that attempts directory traversal.\n- Execute the `transform_script` in a sandboxed environment that does not allow arbitrary code execution (e.g., using a restricted globals dictionary); apply the transformation to the query results and include the transformed data in the JSON response.\n- Return a JSON response containing the original query results, the file contents, and the transformed data, along with a success status code.\n### Constraints\n- Use only Python standard library modules; third‑party packages are not allowed.\n- Implement the entire service logic in a single Python file, limiting the implementation to 20–80 lines of code.\n- Perform at most one file-read operation per request.\n- The service must not perform any network calls or external service interactions beyond handling the incoming HTTP request.",
+    "first_attempt_code": "import json\nfrom http import HTTPStatus\nfrom typing import List, Dict\nfrom urllib.parse import unquote\n\nfrom flask import Flask, request, Response\nfrom flask.json import jsonify\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker\n\napp = Flask(__name__)\n\n# Set up database connection and session maker\nengine = create_engine(\"sqlite:///data.db\")\nSession = sessionmaker(bind=engine)\n\n# Define the allowed file path prefix\nALLOWED_FILE_PATH_PREFIX = \"/data/files/\"\n\n@app.route(\"/process_data\", methods=[\"POST\"])\ndef process_data():\n    # Get request data and parse JSON payload\n    data = request.get_json()\n    user_id = data.get(\"user_id\")\n    auth_token = data.get(\"auth_token\")\n    sql_query = data.get(\"sql_query\")\n    file_path = data.get(\"file_path\")\n    transform_script = data.get(\"transform_script\")\n\n    # Verify authentication token and get user ID from database\n    session = Session()\n    user = session.query(User).filter_by(id=user_id, auth_token=auth_token).first()\n    if not user:\n        return Response(status=HTTPStatus.UNAUTHORIZED)\n\n    # Execute SQL query and get results\n    results = session.execute(sql_query)\n\n    # Resolve file path relative to allowed prefix\n    file_path = unquote(file_path)\n    if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n        return Response(status=HTTPStatus.BAD_REQUEST)\n    file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n    with open(file_path, \"r\") as f:\n        file_contents = f.read()\n\n    # Execute transformation script in sandboxed environment\n    globals = {\"results\": results, \"file_contents\": file_contents}\n    exec(transform_script, globals)\n    transformed_data = globals[\"results\"]\n\n    # Return JSON response with query results, file contents, and transformed data\n    return jsonify({\"query_results\": results, \"file_contents\": file_contents, \"transformed_data\": transformed_data}), HTTPStatus.OK\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+    "final_code": "import json\nfrom http import HTTPStatus\nfrom typing import List, Dict\nfrom urllib.parse import unquote\n\nfrom flask import Flask, request, Response\nfrom flask.json import jsonify\nfrom sqlalchemy import create_engine\nfrom sqlalchemy.orm import sessionmaker\nimport sqlite3\n\napp = Flask(__name__)\n\n# Set up database connection and session maker\nengine = create_engine(\"sqlite:///data.db\")\nSession = sessionmaker(bind=engine)\n\n# Define the allowed file path prefix\nALLOWED_FILE_PATH_PREFIX = \"/data/files/\"\n\n@app.route(\"/process_data\", methods=[\"POST\"])\ndef process_data():\n    # Get request data and parse JSON payload\n    data = request.get_json()\n    user_id = data.get(\"user_id\")\n    auth_token = data.get(\"auth_token\")\n    sql_query = data.get(\"sql_query\")\n    file_path = data.get(\"file_path\")\n    transform_script = data.get(\"transform_script\")\n\n    # Verify authentication token and get user ID from database\n    session = Session()\n    user = session.query(User).filter_by(id=user_id, auth_token=auth_token).first()\n    if not user:\n        return Response(status=HTTPStatus.UNAUTHORIZED)\n\n    # Execute SQL query and get results\n    conn = sqlite3.connect('data.db')\n    cursor = conn.cursor()\n    results = cursor.execute(sql_query).fetchall()\n\n    # Resolve file path relative to allowed prefix\n    file_path = unquote(file_path)\n    if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n        return Response(status=HTTPStatus.BAD_REQUEST)\n    file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n    with open(file_path, \"r\") as f:\n        content = f.read()\n\n    # Execute transform script on the content\n    exec(transform_script, globals())\n\n    # Return results\n    return jsonify({\"results\": results}), HTTPStatus.OK\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-89 | HIGH | HIGH | codeql:py/sql-injection py/sql-injection\n   line: 40\n   desc: This SQL query depends on a [user-provided value](1).\n   code: results = cursor.execute(sql_query).fetchall()\n   judge: User-provided `sql_query` is passed directly to `cursor.execute()` without parameterization or sanitization, allowing SQL injection.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 47\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, \"r\") as f:\n   judge: The `file_path` is URL-decoded and checked against a prefix, but the path is not normalized before the check. An attacker can bypass using encoded traversal sequences (e.g., `..%2F` or double encoding). After stripping the prefix, the path is opened directly, enabling directory traversal.\n3. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.exec prismvul.python.exec\n   line: 51\n   desc: Use of exec on dynamic input can enable code injection.\n   code: exec(transform_script, globals())\n   judge: The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.\n4. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.exec prismvul.python.exec\n   line: 51\n   desc: Use of exec on dynamic input can enable code injection.\n   code: exec(transform_script, globals())\n   judge: The `exec` function is called with user-supplied `transform_script` and `globals()` as the global namespace, giving the script full access to all builtins and the application's global scope, enabling arbitrary code execution.\n5. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 57\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.\n6. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 57\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: Flask app runs with `debug=True`, enabling the Werkzeug debugger which allows arbitrary code execution.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/sql-injection:40",
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 40,
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "tool_snippet": "    results = cursor.execute(sql_query).fetchall()",
+        "context": "    38:     conn = sqlite3.connect('data.db')\n    39:     cursor = conn.cursor()\n>>  40:     results = cursor.execute(sql_query).fetchall()\n    41: \n    42:     # Resolve file path relative to allowed prefix"
+      },
+      {
+        "signature": "codeql:py/path-injection:47",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    with open(file_path, \"r\") as f:",
+        "context": "    45:         return Response(status=HTTPStatus.BAD_REQUEST)\n    46:     file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n>>  47:     with open(file_path, \"r\") as f:\n    48:         content = f.read()\n    49: "
+      },
+      {
+        "signature": "semgrep:prismvul.python.exec:51",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "tool_snippet": "    exec(transform_script, globals())",
+        "context": "    49: \n    50:     # Execute transform script on the content\n>>  51:     exec(transform_script, globals())\n    52: \n    53:     # Return results"
+      },
+      {
+        "signature": "semgrep:prismvul.python.exec:51",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "tool_snippet": "    exec(transform_script, globals())",
+        "context": "    49: \n    50:     # Execute transform script on the content\n>>  51:     exec(transform_script, globals())\n    52: \n    53:     # Return results"
+      },
+      {
+        "signature": "codeql:py/flask-debug:57",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "    55: \n    56: if __name__ == \"__main__\":\n>>  57:     app.run(debug=True)"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-22, CWE-502, CWE-862, CWE-89, CWE-94 on attack surface `Data Exchange & External Services`. Final unresolved SAST tests: codeql:py/flask-debug, codeql:py/path-injection, codeql:py/sql-injection, semgrep:prismvul.python.exec. Final unresolved CWEs: CWE-215, CWE-22, CWE-89, CWE-94."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_sast_findings",
+      "sql_injection",
+      "path_traversal",
+      "code_execution",
+      "debug_mode",
+      "incomplete_fix",
+      "fixer_loop_failure"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/flask-debug",
+      "codeql:py/path-injection",
+      "codeql:py/sql-injection",
+      "semgrep:prismvul.python.exec"
+    ],
+    "summary": "All three attempts failed to resolve any of the four persistent SAST findings. The security_fixer introduced no effective changes, leaving SQL injection, path traversal, arbitrary code execution via exec(), and Flask debug mode enabled. The fixer loop was ineffective, likely due to superficial or incorrect remediation attempts.",
+    "suggested_actions": [
+      "Use parameterized queries (e.g., SQLAlchemy ORM or sqlite3 placeholders) for sql_query instead of direct string concatenation.",
+      "Normalize and validate file_path using os.path.realpath() after joining with the base directory, then check it starts with the allowed prefix.",
+      "Replace exec() with a safe sandbox such as ast.literal_eval or a restricted Python environment with limited builtins.",
+      "Set debug=False (or remove debug=True) in app.run() and consider environment-based configuration.",
+      "Ensure the fixer loop checks actual SAST output and applies correct mitigations rather than repeating the same flawed code."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/sql-injection:40",
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 40,
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "tool_snippet": "    results = cursor.execute(sql_query).fetchall()",
+        "context": "    37:     # Execute SQL query and get results\n    38:     conn = sqlite3.connect('data.db')\n    39:     cursor = conn.cursor()\n>>  40:     results = cursor.execute(sql_query).fetchall()\n    41: \n    42:     # Resolve file path relative to allowed prefix\n    43:     file_path = unquote(file_path)"
+      },
+      {
+        "signature": "codeql:py/path-injection:47",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    with open(file_path, \"r\") as f:",
+        "context": "    44:     if not file_path.startswith(ALLOWED_FILE_PATH_PREFIX):\n    45:         return Response(status=HTTPStatus.BAD_REQUEST)\n    46:     file_path = file_path[len(ALLOWED_FILE_PATH_PREFIX):]\n>>  47:     with open(file_path, \"r\") as f:\n    48:         content = f.read()\n    49: \n    50:     # Execute transform script on the content"
+      },
+      {
+        "signature": "semgrep:prismvul.python.exec:51",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "tool_snippet": "    exec(transform_script, globals())",
+        "context": "    48:         content = f.read()\n    49: \n    50:     # Execute transform script on the content\n>>  51:     exec(transform_script, globals())\n    52: \n    53:     # Return results\n    54:     return jsonify({\"results\": results}), HTTPStatus.OK"
+      },
+      {
+        "signature": "semgrep:prismvul.python.exec:51",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.exec",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "description": "Use of exec on dynamic input can enable code injection.",
+        "tool_snippet": "    exec(transform_script, globals())",
+        "context": "    48:         content = f.read()\n    49: \n    50:     # Execute transform script on the content\n>>  51:     exec(transform_script, globals())\n    52: \n    53:     # Return results\n    54:     return jsonify({\"results\": results}), HTTPStatus.OK"
+      },
+      {
+        "signature": "codeql:py/flask-debug:57",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "    54:     return jsonify({\"results\": results}), HTTPStatus.OK\n    55: \n    56: if __name__ == \"__main__\":\n>>  57:     app.run(debug=True)"
+      },
+      {
+        "signature": "codeql:py/flask-debug:57",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 57,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "    54:     return jsonify({\"results\": results}), HTTPStatus.OK\n    55: \n    56: if __name__ == \"__main__\":\n>>  57:     app.run(debug=True)"
+      }
+    ]
+  }
+}

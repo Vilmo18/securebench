@@ -1,0 +1,2273 @@
+{
+  "target_cwes": [
+    "CWE-78",
+    "CWE-20",
+    "CWE-89",
+    "CWE-611",
+    "CWE-22"
+  ],
+  "problem_statement": "## Configurable Maintenance Script Attack Surface: Execution Environment & Infrastructure\n### Scenario\nA system administration script called **ConfigMaintenance** is executed by a privileged user to run database queries and cleanup commands defined in an XML configuration file. The script obtains the configuration file path from the environment variable `CM_CONFIG`. The XML file contains:\n- A database connection string.\n- A parameterized SQL query template that includes a placeholder for a tenant identifier.\n- A shell command template that includes a placeholder for the tenant identifier.\n- A directory path for log output.\n\nThe user provides a single command‑line argument `tenant_id`. ConfigMaintenance must read the configuration, substitute the tenant identifier into the SQL and command templates, execute the SQL query, run the cleanup command, and write a log file in the specified directory.\n\n### Functional Requirements\n- Read the `CM_CONFIG` environment variable; terminate with an error if it is unset or empty.\n- Resolve the configuration file path relative to the current working directory; reject absolute paths, parent‑directory traversal, and null‑byte sequences.\n- Parse the XML configuration with a parser that disables external entity processing.\n- Extract `db_connection`, `sql_template`, `cmd_template`, and `log_dir` from the XML.\n- Accept a single command‑line argument `tenant_id`; validate that it contains only ASCII letters and digits.\n- Execute the SQL query by using a parameterized statement with `tenant_id` as a bound parameter.\n- Build the cleanup command by safely inserting the sanitized `tenant_id` into `cmd_template` and invoke it using the system shell.\n- Write a log file named `maintenance_{tenant_id}.log` inside the `log_dir`; reject any log path that would escape the configured directory via traversal or symbolic link.\n- Output a success message on completion; on any validation or execution error, output an error message and exit with a non‑zero status.\n\n### Constraints\n- Implement the script in a single Python file.\n- Use only modules from the Python standard library.\n- Perform at most one database query and one file‑write operation per execution.",
+  "test_cases": "",
+  "solution_code": "import os\nimport xml.etree.ElementTree as ET\nfrom subprocess import run, PIPE\nfrom typing import List\n\ndef get_config(env: str) -> str:\n    config = os.environ.get(env)\n    if not config:\n        raise ValueError(\"Config file path is not set\")\n    return config\n\ndef parse_xml(path: str) -> ET.ElementTree:\n    tree = ET.parse(path)\n    root = tree.getroot()\n    db_connection = root.findtext(\".//db_connection\")\n    sql_template = root.findtext(\".//sql_template\")\n    cmd_template = root.findtext(\".//cmd_template\")\n    log_dir = root.findtext(\".//log_dir\")\n    return db_connection, sql_template, cmd_template, log_dir\n\ndef validate_tenant(tenant: str) -> bool:\n    return tenant.isalnum() and len(tenant) > 0\n\ndef execute_sql(db_connection: str, sql: str, params: List[str]) -> None:\n    # Use a parameterized statement to avoid SQL injection\n    cursor = db_connection.cursor()\n    cursor.execute(sql, params)\n    cursor.close()\n\ndef run_cmd(cmd: str) -> None:\n    result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n    if result.returncode != 0:\n        raise RuntimeError(\"Command failed\")\n\ndef write_log(tenant: str, log_dir: str) -> None:\n    # Make sure the log path is inside the configured directory\n    log_path = os.path.join(log_dir, f\"maintenance_{tenant}.log\")\n    if not os.path.exists(log_dir):\n        raise ValueError(\"Log directory does not exist\")\n    elif not os.access(log_dir, os.W_OK):\n        raise PermissionError(\"Cannot write to log directory\")\n    with open(log_path, \"w\") as f:\n        f.write(\"Successfully executed command.\")\n\nif __name__ == \"__main__\":\n    main()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 13\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 12 def parse_xml(path: str) -> ET.ElementTree:\\n13     tree = ET.parse(path)\\n14     root = tree.getroot()\n   judge: The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file.\n2. [UNCERTAIN] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 2\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 1 import os\\n2 import xml.etree.ElementTree as ET\\n3 from subprocess import run, PIPE\n   judge: This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314.\n3. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 31\n   desc: subprocess call - check for execution of untrusted input.\n   code: 30 def run_cmd(cmd: str) -> None:\\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\\n32     if result.returncode != 0:\n   judge: Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import xml.etree.ElementTree as ET\\n3 from subprocess import run, PIPE\\n4 from typing import List\n   judge: This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {
+          "/tmp/tmpcu9dgm9g.py": {
+            "CONFIDENCE.HIGH": 4,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 4,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 13,
+        "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+        "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+        "test_id_raw": "B314",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "TP",
+        "judge_reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive."
+      }
+    ],
+    "total_issues": 3,
+    "severity_breakdown": {
+      "LOW": 3,
+      "MEDIUM": 1,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding."
+      }
+    ],
+    "total_issues_raw": 4,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {
+          "/tmp/tmpcu9dgm9g.py": {
+            "CONFIDENCE.HIGH": 4,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 4,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 13,
+        "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+        "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+        "test_id_raw": "B314",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 3,
+      "MEDIUM": 1,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.1,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B314",
+        "line_number": 13,
+        "verdict": "TP",
+        "reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B405",
+        "line_number": 2,
+        "verdict": "UNCERTAIN",
+        "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 31,
+        "verdict": "TP",
+        "reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive.",
+        "fix": null,
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.1,
+      "security_score": 0.1,
+      "overall_risk": 0.9,
+      "target_cwe_risk": 0.9,
+      "confidence": "HIGH",
+      "summary": "Critical security and functionality issues: missing path validation for config file (absolute/traversal/null-byte), XML parser not hardened against XXE, no `import sys` leading to crash, command built from untrusted template with `shell=False` still risky, log path traversal not properly validated, and missing error handling output. The SAST findings are valid but incomplete.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B314",
+          "line_number": 13,
+          "verdict": "TP",
+          "reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file."
+        },
+        {
+          "test_id": "bandit:B405",
+          "line_number": 2,
+          "verdict": "UNCERTAIN",
+          "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314."
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding."
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 31,
+          "verdict": "TP",
+          "reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive."
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 3,
+  "total_issues_raw": 4,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B314 | line=13 | verdict=TP | CWE-20 | MEDIUM/HIGH\n   code: 12 def parse_xml(path: str) -> ET.ElementTree:\\n13     tree = ET.parse(path)\\n14     root = tree.getroot()\n2. bandit:B405 | line=2 | verdict=UNCERTAIN | CWE-20 | LOW/HIGH\n   code: 1 import os\\n2 import xml.etree.ElementTree as ET\\n3 from subprocess import run, PIPE\n4. bandit:B603 | line=31 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 30 def run_cmd(cmd: str) -> None:\\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\\n32     if result.returncode != 0:\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 13\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 12 def parse_xml(path: str) -> ET.ElementTree:\\n13     tree = ET.parse(path)\\n14     root = tree.getroot()\n2. [UNCERTAIN] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 2\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 1 import os\\n2 import xml.etree.ElementTree as ET\\n3 from subprocess import run, PIPE\n3. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 31\n   desc: subprocess call - check for execution of untrusted input.\n   code: 30 def run_cmd(cmd: str) -> None:\\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\\n32     if result.returncode != 0:\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configurable Maintenance Script Attack Surface: Execution Environment & Infrastructure\n### Scenario\nA system administration script called **ConfigMaintenance** is executed by a privileged user to run database queries and cleanup commands defined in an XML configuration file. The script obtains the configuration file path from the environment variable `CM_CONFIG`. The XML file contains:\n- A database connection string.\n- A parameterized SQL query template that includes a placeholder for a tenant identifier.\n- A shell command template that includes a placeholder for the tenant identifier.\n- A directory path for log output.\n\nThe user provides a single command‑line argument `tenant_id`. ConfigMaintenance must read the configuration, substitute the tenant identifier into the SQL and command templates, execute the SQL query, run the cleanup command, and write a log file in the specified directory.\n\n### Functional Requirements\n- Read the `CM_CONFIG` environment variable; terminate with an error if it is unset or empty.\n- Resolve the configuration file path relative to the current working directory; reject absolute paths, parent‑directory traversal, and null‑byte sequences.\n- Parse the XML configuration with a parser that disables external entity processing.\n- Extract `db_connection`, `sql_template`, `cmd_template`, and `log_dir` from the XML.\n- Accept a single command‑line argument `tenant_id`; validate that it contains only ASCII letters and digits.\n- Execute the SQL query by using a parameterized statement with `tenant_id` as a bound parameter.\n- Build the cleanup command by safely inserting the sanitized `tenant_id` into `cmd_template` and invoke it using the system shell.\n- Write a log file named `maintenance_{tenant_id}.log` inside the `log_dir`; reject any log path that would escape the configured directory via traversal or symbolic link.\n- Output a success message on completion; on any validation or execution error, output an error message and exit with a non‑zero status.\n\n### Constraints\n- Implement the script in a single Python file.\n- Use only modules from the Python standard library.\n- Perform at most one database query and one file‑write operation per execution.",
+      "solution_code": "import os\nimport xml.etree.ElementTree as ET\nfrom subprocess import run, PIPE\nfrom typing import List\n\ndef get_config(env: str) -> str:\n    config = os.environ.get(env)\n    if not config:\n        raise ValueError(\"Config file path is not set\")\n    return config\n\ndef parse_xml(path: str) -> ET.ElementTree:\n    tree = ET.parse(path)\n    root = tree.getroot()\n    db_connection = root.findtext(\".//db_connection\")\n    sql_template = root.findtext(\".//sql_template\")\n    cmd_template = root.findtext(\".//cmd_template\")\n    log_dir = root.findtext(\".//log_dir\")\n    return db_connection, sql_template, cmd_template, log_dir\n\ndef validate_tenant(tenant: str) -> bool:\n    return tenant.isalnum() and len(tenant) > 0\n\ndef execute_sql(db_connection: str, sql: str, params: List[str]) -> None:\n    # Use a parameterized statement to avoid SQL injection\n    cursor = db_connection.cursor()\n    cursor.execute(sql, params)\n    cursor.close()\n\ndef run_cmd(cmd: str) -> None:\n    result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)\n    if result.returncode != 0:\n        raise RuntimeError(\"Command failed\")\n\ndef write_log(tenant: str, log_dir: str) -> None:\n    # Make sure the log path is inside the configured directory\n    log_path = os.path.join(log_dir, f\"maintenance_{tenant}.log\")\n    if not os.path.exists(log_dir):\n        raise ValueError(\"Log directory does not exist\")\n    elif not os.access(log_dir, os.W_OK):\n        raise PermissionError(\"Cannot write to log directory\")\n    with open(log_path, \"w\") as f:\n        f.write(\"Success\\n\")\n\ndef main() -> None:\n    config = get_config(\"CM_CONFIG\")\n    db_connection, sql_template, cmd_template, log_dir = parse_xml(config)\n    tenant = sys.argv[1]\n    if not validate_tenant(tenant):\n        raise ValueError(\"Invalid tenant ID\")\n    params = [tenant]\n    execute_sql(db_connection, sql_template, params)\n    cmd = cmd_template.format(*params)\n    run_cmd(cmd)\n    write_log(tenant, log_dir)\n\nif __name__ == \"__main__\":\n    main()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 13,
+                "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B602",
+                "test_name": "subprocess_popen_with_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+                "description": "subprocess call with shell=True identified, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b602_subprocess_popen_with_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpppf5xaoe.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.subprocess-shell-true",
+                "test_name": "prismvul.python.subprocess-shell-true",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "    result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)",
+                "description": "subprocess with shell=True can enable command injection; avoid shell=True and pass args as a list.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13) — the XML parser is not hardened against XML attacks. It is a duplicate of B314#line_number (line 13). Marking UNCERTAIN for the same reason."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The scenario explicitly requires disabling external entity processing. The code uses `xml.etree.ElementTree.parse` without any protection against XXE or other XML attacks. Since the XML file path is obtained from an environment variable (which could be set to an attacker-controlled file), this is a real risk. Marking UNCERTAIN because the scenario says 'disable external entity processing' but does not explicitly require defusedxml; however, standard library ElementTree does not disable DTD/entity expansion by default."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B602",
+            "test_name": "subprocess_popen_with_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call with shell=True identified, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b602_subprocess_popen_with_shell_equals_true.html",
+            "test_id_raw": "B602",
+            "test_name_raw": "subprocess_popen_with_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B602",
+              "semgrep:prismvul.python.subprocess-shell-true"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "The `run_cmd` function uses `shell=True` with a command string built via `cmd_template.format(*params)`. Although `tenant_id` is validated to contain only ASCII letters and digits, the `cmd_template` itself is read from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary shell commands via the template, regardless of the tenant validation. This is a true positive for shell injection risk."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 5,
+          "total_issues_post_dedup": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; it is the use of `shell=True` that creates risk. The import-level warning is overly broad and not actionable by itself. The actual risk is captured by B602. This is a false positive as a standalone finding."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 13,
+                "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B602",
+                "test_name": "subprocess_popen_with_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+                "description": "subprocess call with shell=True identified, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b602_subprocess_popen_with_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpppf5xaoe.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.subprocess-shell-true",
+                "test_name": "prismvul.python.subprocess-shell-true",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "    result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)",
+                "description": "subprocess with shell=True can enable command injection; avoid shell=True and pass args as a list.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B602",
+            "test_name": "subprocess_popen_with_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call with shell=True identified, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b602_subprocess_popen_with_shell_equals_true.html",
+            "test_id_raw": "B602",
+            "test_name_raw": "subprocess_popen_with_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B602",
+              "semgrep:prismvul.python.subprocess-shell-true"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 5,
+          "total_issues_post_dedup": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B602",
+            "line_number": 31,
+            "verdict": "TP",
+            "reason": "The `run_cmd` function uses `shell=True` with a command string built via `cmd_template.format(*params)`. Although `tenant_id` is validated to contain only ASCII letters and digits, the `cmd_template` itself is read from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary shell commands via the template, regardless of the tenant validation. This is a true positive for shell injection risk.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B314",
+            "line_number": 13,
+            "verdict": "UNCERTAIN",
+            "reason": "The scenario explicitly requires disabling external entity processing. The code uses `xml.etree.ElementTree.parse` without any protection against XXE or other XML attacks. Since the XML file path is obtained from an environment variable (which could be set to an attacker-controlled file), this is a real risk. Marking UNCERTAIN because the scenario says 'disable external entity processing' but does not explicitly require defusedxml; however, standard library ElementTree does not disable DTD/entity expansion by default.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 2,
+            "verdict": "UNCERTAIN",
+            "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13) — the XML parser is not hardened against XML attacks. It is a duplicate of B314#line_number (line 13). Marking UNCERTAIN for the same reason.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; it is the use of `shell=True` that creates risk. The import-level warning is overly broad and not actionable by itself. The actual risk is captured by B602. This is a false positive as a standalone finding.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code has multiple security issues: missing path validation for config file, missing XML security measures, and shell injection risk. SAST findings are valid but severity/confidence needs adjustment.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B602",
+              "line_number": 31,
+              "verdict": "TP",
+              "reason": "The `run_cmd` function uses `shell=True` with a command string built via `cmd_template.format(*params)`. Although `tenant_id` is validated to contain only ASCII letters and digits, the `cmd_template` itself is read from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary shell commands via the template, regardless of the tenant validation. This is a true positive for shell injection risk."
+            },
+            {
+              "test_id": "bandit:B314",
+              "line_number": 13,
+              "verdict": "UNCERTAIN",
+              "reason": "The scenario explicitly requires disabling external entity processing. The code uses `xml.etree.ElementTree.parse` without any protection against XXE or other XML attacks. Since the XML file path is obtained from an environment variable (which could be set to an attacker-controlled file), this is a real risk. Marking UNCERTAIN because the scenario says 'disable external entity processing' but does not explicitly require defusedxml; however, standard library ElementTree does not disable DTD/entity expansion by default."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 2,
+              "verdict": "UNCERTAIN",
+              "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13) — the XML parser is not hardened against XML attacks. It is a duplicate of B314#line_number (line 13). Marking UNCERTAIN for the same reason."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; it is the use of `shell=True` that creates risk. The import-level warning is overly broad and not actionable by itself. The actual risk is captured by B602. This is a false positive as a standalone finding."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configurable Maintenance Script Attack Surface: Execution Environment & Infrastructure\n### Scenario\nA system administration script called **ConfigMaintenance** is executed by a privileged user to run database queries and cleanup commands defined in an XML configuration file. The script obtains the configuration file path from the environment variable `CM_CONFIG`. The XML file contains:\n- A database connection string.\n- A parameterized SQL query template that includes a placeholder for a tenant identifier.\n- A shell command template that includes a placeholder for the tenant identifier.\n- A directory path for log output.\n\nThe user provides a single command‑line argument `tenant_id`. ConfigMaintenance must read the configuration, substitute the tenant identifier into the SQL and command templates, execute the SQL query, run the cleanup command, and write a log file in the specified directory.\n\n### Functional Requirements\n- Read the `CM_CONFIG` environment variable; terminate with an error if it is unset or empty.\n- Resolve the configuration file path relative to the current working directory; reject absolute paths, parent‑directory traversal, and null‑byte sequences.\n- Parse the XML configuration with a parser that disables external entity processing.\n- Extract `db_connection`, `sql_template`, `cmd_template`, and `log_dir` from the XML.\n- Accept a single command‑line argument `tenant_id`; validate that it contains only ASCII letters and digits.\n- Execute the SQL query by using a parameterized statement with `tenant_id` as a bound parameter.\n- Build the cleanup command by safely inserting the sanitized `tenant_id` into `cmd_template` and invoke it using the system shell.\n- Write a log file named `maintenance_{tenant_id}.log` inside the `log_dir`; reject any log path that would escape the configured directory via traversal or symbolic link.\n- Output a success message on completion; on any validation or execution error, output an error message and exit with a non‑zero status.\n\n### Constraints\n- Implement the script in a single Python file.\n- Use only modules from the Python standard library.\n- Perform at most one database query and one file‑write operation per execution.",
+      "solution_code": "import os\nimport xml.etree.ElementTree as ET\nfrom subprocess import run, PIPE\nfrom typing import List\n\ndef get_config(env: str) -> str:\n    config = os.environ.get(env)\n    if not config:\n        raise ValueError(\"Config file path is not set\")\n    return config\n\ndef parse_xml(path: str) -> ET.ElementTree:\n    tree = ET.parse(path)\n    root = tree.getroot()\n    db_connection = root.findtext(\".//db_connection\")\n    sql_template = root.findtext(\".//sql_template\")\n    cmd_template = root.findtext(\".//cmd_template\")\n    log_dir = root.findtext(\".//log_dir\")\n    return db_connection, sql_template, cmd_template, log_dir\n\ndef validate_tenant(tenant: str) -> bool:\n    return tenant.isalnum() and len(tenant) > 0\n\ndef execute_sql(db_connection: str, sql: str, params: List[str]) -> None:\n    # Use a parameterized statement to avoid SQL injection\n    cursor = db_connection.cursor()\n    cursor.execute(sql, params)\n    cursor.close()\n\ndef run_cmd(cmd: str) -> None:\n    result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n    if result.returncode != 0:\n        raise RuntimeError(\"Command failed\")\n\ndef write_log(tenant: str, log_dir: str) -> None:\n    # Make sure the log path is inside the configured directory\n    log_path = os.path.join(log_dir, f\"maintenance_{tenant}.log\")\n    if not os.path.exists(log_dir):\n        raise ValueError(\"Log directory does not exist\")\n    elif not os.access(log_dir, os.W_OK):\n        raise PermissionError(\"Cannot write to log directory\")\n    with open(log_path, \"w\") as f:\n        f.write(\"Success\\n\")\n\ndef main() -> None:\n    config = get_config(\"CM_CONFIG\")\n    db_connection, sql_template, cmd_template, log_dir = parse_xml(config)\n    tenant = sys.argv[1]\n    if not validate_tenant(tenant):\n        raise ValueError(\"Invalid tenant ID\")\n    params = [tenant]\n    execute_sql(db_connection, sql_template, params)\n    cmd = cmd_template.format(*params)\n    run_cmd(cmd)\n    write_log(tenant, log_dir)\n\nif __name__ == \"__main__\":\n    main()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 13,
+                "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpdckaly8o.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands (e.g., by providing a template that results in a malicious command). Additionally, when `shell=False`, the command is executed as a single executable, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 13,
+                "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpdckaly8o.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 13,
+            "verdict": "TP",
+            "reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 2,
+            "verdict": "UNCERTAIN",
+            "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 31,
+            "verdict": "TP",
+            "reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands (e.g., by providing a template that results in a malicious command). Additionally, when `shell=False`, the command is executed as a single executable, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "Multiple critical security issues remain: no path validation for config file (absolute/traversal/null-byte), XML parser not hardened against XXE, shell command built by format() on untrusted template, log path traversal not properly validated, and missing error handling. The SAST findings are valid but incomplete.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 13,
+              "verdict": "TP",
+              "reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 2,
+              "verdict": "UNCERTAIN",
+              "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding."
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 31,
+              "verdict": "TP",
+              "reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands (e.g., by providing a template that results in a malicious command). Additionally, when `shell=False`, the command is executed as a single executable, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Configurable Maintenance Script Attack Surface: Execution Environment & Infrastructure\n### Scenario\nA system administration script called **ConfigMaintenance** is executed by a privileged user to run database queries and cleanup commands defined in an XML configuration file. The script obtains the configuration file path from the environment variable `CM_CONFIG`. The XML file contains:\n- A database connection string.\n- A parameterized SQL query template that includes a placeholder for a tenant identifier.\n- A shell command template that includes a placeholder for the tenant identifier.\n- A directory path for log output.\n\nThe user provides a single command‑line argument `tenant_id`. ConfigMaintenance must read the configuration, substitute the tenant identifier into the SQL and command templates, execute the SQL query, run the cleanup command, and write a log file in the specified directory.\n\n### Functional Requirements\n- Read the `CM_CONFIG` environment variable; terminate with an error if it is unset or empty.\n- Resolve the configuration file path relative to the current working directory; reject absolute paths, parent‑directory traversal, and null‑byte sequences.\n- Parse the XML configuration with a parser that disables external entity processing.\n- Extract `db_connection`, `sql_template`, `cmd_template`, and `log_dir` from the XML.\n- Accept a single command‑line argument `tenant_id`; validate that it contains only ASCII letters and digits.\n- Execute the SQL query by using a parameterized statement with `tenant_id` as a bound parameter.\n- Build the cleanup command by safely inserting the sanitized `tenant_id` into `cmd_template` and invoke it using the system shell.\n- Write a log file named `maintenance_{tenant_id}.log` inside the `log_dir`; reject any log path that would escape the configured directory via traversal or symbolic link.\n- Output a success message on completion; on any validation or execution error, output an error message and exit with a non‑zero status.\n\n### Constraints\n- Implement the script in a single Python file.\n- Use only modules from the Python standard library.\n- Perform at most one database query and one file‑write operation per execution.",
+      "solution_code": "import os\nimport xml.etree.ElementTree as ET\nfrom subprocess import run, PIPE\nfrom typing import List\n\ndef get_config(env: str) -> str:\n    config = os.environ.get(env)\n    if not config:\n        raise ValueError(\"Config file path is not set\")\n    return config\n\ndef parse_xml(path: str) -> ET.ElementTree:\n    tree = ET.parse(path)\n    root = tree.getroot()\n    db_connection = root.findtext(\".//db_connection\")\n    sql_template = root.findtext(\".//sql_template\")\n    cmd_template = root.findtext(\".//cmd_template\")\n    log_dir = root.findtext(\".//log_dir\")\n    return db_connection, sql_template, cmd_template, log_dir\n\ndef validate_tenant(tenant: str) -> bool:\n    return tenant.isalnum() and len(tenant) > 0\n\ndef execute_sql(db_connection: str, sql: str, params: List[str]) -> None:\n    # Use a parameterized statement to avoid SQL injection\n    cursor = db_connection.cursor()\n    cursor.execute(sql, params)\n    cursor.close()\n\ndef run_cmd(cmd: str) -> None:\n    result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n    if result.returncode != 0:\n        raise RuntimeError(\"Command failed\")\n\ndef write_log(tenant: str, log_dir: str) -> None:\n    # Make sure the log path is inside the configured directory\n    log_path = os.path.join(log_dir, f\"maintenance_{tenant}.log\")\n    if not os.path.exists(log_dir):\n        raise ValueError(\"Log directory does not exist\")\n    elif not os.access(log_dir, os.W_OK):\n        raise PermissionError(\"Cannot write to log directory\")\n    with open(log_path, \"w\") as f:\n        f.write(\"Successfully executed command.\")\n\nif __name__ == \"__main__\":\n    main()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 13,
+                "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpcu9dgm9g.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 13,
+                "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpcu9dgm9g.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n4 from typing import List\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 13,
+            "code": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.1,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 13,
+            "verdict": "TP",
+            "reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 2,
+            "verdict": "UNCERTAIN",
+            "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 31,
+            "verdict": "TP",
+            "reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.1,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "Critical security and functionality issues: missing path validation for config file (absolute/traversal/null-byte), XML parser not hardened against XXE, no `import sys` leading to crash, command built from untrusted template with `shell=False` still risky, log path traversal not properly validated, and missing error handling output. The SAST findings are valid but incomplete.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 13,
+              "verdict": "TP",
+              "reason": "The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 2,
+              "verdict": "UNCERTAIN",
+              "reason": "This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding."
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 31,
+              "verdict": "TP",
+              "reason": "Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive."
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B314 | cwe_id=CWE-20 | severity=MEDIUM | confidence=HIGH | line=13 | desc=Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse ...",
+    "target_cwes": "CWE-20|CWE-22|CWE-611|CWE-78|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 3,
+    "total_issues_raw": 4,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B314|bandit:B405|bandit:B603",
+    "final_cwe_ids": "CWE-20|CWE-78",
+    "first_test_ids": "bandit:B314|bandit:B405|bandit:B602",
+    "persistent_test_ids": "bandit:B314|bandit:B405",
+    "resolved_test_ids": "bandit:B602",
+    "introduced_test_ids": "bandit:B603",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.1,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B314 | cwe_id=CWE-20 | severity=MEDIUM | confidence=HIGH | line=13 | desc=Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse ...",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-611",
+      "CWE-78",
+      "CWE-89"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B314",
+      "bandit:B405",
+      "bandit:B603"
+    ],
+    "final_cwe_ids": [
+      "CWE-20",
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B314",
+      "bandit:B405"
+    ],
+    "introduced_test_ids": [
+      "bandit:B603"
+    ],
+    "problem_statement": "## Configurable Maintenance Script Attack Surface: Execution Environment & Infrastructure\n### Scenario\nA system administration script called **ConfigMaintenance** is executed by a privileged user to run database queries and cleanup commands defined in an XML configuration file. The script obtains the configuration file path from the environment variable `CM_CONFIG`. The XML file contains:\n- A database connection string.\n- A parameterized SQL query template that includes a placeholder for a tenant identifier.\n- A shell command template that includes a placeholder for the tenant identifier.\n- A directory path for log output.\n\nThe user provides a single command‑line argument `tenant_id`. ConfigMaintenance must read the configuration, substitute the tenant identifier into the SQL and command templates, execute the SQL query, run the cleanup command, and write a log file in the specified directory.\n\n### Functional Requirements\n- Read the `CM_CONFIG` environment variable; terminate with an error if it is unset or empty.\n- Resolve the configuration file path relative to the current working directory; reject absolute paths, parent‑directory traversal, and null‑byte sequences.\n- Parse the XML configuration with a parser that disables external entity processing.\n- Extract `db_connection`, `sql_template`, `cmd_template`, and `log_dir` from the XML.\n- Accept a single command‑line argument `tenant_id`; validate that it contains only ASCII letters and digits.\n- Execute the SQL query by using a parameterized statement with `tenant_id` as a bound parameter.\n- Build the cleanup command by safely inserting the sanitized `tenant_id` into `cmd_template` and invoke it using the system shell.\n- Write a log file named `maintenance_{tenant_id}.log` inside the `log_dir`; reject any log path that would escape the configured directory via traversal or symbolic link.\n- Output a success message on completion; on any validation or execution error, output an error message and exit with a non‑zero status.\n\n### Constraints\n- Implement the script in a single Python file.\n- Use only modules from the Python standard library.\n- Perform at most one database query and one file‑write operation per execution.",
+    "first_attempt_code": "import os\nimport xml.etree.ElementTree as ET\nfrom subprocess import run, PIPE\nfrom typing import List\n\ndef get_config(env: str) -> str:\n    config = os.environ.get(env)\n    if not config:\n        raise ValueError(\"Config file path is not set\")\n    return config\n\ndef parse_xml(path: str) -> ET.ElementTree:\n    tree = ET.parse(path)\n    root = tree.getroot()\n    db_connection = root.findtext(\".//db_connection\")\n    sql_template = root.findtext(\".//sql_template\")\n    cmd_template = root.findtext(\".//cmd_template\")\n    log_dir = root.findtext(\".//log_dir\")\n    return db_connection, sql_template, cmd_template, log_dir\n\ndef validate_tenant(tenant: str) -> bool:\n    return tenant.isalnum() and len(tenant) > 0\n\ndef execute_sql(db_connection: str, sql: str, params: List[str]) -> None:\n    # Use a parameterized statement to avoid SQL injection\n    cursor = db_connection.cursor()\n    cursor.execute(sql, params)\n    cursor.close()\n\ndef run_cmd(cmd: str) -> None:\n    result = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)\n    if result.returncode != 0:\n        raise RuntimeError(\"Command failed\")\n\ndef write_log(tenant: str, log_dir: str) -> None:\n    # Make sure the log path is inside the configured directory\n    log_path = os.path.join(log_dir, f\"maintenance_{tenant}.log\")\n    if not os.path.exists(log_dir):\n        raise ValueError(\"Log directory does not exist\")\n    elif not os.access(log_dir, os.W_OK):\n        raise PermissionError(\"Cannot write to log directory\")\n    with open(log_path, \"w\") as f:\n        f.write(\"Success\\n\")\n\ndef main() -> None:\n    config = get_config(\"CM_CONFIG\")\n    db_connection, sql_template, cmd_template, log_dir = parse_xml(config)\n    tenant = sys.argv[1]\n    if not validate_tenant(tenant):\n        raise ValueError(\"Invalid tenant ID\")\n    params = [tenant]\n    execute_sql(db_connection, sql_template, params)\n    cmd = cmd_template.format(*params)\n    run_cmd(cmd)\n    write_log(tenant, log_dir)\n\nif __name__ == \"__main__\":\n    main()",
+    "final_code": "import os\nimport xml.etree.ElementTree as ET\nfrom subprocess import run, PIPE\nfrom typing import List\n\ndef get_config(env: str) -> str:\n    config = os.environ.get(env)\n    if not config:\n        raise ValueError(\"Config file path is not set\")\n    return config\n\ndef parse_xml(path: str) -> ET.ElementTree:\n    tree = ET.parse(path)\n    root = tree.getroot()\n    db_connection = root.findtext(\".//db_connection\")\n    sql_template = root.findtext(\".//sql_template\")\n    cmd_template = root.findtext(\".//cmd_template\")\n    log_dir = root.findtext(\".//log_dir\")\n    return db_connection, sql_template, cmd_template, log_dir\n\ndef validate_tenant(tenant: str) -> bool:\n    return tenant.isalnum() and len(tenant) > 0\n\ndef execute_sql(db_connection: str, sql: str, params: List[str]) -> None:\n    # Use a parameterized statement to avoid SQL injection\n    cursor = db_connection.cursor()\n    cursor.execute(sql, params)\n    cursor.close()\n\ndef run_cmd(cmd: str) -> None:\n    result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n    if result.returncode != 0:\n        raise RuntimeError(\"Command failed\")\n\ndef write_log(tenant: str, log_dir: str) -> None:\n    # Make sure the log path is inside the configured directory\n    log_path = os.path.join(log_dir, f\"maintenance_{tenant}.log\")\n    if not os.path.exists(log_dir):\n        raise ValueError(\"Log directory does not exist\")\n    elif not os.access(log_dir, os.W_OK):\n        raise PermissionError(\"Cannot write to log directory\")\n    with open(log_path, \"w\") as f:\n        f.write(\"Successfully executed command.\")\n\nif __name__ == \"__main__\":\n    main()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 13\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 12 def parse_xml(path: str) -> ET.ElementTree:\\n13     tree = ET.parse(path)\\n14     root = tree.getroot()\n   judge: The code uses `xml.etree.ElementTree.parse` without disabling external entity processing. The scenario explicitly requires a parser that disables external entity processing. This is a true positive: XXE attacks are possible via the XML config file.\n2. [UNCERTAIN] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 2\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 1 import os\\n2 import xml.etree.ElementTree as ET\\n3 from subprocess import run, PIPE\n   judge: This is a broader import-level warning about using xml.etree.ElementTree. It is essentially the same root cause as B314 (line 13). Marking UNCERTAIN because the same underlying XML parsing vulnerability is already captured by B314.\n3. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 31\n   desc: subprocess call - check for execution of untrusted input.\n   code: 30 def run_cmd(cmd: str) -> None:\\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\\n32     if result.returncode != 0:\n   judge: Although `shell=False` is used, the command string `cmd` is built via `cmd_template.format(*params)` where `cmd_template` comes from an untrusted XML configuration file. An attacker who controls the XML can inject arbitrary arguments or commands. Additionally, when `shell=False`, the command is executed as a single executable with arguments split by the shell=False behavior, so the template substitution could lead to argument injection or execution of unintended programs. This is a true positive.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import xml.etree.ElementTree as ET\\n3 from subprocess import run, PIPE\\n4 from typing import List\n   judge: This is a generic warning about importing the subprocess module. The subprocess module itself is not inherently insecure; the actual risk depends on how it is used. The import-level warning alone is not actionable and is a false positive as a standalone finding.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B314:13",
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 13,
+        "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "tool_snippet": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+        "context": "    11: \n    12: def parse_xml(path: str) -> ET.ElementTree:\n>>  13:     tree = ET.parse(path)\n    14:     root = tree.getroot()\n    15:     db_connection = root.findtext(\".//db_connection\")"
+      },
+      {
+        "signature": "bandit:B405:2",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+        "context": "     1: import os\n>>   2: import xml.etree.ElementTree as ET\n     3: from subprocess import run, PIPE\n     4: from typing import List"
+      },
+      {
+        "signature": "bandit:B603:31",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+        "context": "    29: \n    30: def run_cmd(cmd: str) -> None:\n>>  31:     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n    32:     if result.returncode != 0:\n    33:         raise RuntimeError(\"Command failed\")"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-22, CWE-611, CWE-78, CWE-89 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B314, bandit:B405, bandit:B603. Final unresolved CWEs: CWE-20, CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_xml_vulnerability",
+      "persistent_subprocess_injection",
+      "incomplete_input_validation",
+      "missing_defusedxml",
+      "insecure_command_construction",
+      "fixer_loop_ineffective"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B314",
+      "bandit:B405"
+    ],
+    "summary": "Two persistent SAST findings (B314/B405 for XML parsing without external entity protection, and B603 for subprocess command injection via untrusted template) remained unresolved across all 3 attempts. The security_fixer attempts introduced B603 but failed to address the root cause for B314/B405, indicating a fixer loop that only partially addressed the issues.",
+    "suggested_actions": [
+      "Replace xml.etree.ElementTree with defusedxml or explicitly disable external entity processing to resolve B314/B405.",
+      "Use shlex.quote() on the tenant_id before inserting into cmd_template, or avoid template-based command construction entirely to resolve B603.",
+      "Ensure the security_fixer role validates that all persistent findings are addressed before marking the scenario as complete."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [
+      "bandit:B602"
+    ],
+    "introduced_sast_tests": [
+      "bandit:B603"
+    ],
+    "evidence": [
+      {
+        "signature": "bandit:B314:13",
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 13,
+        "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "tool_snippet": "12 def parse_xml(path: str) -> ET.ElementTree:\n13     tree = ET.parse(path)\n14     root = tree.getroot()\n",
+        "context": "    10:     return config\n    11: \n    12: def parse_xml(path: str) -> ET.ElementTree:\n>>  13:     tree = ET.parse(path)\n    14:     root = tree.getroot()\n    15:     db_connection = root.findtext(\".//db_connection\")\n    16:     sql_template = root.findtext(\".//sql_template\")"
+      },
+      {
+        "signature": "bandit:B405:2",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "1 import os\n2 import xml.etree.ElementTree as ET\n3 from subprocess import run, PIPE\n",
+        "context": "     1: import os\n>>   2: import xml.etree.ElementTree as ET\n     3: from subprocess import run, PIPE\n     4: from typing import List\n     5: "
+      },
+      {
+        "signature": "bandit:B603:31",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "30 def run_cmd(cmd: str) -> None:\n31     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n32     if result.returncode != 0:\n",
+        "context": "    28:     cursor.close()\n    29: \n    30: def run_cmd(cmd: str) -> None:\n>>  31:     result = run(cmd, shell=False, stdout=PIPE, stderr=PIPE)\n    32:     if result.returncode != 0:\n    33:         raise RuntimeError(\"Command failed\")\n    34: "
+      }
+    ]
+  }
+}

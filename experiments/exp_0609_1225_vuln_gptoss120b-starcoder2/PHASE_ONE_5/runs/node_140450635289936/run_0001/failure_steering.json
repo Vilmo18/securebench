@@ -1,0 +1,58 @@
+{
+  "success": false,
+  "primary_reason": "unresolved_off_target_findings",
+  "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=4 | desc=Consider possible security implications associated with the subprocess module.",
+  "target_cwes": [
+    "CWE-502",
+    "CWE-611",
+    "CWE-862",
+    "CWE-89"
+  ],
+  "attack_surface": "Execution Environment & Infrastructure",
+  "attempts_executed": 3,
+  "fixer_attempts": 2,
+  "final_agent_role": "security_fixer",
+  "final_test_ids": [
+    "bandit:B404",
+    "bandit:B603"
+  ],
+  "final_cwe_ids": [
+    "CWE-78"
+  ],
+  "persistent_test_ids": [
+    "bandit:B404",
+    "bandit:B603"
+  ],
+  "introduced_test_ids": [],
+  "problem_statement": "## Container Provisioning Service Attack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA cloud‑based provisioning service allows internal staff to request new container instances via a web‑admin portal. The request is submitted as a JSON payload containing `image_name`, `env_vars` (a mapping of environment variable names to values), and an optional `config_xml` file that describes network and storage settings. The service must:\n\n1. Verify that the requesting user has the “provision” role.\n2. Deserialize the JSON payload.\n3. Parse the `config_xml` to extract allowed network parameters.\n4. Store the request details in an internal PostgreSQL database.\n5. Build and execute a `docker run` command that launches the container with the supplied image and environment variables.\n\nImplement the handler so that it performs proper authorization, safe deserialization, protected XML parsing, uses parameterized SQL statements, and constructs the OS command without exposing the execution environment to injection or external entity attacks.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing `image_name` (string), `env_vars` (object of string→string), and optionally `config_xml` (string containing XML).\n- Check that the authenticated user’s role includes “provision”. Reject the request with an appropriate error if not authorized.\n- Deserialize the JSON payload safely, rejecting any data that does not conform to the expected schema.\n- Parse `config_xml` using a secure XML parser that disables external entity resolution. Extract the `<network>` element’s `subnet` attribute; if missing, use a default subnet.\n- Insert a new row into the `provision_requests` table with columns `user_id`, `image_name`, `env_vars_json`, and `subnet` using a prepared statement.\n- Construct a `docker run` command that includes:\n  - `--env` flags for each entry in `env_vars`.\n  - `--network` flag with the extracted subnet.\n  - The supplied `image_name`.\n- Execute the command using a subprocess API that does not invoke a shell (e.g., `subprocess.run` with an argument list).\n- Return a JSON response indicating success and the container ID, or an error message for any validation failure.\n\n### Constraints\n- Use only Python standard library modules and the `psycopg2` package for database access.\n- Keep the entire implementation in a single Python file (approximately 20–80 lines of code).\n- Perform exactly one database INSERT per request and one subprocess execution per request.\n- Do not write any temporary files to disk; handle all data in memory.",
+  "first_attempt_code": "import json\nimport os\nfrom xml.etree.ElementTree import XMLParser, ElementTree\nfrom io import StringIO\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True)\n    if result.returncode != 0:\n        return json.dumps({\"error\": \"Docker command failed\"}), 500\n\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+  "final_code": "import json\nfrom defusedxml.ElementTree import XMLParser, ElementTree\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+  "sast_output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import psycopg2\\n4 import subprocess\\n5\n   judge: Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run.\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 52\n   desc: subprocess call - check for execution of untrusted input.\n   code: 51 \\n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\\n53     container_id = result.stdout.strip()\n   judge: subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command.",
+  "issue_snippets": [
+    {
+      "signature": "bandit:B404:4",
+      "tool": "bandit",
+      "test_id": "bandit:B404",
+      "cwe_id": "CWE-78",
+      "severity": "LOW",
+      "confidence": "HIGH",
+      "line_number": 4,
+      "description": "Consider possible security implications associated with the subprocess module.",
+      "tool_snippet": "3 import psycopg2\n4 import subprocess\n5 \n",
+      "context": "     2: from defusedxml.ElementTree import XMLParser, ElementTree\n     3: import psycopg2\n>>   4: import subprocess\n     5: \n     6: class SafeXMLParser(XMLParser):"
+    },
+    {
+      "signature": "bandit:B603:52",
+      "tool": "bandit",
+      "test_id": "bandit:B603",
+      "cwe_id": "CWE-78",
+      "severity": "LOW",
+      "confidence": "HIGH",
+      "line_number": 52,
+      "description": "subprocess call - check for execution of untrusted input.",
+      "tool_snippet": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+      "context": "    50:     docker_cmd.extend([\"--network\", subnet, image_name])\n    51: \n>>  52:     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    53:     container_id = result.stdout.strip()\n    54:     return json.dumps({\"success\": True, \"container_id\": container_id}), 200"
+    }
+  ],
+  "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-502, CWE-611, CWE-862, CWE-89 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B404, bandit:B603. Final unresolved CWEs: CWE-78."
+}

@@ -1,0 +1,2047 @@
+{
+  "target_cwes": [
+    "CWE-20",
+    "CWE-78",
+    "CWE-611",
+    "CWE-89",
+    "CWE-22"
+  ],
+  "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nAn internal web service allows privileged users to upload a custom XML configuration file that defines a SQL query and an optional post‑processing shell command. The service stores the uploaded file in a dedicated `configs/` directory, parses the XML to extract the query and command, executes the query against the internal SQLite database, writes the query result to a CSV file in a `reports/` directory, and finally runs the specified shell command on that CSV file. Implement the handler so that all inputs are validated, XML external entities are disabled, database access uses safe query handling, file paths are confined to the allowed directories, and the shell command is executed without allowing injection.\n\n### Functional Requirements  \n- Accept a file upload named `config.xml` from an authenticated user.  \n- Store the uploaded file under `configs/` using a sanitized filename that cannot escape this directory.  \n- Parse the XML configuration securely, extracting:  \n  - `<sql>` element containing a single SELECT statement.  \n  - Optional `<command>` element containing a shell command to run on the generated report.  \n- Execute the extracted SQL statement against the provided SQLite database using parameterized queries; do not concatenate user‑supplied values into the statement.  \n- Write the query result to a CSV file named `<sanitized_config_name>.csv` inside the `reports/` directory.  \n- If a `<command>` is present, execute it with the CSV file path as its sole argument, ensuring no additional command‑line injection is possible.  \n- Return a JSON response indicating success and the path to the generated report, or an appropriate error message for validation failures.\n\n### Constraints  \n- Use only Python standard library modules.  \n- All file operations must stay within the `configs/` and `reports/` directories; absolute paths, `..` segments, or null bytes in filenames must be rejected.  \n- XML parsing must disable external entity resolution.  \n- The shell command must be invoked without invoking a shell interpreter (e.g., using `subprocess.run` with a list of arguments).  \n- The implementation must reside in a single Python file and not exceed 80 lines of code.",
+  "test_cases": "",
+  "solution_code": "import os\nimport sqlite3\nimport subprocess\nimport json\nfrom defusedxml.ElementTree import fromstring as safe_fromstring\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nREPORT_DIR = 'reports/'\nDB_PATH = 'internal.db'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_').replace('..', '_')\n\ndef parse_xml(xml_content):\n    root = safe_fromstring(xml_content)\n    sql_query = root.find('sql').text.strip() if root.find('sql') is not None else None\n    command = root.find('command').text.strip() if root.find('command') is not None else None\n    return sql_query, command\n\ndef execute_query(query):\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(query)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        xml_content = self.rfile.read(content_length)\n\n        try:\n            sql_query, command = parse_xml(xml_content)\n            if not sql_query or not sql_query.strip().lower().startswith('select'):\n                raise ValueError(\"Invalid SQL query\")\n\n            config_filename = sanitize_filename('config.xml')\n            with open(os.path.join(CONFIG_DIR, config_filename), 'w') as f:\n                f.write(xml_content)\n\n            results = execute_query(sql_query)\n            report_filename = sanitize_filename(config_filename) + '.csv'\n            with open(os.path.join(REPORT_DIR, report_filename), 'w') as f:\n                for row in results:\n                    f.write(','.join(map(str, row)) + '\\n')\n\n            if command:\n                subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'success', 'report_path': os.path.join(REPORT_DIR, report_filename)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\n        except Exception as e:\n            self.send_response(400)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'error', 'message': str(e)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B607 start_process_with_partial_path\n   line: 55\n   desc: Starting a process with a partial executable path\n   code: 54             if command:\\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\\n56\n   judge: Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import sqlite3\\n3 import subprocess\\n4 import json\n   judge: Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmper6dccqs.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 63,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 63,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B607",
+        "test_name": "start_process_with_partial_path",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+        "description": "Starting a process with a partial executable path",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+        "test_id_raw": "B607",
+        "test_name_raw": "start_process_with_partial_path",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "bandit:B607"
+        ],
+        "dedup_tools": [
+          "bandit"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "TP",
+        "judge_reason": "Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 3,
+      "total_issues_post_dedup": 2
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import."
+      }
+    ],
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmper6dccqs.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 63,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 63,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B607",
+        "test_name": "start_process_with_partial_path",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+        "description": "Starting a process with a partial executable path",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+        "test_id_raw": "B607",
+        "test_name_raw": "start_process_with_partial_path",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "bandit:B607"
+        ],
+        "dedup_tools": [
+          "bandit"
+        ],
+        "dedup_count": 1
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 3,
+      "total_issues_post_dedup": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.5,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B607",
+        "line_number": 55,
+        "verdict": "TP",
+        "reason": "Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.5,
+      "security_score": 0.05,
+      "overall_risk": 0.98,
+      "target_cwe_risk": 0.98,
+      "confidence": "HIGH",
+      "summary": "Critical security issues: shell command execution uses 'sh -c' with insufficient escaping, allowing arbitrary command injection. SQL query is executed directly without parameterization. Filename sanitization is weak (does not block null bytes, absolute paths, or all path traversal). The command is not passed the CSV file path as required. SAST findings are TP/UNCERTAIN.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B607",
+          "line_number": 55,
+          "verdict": "TP",
+          "reason": "Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n2. bandit:B607 | line=55 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 54             if command:\\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\\n56\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B607 start_process_with_partial_path\n   line: 55\n   desc: Starting a process with a partial executable path\n   code: 54             if command:\\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\\n56\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nAn internal web service allows privileged users to upload a custom XML configuration file that defines a SQL query and an optional post‑processing shell command. The service stores the uploaded file in a dedicated `configs/` directory, parses the XML to extract the query and command, executes the query against the internal SQLite database, writes the query result to a CSV file in a `reports/` directory, and finally runs the specified shell command on that CSV file. Implement the handler so that all inputs are validated, XML external entities are disabled, database access uses safe query handling, file paths are confined to the allowed directories, and the shell command is executed without allowing injection.\n\n### Functional Requirements  \n- Accept a file upload named `config.xml` from an authenticated user.  \n- Store the uploaded file under `configs/` using a sanitized filename that cannot escape this directory.  \n- Parse the XML configuration securely, extracting:  \n  - `<sql>` element containing a single SELECT statement.  \n  - Optional `<command>` element containing a shell command to run on the generated report.  \n- Execute the extracted SQL statement against the provided SQLite database using parameterized queries; do not concatenate user‑supplied values into the statement.  \n- Write the query result to a CSV file named `<sanitized_config_name>.csv` inside the `reports/` directory.  \n- If a `<command>` is present, execute it with the CSV file path as its sole argument, ensuring no additional command‑line injection is possible.  \n- Return a JSON response indicating success and the path to the generated report, or an appropriate error message for validation failures.\n\n### Constraints  \n- Use only Python standard library modules.  \n- All file operations must stay within the `configs/` and `reports/` directories; absolute paths, `..` segments, or null bytes in filenames must be rejected.  \n- XML parsing must disable external entity resolution.  \n- The shell command must be invoked without invoking a shell interpreter (e.g., using `subprocess.run` with a list of arguments).  \n- The implementation must reside in a single Python file and not exceed 80 lines of code.",
+      "solution_code": "import os\nimport sqlite3\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nREPORT_DIR = 'reports/'\nDB_PATH = 'internal.db'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_').replace('..', '_')\n\ndef parse_xml(xml_content):\n    tree = ET.ElementTree(ET.fromstring(xml_content))\n    root = tree.getroot()\n    sql_query = root.find('sql').text.strip() if root.find('sql') is not None else None\n    command = root.find('command').text.strip() if root.find('command') is not None else None\n    return sql_query, command\n\ndef execute_query(query):\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(query)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        xml_content = self.rfile.read(content_length)\n\n        try:\n            sql_query, command = parse_xml(xml_content)\n            if not sql_query or not sql_query.strip().lower().startswith('select'):\n                raise ValueError(\"Invalid SQL query\")\n\n            config_filename = sanitize_filename('config.xml')\n            with open(os.path.join(CONFIG_DIR, config_filename), 'w') as f:\n                f.write(xml_content)\n\n            results = execute_query(sql_query)\n            report_filename = sanitize_filename(config_filename) + '.csv'\n            with open(os.path.join(REPORT_DIR, report_filename), 'w') as f:\n                for row in results:\n                    f.write(','.join(map(str, row)) + '\\n')\n\n            if command:\n                subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'success', 'report_path': os.path.join(REPORT_DIR, report_filename)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\n        except Exception as e:\n            self.send_response(400)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'error', 'message': str(e)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import subprocess\n4 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import subprocess\n4 import xml.etree.ElementTree as ET\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 15,
+                "code": "14 def parse_xml(xml_content):\n15     tree = ET.ElementTree(ET.fromstring(xml_content))\n16     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {
+              "/tmp/tmp7m38e6fl.py": {
+                "CONFIDENCE.HIGH": 5,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 4,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 5,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 4,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 4,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 15,
+                "code": "    tree = ET.ElementTree(ET.fromstring(xml_content))",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import subprocess\n4 import xml.etree.ElementTree as ET\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same root cause as bandit:B314 - importing xml.etree.ElementTree without defusedxml is risky, but the actual vulnerability is at the parse call on line 15. This import-level finding is a weaker signal, but still valid as a warning."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 15,
+            "code": "14 def parse_xml(xml_content):\n15     tree = ET.ElementTree(ET.fromstring(xml_content))\n16     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Code uses ET.fromstring() which is vulnerable to XML attacks (XXE, billion laughs). No defusedxml or other protection is used.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "Uses 'sh' with partial path (no absolute path), and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $())."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 15,
+            "code": "    tree = ET.ElementTree(ET.fromstring(xml_content))",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying vulnerability as bandit:B314 - ET.fromstring() without entity expansion protection allows billion laughs attack.",
+            "judge_duplicate_of": "bandit:B314",
+            "duplicate_of": "bandit:B314"
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import subprocess\n4 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import subprocess\n4 import xml.etree.ElementTree as ET\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 15,
+                "code": "14 def parse_xml(xml_content):\n15     tree = ET.ElementTree(ET.fromstring(xml_content))\n16     root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {
+              "/tmp/tmp7m38e6fl.py": {
+                "CONFIDENCE.HIGH": 5,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 4,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 5,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 4,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 4,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 15,
+                "code": "    tree = ET.ElementTree(ET.fromstring(xml_content))",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import subprocess\n4 import xml.etree.ElementTree as ET\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 15,
+            "code": "14 def parse_xml(xml_content):\n15     tree = ET.ElementTree(ET.fromstring(xml_content))\n16     root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 15,
+            "code": "    tree = ET.ElementTree(ET.fromstring(xml_content))",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=5, false_pos=1, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 15,
+            "verdict": "TP",
+            "reason": "Code uses ET.fromstring() which is vulnerable to XML attacks (XXE, billion laughs). No defusedxml or other protection is used.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 4,
+            "verdict": "UNCERTAIN",
+            "reason": "Same root cause as bandit:B314 - importing xml.etree.ElementTree without defusedxml is risky, but the actual vulnerability is at the parse call on line 15. This import-level finding is a weaker signal, but still valid as a warning.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B607",
+            "line_number": 55,
+            "verdict": "TP",
+            "reason": "Uses 'sh' with partial path (no absolute path), and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()).",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.2,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "Multiple critical security issues: XML parsing is vulnerable to XXE and billion laughs (no external entity protection), shell command execution uses 'sh -c' with insufficient escaping allowing injection, SQL query is directly concatenated without parameterization, and filename sanitization is weak (does not block null bytes or path separators properly). SAST findings are all TP or UNCERTAIN.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 15,
+              "verdict": "TP",
+              "reason": "Code uses ET.fromstring() which is vulnerable to XML attacks (XXE, billion laughs). No defusedxml or other protection is used.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 15,
+              "verdict": "TP",
+              "reason": "Same underlying vulnerability as bandit:B314 - ET.fromstring() without entity expansion protection allows billion laughs attack.",
+              "fix": "",
+              "duplicate_of": "bandit:B314#line15"
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 4,
+              "verdict": "UNCERTAIN",
+              "reason": "Same root cause as bandit:B314 - importing xml.etree.ElementTree without defusedxml is risky, but the actual vulnerability is at the parse call on line 15. This import-level finding is a weaker signal, but still valid as a warning.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B607",
+              "line_number": 55,
+              "verdict": "TP",
+              "reason": "Uses 'sh' with partial path (no absolute path), and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()).",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nAn internal web service allows privileged users to upload a custom XML configuration file that defines a SQL query and an optional post‑processing shell command. The service stores the uploaded file in a dedicated `configs/` directory, parses the XML to extract the query and command, executes the query against the internal SQLite database, writes the query result to a CSV file in a `reports/` directory, and finally runs the specified shell command on that CSV file. Implement the handler so that all inputs are validated, XML external entities are disabled, database access uses safe query handling, file paths are confined to the allowed directories, and the shell command is executed without allowing injection.\n\n### Functional Requirements  \n- Accept a file upload named `config.xml` from an authenticated user.  \n- Store the uploaded file under `configs/` using a sanitized filename that cannot escape this directory.  \n- Parse the XML configuration securely, extracting:  \n  - `<sql>` element containing a single SELECT statement.  \n  - Optional `<command>` element containing a shell command to run on the generated report.  \n- Execute the extracted SQL statement against the provided SQLite database using parameterized queries; do not concatenate user‑supplied values into the statement.  \n- Write the query result to a CSV file named `<sanitized_config_name>.csv` inside the `reports/` directory.  \n- If a `<command>` is present, execute it with the CSV file path as its sole argument, ensuring no additional command‑line injection is possible.  \n- Return a JSON response indicating success and the path to the generated report, or an appropriate error message for validation failures.\n\n### Constraints  \n- Use only Python standard library modules.  \n- All file operations must stay within the `configs/` and `reports/` directories; absolute paths, `..` segments, or null bytes in filenames must be rejected.  \n- XML parsing must disable external entity resolution.  \n- The shell command must be invoked without invoking a shell interpreter (e.g., using `subprocess.run` with a list of arguments).  \n- The implementation must reside in a single Python file and not exceed 80 lines of code.",
+      "solution_code": "import os\nimport sqlite3\nimport subprocess\nimport json\nfrom defusedxml.ElementTree import fromstring as safe_fromstring\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nREPORT_DIR = 'reports/'\nDB_PATH = 'internal.db'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_').replace('..', '_')\n\ndef parse_xml(xml_content):\n    root = safe_fromstring(xml_content)\n    sql_query = root.find('sql').text.strip() if root.find('sql') is not None else None\n    command = root.find('command').text.strip() if root.find('command') is not None else None\n    return sql_query, command\n\ndef execute_query(query):\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(query)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        xml_content = self.rfile.read(content_length)\n\n        try:\n            sql_query, command = parse_xml(xml_content)\n            if not sql_query or not sql_query.strip().lower().startswith('select'):\n                raise ValueError(\"Invalid SQL query\")\n\n            config_filename = sanitize_filename('config.xml')\n            with open(os.path.join(CONFIG_DIR, config_filename), 'w') as f:\n                f.write(xml_content)\n\n            results = execute_query(sql_query)\n            report_filename = sanitize_filename(config_filename) + '.csv'\n            with open(os.path.join(REPORT_DIR, report_filename), 'w') as f:\n                for row in results:\n                    f.write(','.join(map(str, row)) + '\\n')\n\n            if command:\n                subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'success', 'report_path': os.path.join(REPORT_DIR, report_filename)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\n        except Exception as e:\n            self.send_response(400)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'error', 'message': str(e)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpzlardvy0.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "Uses 'sh' with partial path (no absolute path), and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 3,
+          "total_issues_post_dedup": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpzlardvy0.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 3,
+          "total_issues_post_dedup": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B607",
+            "line_number": 55,
+            "verdict": "TP",
+            "reason": "Uses 'sh' with partial path (no absolute path), and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.1,
+          "overall_risk": 0.95,
+          "target_cwe_risk": 0.95,
+          "confidence": "HIGH",
+          "summary": "Critical security issues remain: shell command execution uses 'sh -c' with insufficient escaping, allowing arbitrary command injection. SQL query is executed directly without parameterization. Filename sanitization is weak (does not block null bytes, absolute paths, or all path traversal attempts). The command is not passed the CSV file path as required. SAST findings are TP/UNCERTAIN.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B607",
+              "line_number": 55,
+              "verdict": "TP",
+              "reason": "Uses 'sh' with partial path (no absolute path), and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nAn internal web service allows privileged users to upload a custom XML configuration file that defines a SQL query and an optional post‑processing shell command. The service stores the uploaded file in a dedicated `configs/` directory, parses the XML to extract the query and command, executes the query against the internal SQLite database, writes the query result to a CSV file in a `reports/` directory, and finally runs the specified shell command on that CSV file. Implement the handler so that all inputs are validated, XML external entities are disabled, database access uses safe query handling, file paths are confined to the allowed directories, and the shell command is executed without allowing injection.\n\n### Functional Requirements  \n- Accept a file upload named `config.xml` from an authenticated user.  \n- Store the uploaded file under `configs/` using a sanitized filename that cannot escape this directory.  \n- Parse the XML configuration securely, extracting:  \n  - `<sql>` element containing a single SELECT statement.  \n  - Optional `<command>` element containing a shell command to run on the generated report.  \n- Execute the extracted SQL statement against the provided SQLite database using parameterized queries; do not concatenate user‑supplied values into the statement.  \n- Write the query result to a CSV file named `<sanitized_config_name>.csv` inside the `reports/` directory.  \n- If a `<command>` is present, execute it with the CSV file path as its sole argument, ensuring no additional command‑line injection is possible.  \n- Return a JSON response indicating success and the path to the generated report, or an appropriate error message for validation failures.\n\n### Constraints  \n- Use only Python standard library modules.  \n- All file operations must stay within the `configs/` and `reports/` directories; absolute paths, `..` segments, or null bytes in filenames must be rejected.  \n- XML parsing must disable external entity resolution.  \n- The shell command must be invoked without invoking a shell interpreter (e.g., using `subprocess.run` with a list of arguments).  \n- The implementation must reside in a single Python file and not exceed 80 lines of code.",
+      "solution_code": "import os\nimport sqlite3\nimport subprocess\nimport json\nfrom defusedxml.ElementTree import fromstring as safe_fromstring\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nREPORT_DIR = 'reports/'\nDB_PATH = 'internal.db'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_').replace('..', '_')\n\ndef parse_xml(xml_content):\n    root = safe_fromstring(xml_content)\n    sql_query = root.find('sql').text.strip() if root.find('sql') is not None else None\n    command = root.find('command').text.strip() if root.find('command') is not None else None\n    return sql_query, command\n\ndef execute_query(query):\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(query)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        xml_content = self.rfile.read(content_length)\n\n        try:\n            sql_query, command = parse_xml(xml_content)\n            if not sql_query or not sql_query.strip().lower().startswith('select'):\n                raise ValueError(\"Invalid SQL query\")\n\n            config_filename = sanitize_filename('config.xml')\n            with open(os.path.join(CONFIG_DIR, config_filename), 'w') as f:\n                f.write(xml_content)\n\n            results = execute_query(sql_query)\n            report_filename = sanitize_filename(config_filename) + '.csv'\n            with open(os.path.join(REPORT_DIR, report_filename), 'w') as f:\n                for row in results:\n                    f.write(','.join(map(str, row)) + '\\n')\n\n            if command:\n                subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'success', 'report_path': os.path.join(REPORT_DIR, report_filename)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\n        except Exception as e:\n            self.send_response(400)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'error', 'message': str(e)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmper6dccqs.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 3,
+          "total_issues_post_dedup": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmper6dccqs.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 63,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import subprocess\n4 import json\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 3,
+          "total_issues_post_dedup": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.5,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B607",
+            "line_number": 55,
+            "verdict": "TP",
+            "reason": "Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.5,
+          "security_score": 0.05,
+          "overall_risk": 0.98,
+          "target_cwe_risk": 0.98,
+          "confidence": "HIGH",
+          "summary": "Critical security issues: shell command execution uses 'sh -c' with insufficient escaping, allowing arbitrary command injection. SQL query is executed directly without parameterization. Filename sanitization is weak (does not block null bytes, absolute paths, or all path traversal). The command is not passed the CSV file path as required. SAST findings are TP/UNCERTAIN.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B607",
+              "line_number": 55,
+              "verdict": "TP",
+              "reason": "Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B607 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=55 | desc=Starting a process with a partial executable path",
+    "target_cwes": "CWE-20|CWE-22|CWE-611|CWE-78|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B607",
+    "final_cwe_ids": "CWE-78",
+    "first_test_ids": "bandit:B314|bandit:B405|bandit:B607",
+    "persistent_test_ids": "bandit:B607",
+    "resolved_test_ids": "bandit:B314|bandit:B405",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.5,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B607 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=55 | desc=Starting a process with a partial executable path",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-611",
+      "CWE-78",
+      "CWE-89"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B607"
+    ],
+    "final_cwe_ids": [
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B607"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nAn internal web service allows privileged users to upload a custom XML configuration file that defines a SQL query and an optional post‑processing shell command. The service stores the uploaded file in a dedicated `configs/` directory, parses the XML to extract the query and command, executes the query against the internal SQLite database, writes the query result to a CSV file in a `reports/` directory, and finally runs the specified shell command on that CSV file. Implement the handler so that all inputs are validated, XML external entities are disabled, database access uses safe query handling, file paths are confined to the allowed directories, and the shell command is executed without allowing injection.\n\n### Functional Requirements  \n- Accept a file upload named `config.xml` from an authenticated user.  \n- Store the uploaded file under `configs/` using a sanitized filename that cannot escape this directory.  \n- Parse the XML configuration securely, extracting:  \n  - `<sql>` element containing a single SELECT statement.  \n  - Optional `<command>` element containing a shell command to run on the generated report.  \n- Execute the extracted SQL statement against the provided SQLite database using parameterized queries; do not concatenate user‑supplied values into the statement.  \n- Write the query result to a CSV file named `<sanitized_config_name>.csv` inside the `reports/` directory.  \n- If a `<command>` is present, execute it with the CSV file path as its sole argument, ensuring no additional command‑line injection is possible.  \n- Return a JSON response indicating success and the path to the generated report, or an appropriate error message for validation failures.\n\n### Constraints  \n- Use only Python standard library modules.  \n- All file operations must stay within the `configs/` and `reports/` directories; absolute paths, `..` segments, or null bytes in filenames must be rejected.  \n- XML parsing must disable external entity resolution.  \n- The shell command must be invoked without invoking a shell interpreter (e.g., using `subprocess.run` with a list of arguments).  \n- The implementation must reside in a single Python file and not exceed 80 lines of code.",
+    "first_attempt_code": "import os\nimport sqlite3\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nREPORT_DIR = 'reports/'\nDB_PATH = 'internal.db'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_').replace('..', '_')\n\ndef parse_xml(xml_content):\n    tree = ET.ElementTree(ET.fromstring(xml_content))\n    root = tree.getroot()\n    sql_query = root.find('sql').text.strip() if root.find('sql') is not None else None\n    command = root.find('command').text.strip() if root.find('command') is not None else None\n    return sql_query, command\n\ndef execute_query(query):\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(query)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        xml_content = self.rfile.read(content_length)\n\n        try:\n            sql_query, command = parse_xml(xml_content)\n            if not sql_query or not sql_query.strip().lower().startswith('select'):\n                raise ValueError(\"Invalid SQL query\")\n\n            config_filename = sanitize_filename('config.xml')\n            with open(os.path.join(CONFIG_DIR, config_filename), 'w') as f:\n                f.write(xml_content)\n\n            results = execute_query(sql_query)\n            report_filename = sanitize_filename(config_filename) + '.csv'\n            with open(os.path.join(REPORT_DIR, report_filename), 'w') as f:\n                for row in results:\n                    f.write(','.join(map(str, row)) + '\\n')\n\n            if command:\n                subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'success', 'report_path': os.path.join(REPORT_DIR, report_filename)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\n        except Exception as e:\n            self.send_response(400)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'error', 'message': str(e)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport sqlite3\nimport subprocess\nimport json\nfrom defusedxml.ElementTree import fromstring as safe_fromstring\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nREPORT_DIR = 'reports/'\nDB_PATH = 'internal.db'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_').replace('..', '_')\n\ndef parse_xml(xml_content):\n    root = safe_fromstring(xml_content)\n    sql_query = root.find('sql').text.strip() if root.find('sql') is not None else None\n    command = root.find('command').text.strip() if root.find('command') is not None else None\n    return sql_query, command\n\ndef execute_query(query):\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(query)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        xml_content = self.rfile.read(content_length)\n\n        try:\n            sql_query, command = parse_xml(xml_content)\n            if not sql_query or not sql_query.strip().lower().startswith('select'):\n                raise ValueError(\"Invalid SQL query\")\n\n            config_filename = sanitize_filename('config.xml')\n            with open(os.path.join(CONFIG_DIR, config_filename), 'w') as f:\n                f.write(xml_content)\n\n            results = execute_query(sql_query)\n            report_filename = sanitize_filename(config_filename) + '.csv'\n            with open(os.path.join(REPORT_DIR, report_filename), 'w') as f:\n                for row in results:\n                    f.write(','.join(map(str, row)) + '\\n')\n\n            if command:\n                subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'success', 'report_path': os.path.join(REPORT_DIR, report_filename)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\n        except Exception as e:\n            self.send_response(400)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            response = {'status': 'error', 'message': str(e)}\n            self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B607 start_process_with_partial_path\n   line: 55\n   desc: Starting a process with a partial executable path\n   code: 54             if command:\\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\\n56\n   judge: Uses 'sh' with partial path, and more critically uses 'sh -c' with a command string - this invokes a shell interpreter, violating the requirement to avoid shell injection. The escaping is insufficient (does not prevent command substitution with backticks or $()). Also the CSV file path is not passed as an argument to the command.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import sqlite3\\n3 import subprocess\\n4 import json\n   judge: Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual issue is in the usage at line 55, not the import.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B607:55",
+        "tool": "bandit",
+        "test_id": "bandit:B607",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "description": "Starting a process with a partial executable path",
+        "tool_snippet": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+        "context": "    53: \n    54:             if command:\n>>  55:                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n    56: \n    57:             self.send_response(200)"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-22, CWE-611, CWE-78, CWE-89 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B607. Final unresolved CWEs: CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "bandit:B607",
+      "CWE-78",
+      "shell_injection",
+      "subprocess_shell",
+      "insecure_command_execution",
+      "missing_argument_passing",
+      "insufficient_escaping"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B607"
+    ],
+    "summary": "The implementation fails to resolve the persistent bandit:B607 finding across all attempts. The final code uses 'sh -c' with a command string and insufficient escaping, violating the requirement to avoid shell injection and not passing the CSV file path as an argument.",
+    "suggested_actions": [
+      "Replace subprocess.run(['sh', '-c', ...]) with subprocess.run(['command', report_path]) using a list of arguments and no shell invocation",
+      "Pass the CSV file path as a separate argument to the command instead of relying on shell string manipulation",
+      "Ensure the command is validated against a whitelist of allowed executables to prevent arbitrary command execution"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [
+      "bandit:B314",
+      "bandit:B405"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B607:55",
+        "tool": "bandit",
+        "test_id": "bandit:B607",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "description": "Starting a process with a partial executable path",
+        "tool_snippet": "54             if command:\n55                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n56 \n",
+        "context": "    52:                     f.write(','.join(map(str, row)) + '\\n')\n    53: \n    54:             if command:\n>>  55:                 subprocess.run(['sh', '-c', command.replace('\"', '\\\\\"').replace(\"'\", \"\\\\'\")], check=True)\n    56: \n    57:             self.send_response(200)\n    58:             self.send_header('Content-Type', 'application/json')"
+      }
+    ]
+  }
+}

@@ -1,0 +1,1795 @@
+{
+  "target_cwes": [
+    "CWE-20",
+    "CWE-78",
+    "CWE-611",
+    "CWE-89"
+  ],
+  "problem_statement": "## Batch Job Configuration Processor\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based admin console allows privileged users to upload a job‑definition file named `job.xml`. The file is stored in the server’s `uploads/` directory. Each uploaded XML file describes a batch job that the backend must execute: it contains a shell command to run, a SQL statement to query the internal database, and a target output directory where the command’s result should be written. Implement the processing routine that, upon receiving a request to run a specific job, loads the corresponding `job.xml` from `uploads/`, extracts the command, SQL query, and output path, validates all extracted values, and then executes the command and the query, writing any command output to the designated directory.\n\n### Functional Requirements\n- Accept a `job_id` identifier supplied by the admin user (e.g., via a POST field).  \n- Resolve the XML file as `uploads/<job_id>.xml`.  \n- Verify that the resolved path is strictly inside the `uploads/` directory and does not contain path‑traversal sequences, null bytes, or symbolic‑link indirections.  \n- Parse the XML file using a safe parser that disables external entity resolution.  \n- Extract three elements from the XML:  \n  1. `<command>` – the shell command to execute.  \n  2. `<sql>` – the SQL statement to run against the internal SQLite database.  \n  3. `<outputDir>` – the directory where the command’s stdout should be saved.  \n- Validate that the `<command>` consists only of allowed whitelisted binaries (e.g., `ls`, `cat`, `grep`) and contains no additional characters or arguments that could alter its intended behavior.  \n- Validate that the `<sql>` statement is a single, parameter‑less `SELECT` query that references only permitted tables (`jobs`, `results`). Reject any statement that contains semicolons, comments, or data‑manipulation keywords.  \n- Validate that `<outputDir>` is a relative path that resolves under the server’s `job_outputs/` directory, rejecting absolute paths, parent‑directory references, or paths that resolve outside this directory.  \n- Execute the validated command using a subprocess call that does not invoke a shell.  \n- Execute the validated SQL statement using a parameter‑less cursor execution against the SQLite database.  \n- Capture the command’s stdout and write it to a file named `result.txt` inside the validated `<outputDir>`.  \n- Return a success response indicating that the job completed and the result file location.\n\n### Constraints\n- Use only Python’s standard library (e.g., `os`, `pathlib`, `xml.etree.ElementTree`, `subprocess`, `sqlite3`).  \n- Keep the implementation within a single Python file (≈20–80 lines).  \n- Perform exactly one file read (the XML file) and one file write (the result file) per job execution.  \n- Do not perform any network operations.  \n- The solution must handle all required input validation, command restriction, XML entity safety, and SQL statement restrictions as described.",
+  "test_cases": "",
+  "solution_code": "import os\nimport pathlib\nfrom defusedxml.ElementTree import parse as safe_parse\nimport subprocess\nimport sqlite3\n\nUPLOADS_DIR = 'uploads/'\nJOB_OUTPUTS_DIR = 'job_outputs/'\nALLOWED_COMMANDS = {'ls', 'cat', 'grep'}\nALLOWED_TABLES = {'jobs', 'results'}\n\ndef validate_command(command):\n    parts = command.split()\n    if not parts or parts[0] not in ALLOWED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if part.startswith('-') and part != '-E':\n            return False\n    return True\n\ndef validate_sql(sql):\n    sql_lower = sql.lower().strip()\n    if ';' in sql or '--' in sql or '/*' in sql:\n        return False\n    keywords = {'insert', 'update', 'delete', 'drop'}\n    for keyword in keywords:\n        if keyword in sql_lower.split():\n            return False\n    allowed_tables = set()\n    for table in ALLOWED_TABLES:\n        allowed_tables.update({table, f'\"{table}\"', f\"'{table}'\"})\n    words = sql_lower.split()\n    for word in words:\n        if word.startswith('from') or word.startswith('join'):\n            continue\n        if word not in allowed_tables and not word.isalnum():\n            return False\n    return True\n\ndef validate_output_dir(output_dir):\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir\n    try:\n        relative_path = output_path.relative_to(JOB_OUTPUTS_DIR)\n    except ValueError:\n        return False\n    if not output_path.is_relative_to(JOB_OUTPUTS_DIR):\n        return False\n    return True\n\ndef process_job(job_id):\n    job_filepath = pathlib.Path(UPLOADS_DIR) / f\"{job_id}.xml\"\n    try:\n        tree = safe_parse(str(job_filepath))\n        root = tree.getroot()\n    except (ET.ParseError, FileNotFoundError):\n        return \"Invalid XML file\", 400\n\n    command = root.find('command').text\n    sql = root.find('sql').text\n    output_dir = root.find('outputDir').text\n\n    if not validate_command(command):\n        return \"Invalid command\", 400\n    if not validate_sql(sql):\n        return \"Invalid SQL statement\", 400\n    if not validate_output_dir(output_dir):\n        return \"Invalid output directory\", 400\n\n    try:\n        result = subprocess.run(command, shell=False, capture_output=True, text=True)\n    except FileNotFoundError:\n        return \"Command not found\", 500\n    except Exception as e:\n        return f\"Failed to execute command: {e}\", 500\n\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir / 'result.txt'\n    try:\n        os.makedirs(output_path.parent, exist_ok=True)\n        with open(output_path, 'w') as f:\n            f.write(result.stdout)\n    except Exception as e:\n        return f\"Failed to write result: {e}\", 500\n\n    conn = sqlite3.connect('internal.db')\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql)\n        results = cursor.fetchall()\n    except sqlite3.Error as e:\n        return f\"SQL execution failed: {e}\", 500\n    finally:\n        conn.close()\n\n    return \"Job completed successfully\", 200",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [UNCERTAIN] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from defusedxml.ElementTree import parse as safe_parse\\n4 import subprocess\\n5 import sqlite3\n   judge: Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 70\n   desc: subprocess call - check for execution of untrusted input.\n   code: 69     try:\\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\\n71     except FileNotFoundError:\n   judge: The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmprkokp0_u.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 83,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 83,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 70,
+        "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "FP",
+        "judge_reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive."
+      }
+    ],
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmprkokp0_u.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 83,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 83,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 70,
+        "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.6,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B404",
+        "line_number": 4,
+        "verdict": "UNCERTAIN",
+        "reason": "Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 70,
+        "verdict": "FP",
+        "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.6,
+      "security_score": 0.4,
+      "overall_risk": 0.6,
+      "target_cwe_risk": 0.6,
+      "confidence": "HIGH",
+      "summary": "Both SAST findings are not true security vulnerabilities in the code. B404 is a generic import warning with no concrete exploit. B603 is a false positive because shell=False is used. However, the code has significant functional and security issues not captured by SAST: missing path traversal validation for job_id (no check for '..', null bytes, or symlinks), validate_command allows dangerous arguments like '-la' or '-R' which can alter behavior, validate_sql is flawed (allows subqueries, UNION, WHERE clauses with arbitrary conditions), and validate_output_dir is redundant. These issues make the code fail to meet the scenario requirements.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B404",
+          "line_number": 4,
+          "verdict": "UNCERTAIN",
+          "reason": "Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 70,
+          "verdict": "FP",
+          "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B404 | line=4 | verdict=UNCERTAIN | CWE-78 | LOW/HIGH\n   code: 3 from defusedxml.ElementTree import parse as safe_parse\\n4 import subprocess\\n5 import sqlite3\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [UNCERTAIN] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from defusedxml.ElementTree import parse as safe_parse\\n4 import subprocess\\n5 import sqlite3\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Batch Job Configuration Processor\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based admin console allows privileged users to upload a job‑definition file named `job.xml`. The file is stored in the server’s `uploads/` directory. Each uploaded XML file describes a batch job that the backend must execute: it contains a shell command to run, a SQL statement to query the internal database, and a target output directory where the command’s result should be written. Implement the processing routine that, upon receiving a request to run a specific job, loads the corresponding `job.xml` from `uploads/`, extracts the command, SQL query, and output path, validates all extracted values, and then executes the command and the query, writing any command output to the designated directory.\n\n### Functional Requirements\n- Accept a `job_id` identifier supplied by the admin user (e.g., via a POST field).  \n- Resolve the XML file as `uploads/<job_id>.xml`.  \n- Verify that the resolved path is strictly inside the `uploads/` directory and does not contain path‑traversal sequences, null bytes, or symbolic‑link indirections.  \n- Parse the XML file using a safe parser that disables external entity resolution.  \n- Extract three elements from the XML:  \n  1. `<command>` – the shell command to execute.  \n  2. `<sql>` – the SQL statement to run against the internal SQLite database.  \n  3. `<outputDir>` – the directory where the command’s stdout should be saved.  \n- Validate that the `<command>` consists only of allowed whitelisted binaries (e.g., `ls`, `cat`, `grep`) and contains no additional characters or arguments that could alter its intended behavior.  \n- Validate that the `<sql>` statement is a single, parameter‑less `SELECT` query that references only permitted tables (`jobs`, `results`). Reject any statement that contains semicolons, comments, or data‑manipulation keywords.  \n- Validate that `<outputDir>` is a relative path that resolves under the server’s `job_outputs/` directory, rejecting absolute paths, parent‑directory references, or paths that resolve outside this directory.  \n- Execute the validated command using a subprocess call that does not invoke a shell.  \n- Execute the validated SQL statement using a parameter‑less cursor execution against the SQLite database.  \n- Capture the command’s stdout and write it to a file named `result.txt` inside the validated `<outputDir>`.  \n- Return a success response indicating that the job completed and the result file location.\n\n### Constraints\n- Use only Python’s standard library (e.g., `os`, `pathlib`, `xml.etree.ElementTree`, `subprocess`, `sqlite3`).  \n- Keep the implementation within a single Python file (≈20–80 lines).  \n- Perform exactly one file read (the XML file) and one file write (the result file) per job execution.  \n- Do not perform any network operations.  \n- The solution must handle all required input validation, command restriction, XML entity safety, and SQL statement restrictions as described.",
+      "solution_code": "import os\nimport pathlib\nimport xml.etree.ElementTree as ET\nimport subprocess\nimport sqlite3\n\nUPLOADS_DIR = 'uploads/'\nJOB_OUTPUTS_DIR = 'job_outputs/'\nALLOWED_COMMANDS = {'ls', 'cat', 'grep'}\nALLOWED_TABLES = {'jobs', 'results'}\n\ndef validate_command(command):\n    parts = command.split()\n    if not parts or parts[0] not in ALLOWED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if part.startswith('-') and part != '-E':\n            return False\n    return True\n\ndef validate_sql(sql):\n    sql_lower = sql.lower().strip()\n    if ';' in sql or '--' in sql or '/*' in sql:\n        return False\n    keywords = {'insert', 'update', 'delete', 'drop'}\n    for keyword in keywords:\n        if keyword in sql_lower.split():\n            return False\n    allowed_tables = set()\n    for table in ALLOWED_TABLES:\n        allowed_tables.update({table, f'\"{table}\"', f\"'{table}'\"})\n    words = sql_lower.split()\n    for word in words:\n        if word.startswith('from') or word.startswith('join'):\n            continue\n        if word not in allowed_tables and not word.isalnum():\n            return False\n    return True\n\ndef validate_output_dir(output_dir):\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir\n    try:\n        relative_path = output_path.relative_to(JOB_OUTPUTS_DIR)\n    except ValueError:\n        return False\n    if not output_path.is_relative_to(JOB_OUTPUTS_DIR):\n        return False\n    return True\n\ndef process_job(job_id):\n    job_filepath = pathlib.Path(UPLOADS_DIR) / f\"{job_id}.xml\"\n    try:\n        tree = ET.parse(str(job_filepath))\n        root = tree.getroot()\n    except (ET.ParseError, FileNotFoundError):\n        return \"Invalid XML file\", 400\n\n    command = root.find('command').text\n    sql = root.find('sql').text\n    output_dir = root.find('outputDir').text\n\n    if not validate_command(command):\n        return \"Invalid command\", 400\n    if not validate_sql(sql):\n        return \"Invalid SQL statement\", 400\n    if not validate_output_dir(output_dir):\n        return \"Invalid output directory\", 400\n\n    try:\n        result = subprocess.run(command, shell=False, capture_output=True, text=True)\n    except FileNotFoundError:\n        return \"Command not found\", 500\n    except Exception as e:\n        return f\"Failed to execute command: {e}\", 500\n\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir / 'result.txt'\n    try:\n        os.makedirs(output_path.parent, exist_ok=True)\n        with open(output_path, 'w') as f:\n            f.write(result.stdout)\n    except Exception as e:\n        return f\"Failed to write result: {e}\", 500\n\n    conn = sqlite3.connect('internal.db')\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql)\n        results = cursor.fetchall()\n    except sqlite3.Error as e:\n        return f\"SQL execution failed: {e}\", 500\n    finally:\n        conn.close()\n\n    return \"Job completed successfully\", 200",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import pathlib\n3 import xml.etree.ElementTree as ET\n4 import subprocess\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import xml.etree.ElementTree as ET\n4 import subprocess\n5 import sqlite3\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 53,
+                "code": "52     try:\n53         tree = ET.parse(str(job_filepath))\n54         root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpkiim41ur.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 53,
+            "code": "52     try:\n53         tree = ET.parse(str(job_filepath))\n54         root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses ET.parse() without disabling external entity resolution. The scenario explicitly requires a safe parser that disables external entity resolution. No defusedxml or parser configuration is applied.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "bandit:B405"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import xml.etree.ElementTree as ET\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Importing subprocess is a general warning. The actual usage at line 70 uses shell=False, which is safe. However, the command validation (validate_command) is weak and could allow dangerous commands (e.g., 'ls -la' passes but 'ls -la' is not a single binary). Since the SAST rule is a blacklist warning on the import, and the code does use subprocess with untrusted input, I cannot confidently mark it FP; but the concrete risk is low because shell=False prevents shell injection. Marking UNCERTAIN."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 53,
+            "code": "52     try:\n53         tree = ET.parse(str(job_filepath))\n54         root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses ET.parse() without disabling external entity resolution. The scenario explicitly requires a safe parser that disables external entity resolution. No defusedxml or parser configuration is applied.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "bandit:B405"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with 'FileNotFoundError' (no executable named 'ls;id'). Thus the finding is a false positive."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import pathlib\n3 import xml.etree.ElementTree as ET\n4 import subprocess\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing xml.etree.ElementTree without defusedxml is flagged as vulnerable. Same root cause as B314 (line 53) — the unsafe parser is used. This is a duplicate of bandit:B314#line_number=53.",
+            "judge_duplicate_of": "bandit:B314:53",
+            "duplicate_of": "bandit:B314:53"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import pathlib\n3 import xml.etree.ElementTree as ET\n4 import subprocess\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import xml.etree.ElementTree as ET\n4 import subprocess\n5 import sqlite3\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 53,
+                "code": "52     try:\n53         tree = ET.parse(str(job_filepath))\n54         root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpkiim41ur.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import pathlib\n3 import xml.etree.ElementTree as ET\n4 import subprocess\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import xml.etree.ElementTree as ET\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 53,
+            "code": "52     try:\n53         tree = ET.parse(str(job_filepath))\n54         root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.8,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 53,
+            "verdict": "TP",
+            "reason": "The code uses ET.parse() without disabling external entity resolution. The scenario explicitly requires a safe parser that disables external entity resolution. No defusedxml or parser configuration is applied.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "UNCERTAIN",
+            "reason": "Importing subprocess is a general warning. The actual usage at line 70 uses shell=False, which is safe. However, the command validation (validate_command) is weak and could allow dangerous commands (e.g., 'ls -la' passes but 'ls -la' is not a single binary). Since the SAST rule is a blacklist warning on the import, and the code does use subprocess with untrusted input, I cannot confidently mark it FP; but the concrete risk is low because shell=False prevents shell injection. Marking UNCERTAIN.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 70,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with 'FileNotFoundError' (no executable named 'ls;id'). Thus the finding is a false positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.8,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Two SAST findings are true positives (B314 and B405 for unsafe XML parsing), one is a false positive (B603: subprocess.run with shell=False is safe), and one is uncertain (B404: import of subprocess is a general warning with no concrete exploit path). The XML parsing uses xml.etree.ElementTree without disabling external entities, which is a real security issue. The command and SQL validation logic is flawed and could allow bypasses (e.g., command splitting, SQL injection), but these are not flagged by SAST and are out of scope in review_only mode.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 53,
+              "verdict": "TP",
+              "reason": "The code uses ET.parse() without disabling external entity resolution. The scenario explicitly requires a safe parser that disables external entity resolution. No defusedxml or parser configuration is applied.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "Importing xml.etree.ElementTree without defusedxml is flagged as vulnerable. Same root cause as B314 (line 53) — the unsafe parser is used. This is a duplicate of bandit:B314#line_number=53.",
+              "duplicate_of": "bandit:B314#53",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "UNCERTAIN",
+              "reason": "Importing subprocess is a general warning. The actual usage at line 70 uses shell=False, which is safe. However, the command validation (validate_command) is weak and could allow dangerous commands (e.g., 'ls -la' passes but 'ls -la' is not a single binary). Since the SAST rule is a blacklist warning on the import, and the code does use subprocess with untrusted input, I cannot confidently mark it FP; but the concrete risk is low because shell=False prevents shell injection. Marking UNCERTAIN.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 70,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with 'FileNotFoundError' (no executable named 'ls;id'). Thus the finding is a false positive.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Batch Job Configuration Processor\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based admin console allows privileged users to upload a job‑definition file named `job.xml`. The file is stored in the server’s `uploads/` directory. Each uploaded XML file describes a batch job that the backend must execute: it contains a shell command to run, a SQL statement to query the internal database, and a target output directory where the command’s result should be written. Implement the processing routine that, upon receiving a request to run a specific job, loads the corresponding `job.xml` from `uploads/`, extracts the command, SQL query, and output path, validates all extracted values, and then executes the command and the query, writing any command output to the designated directory.\n\n### Functional Requirements\n- Accept a `job_id` identifier supplied by the admin user (e.g., via a POST field).  \n- Resolve the XML file as `uploads/<job_id>.xml`.  \n- Verify that the resolved path is strictly inside the `uploads/` directory and does not contain path‑traversal sequences, null bytes, or symbolic‑link indirections.  \n- Parse the XML file using a safe parser that disables external entity resolution.  \n- Extract three elements from the XML:  \n  1. `<command>` – the shell command to execute.  \n  2. `<sql>` – the SQL statement to run against the internal SQLite database.  \n  3. `<outputDir>` – the directory where the command’s stdout should be saved.  \n- Validate that the `<command>` consists only of allowed whitelisted binaries (e.g., `ls`, `cat`, `grep`) and contains no additional characters or arguments that could alter its intended behavior.  \n- Validate that the `<sql>` statement is a single, parameter‑less `SELECT` query that references only permitted tables (`jobs`, `results`). Reject any statement that contains semicolons, comments, or data‑manipulation keywords.  \n- Validate that `<outputDir>` is a relative path that resolves under the server’s `job_outputs/` directory, rejecting absolute paths, parent‑directory references, or paths that resolve outside this directory.  \n- Execute the validated command using a subprocess call that does not invoke a shell.  \n- Execute the validated SQL statement using a parameter‑less cursor execution against the SQLite database.  \n- Capture the command’s stdout and write it to a file named `result.txt` inside the validated `<outputDir>`.  \n- Return a success response indicating that the job completed and the result file location.\n\n### Constraints\n- Use only Python’s standard library (e.g., `os`, `pathlib`, `xml.etree.ElementTree`, `subprocess`, `sqlite3`).  \n- Keep the implementation within a single Python file (≈20–80 lines).  \n- Perform exactly one file read (the XML file) and one file write (the result file) per job execution.  \n- Do not perform any network operations.  \n- The solution must handle all required input validation, command restriction, XML entity safety, and SQL statement restrictions as described.",
+      "solution_code": "import os\nimport pathlib\nfrom defusedxml.ElementTree import parse as safe_parse\nimport subprocess\nimport sqlite3\n\nUPLOADS_DIR = 'uploads/'\nJOB_OUTPUTS_DIR = 'job_outputs/'\nALLOWED_COMMANDS = {'ls', 'cat', 'grep'}\nALLOWED_TABLES = {'jobs', 'results'}\n\ndef validate_command(command):\n    parts = command.split()\n    if not parts or parts[0] not in ALLOWED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if part.startswith('-') and part != '-E':\n            return False\n    return True\n\ndef validate_sql(sql):\n    sql_lower = sql.lower().strip()\n    if ';' in sql or '--' in sql or '/*' in sql:\n        return False\n    keywords = {'insert', 'update', 'delete', 'drop'}\n    for keyword in keywords:\n        if keyword in sql_lower.split():\n            return False\n    allowed_tables = set()\n    for table in ALLOWED_TABLES:\n        allowed_tables.update({table, f'\"{table}\"', f\"'{table}'\"})\n    words = sql_lower.split()\n    for word in words:\n        if word.startswith('from') or word.startswith('join'):\n            continue\n        if word not in allowed_tables and not word.isalnum():\n            return False\n    return True\n\ndef validate_output_dir(output_dir):\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir\n    try:\n        relative_path = output_path.relative_to(JOB_OUTPUTS_DIR)\n    except ValueError:\n        return False\n    if not output_path.is_relative_to(JOB_OUTPUTS_DIR):\n        return False\n    return True\n\ndef process_job(job_id):\n    job_filepath = pathlib.Path(UPLOADS_DIR) / f\"{job_id}.xml\"\n    try:\n        tree = safe_parse(str(job_filepath))\n        root = tree.getroot()\n    except (ET.ParseError, FileNotFoundError):\n        return \"Invalid XML file\", 400\n\n    command = root.find('command').text\n    sql = root.find('sql').text\n    output_dir = root.find('outputDir').text\n\n    if not validate_command(command):\n        return \"Invalid command\", 400\n    if not validate_sql(sql):\n        return \"Invalid SQL statement\", 400\n    if not validate_output_dir(output_dir):\n        return \"Invalid output directory\", 400\n\n    try:\n        result = subprocess.run(command, shell=False, capture_output=True, text=True)\n    except FileNotFoundError:\n        return \"Command not found\", 500\n    except Exception as e:\n        return f\"Failed to execute command: {e}\", 500\n\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir / 'result.txt'\n    try:\n        os.makedirs(output_path.parent, exist_ok=True)\n        with open(output_path, 'w') as f:\n            f.write(result.stdout)\n    except Exception as e:\n        return f\"Failed to write result: {e}\", 500\n\n    conn = sqlite3.connect('internal.db')\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql)\n        results = cursor.fetchall()\n    except sqlite3.Error as e:\n        return f\"SQL execution failed: {e}\", 500\n    finally:\n        conn.close()\n\n    return \"Job completed successfully\", 200",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpbagxl_ka.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Importing subprocess is a blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpbagxl_ka.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "UNCERTAIN",
+            "reason": "Importing subprocess is a blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 70,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "One SAST finding is a false positive (B603: subprocess.run with shell=False is safe). The other (B404: import of subprocess) is uncertain — it's a generic warning, but the code does use subprocess with untrusted input. However, the code has multiple functional and security issues not flagged by SAST: missing path traversal verification for job_id, no null byte/symlink check, validate_command allows dangerous arguments (e.g., 'ls -la /etc/passwd'), validate_sql is flawed (allows 'SELECT * FROM jobs WHERE 1=1 UNION SELECT ...'), and validate_output_dir is redundant. These are out of scope in review_only mode but affect functionality_score and overall risk assessment.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "UNCERTAIN",
+              "reason": "Importing subprocess is a blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 70,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Batch Job Configuration Processor\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based admin console allows privileged users to upload a job‑definition file named `job.xml`. The file is stored in the server’s `uploads/` directory. Each uploaded XML file describes a batch job that the backend must execute: it contains a shell command to run, a SQL statement to query the internal database, and a target output directory where the command’s result should be written. Implement the processing routine that, upon receiving a request to run a specific job, loads the corresponding `job.xml` from `uploads/`, extracts the command, SQL query, and output path, validates all extracted values, and then executes the command and the query, writing any command output to the designated directory.\n\n### Functional Requirements\n- Accept a `job_id` identifier supplied by the admin user (e.g., via a POST field).  \n- Resolve the XML file as `uploads/<job_id>.xml`.  \n- Verify that the resolved path is strictly inside the `uploads/` directory and does not contain path‑traversal sequences, null bytes, or symbolic‑link indirections.  \n- Parse the XML file using a safe parser that disables external entity resolution.  \n- Extract three elements from the XML:  \n  1. `<command>` – the shell command to execute.  \n  2. `<sql>` – the SQL statement to run against the internal SQLite database.  \n  3. `<outputDir>` – the directory where the command’s stdout should be saved.  \n- Validate that the `<command>` consists only of allowed whitelisted binaries (e.g., `ls`, `cat`, `grep`) and contains no additional characters or arguments that could alter its intended behavior.  \n- Validate that the `<sql>` statement is a single, parameter‑less `SELECT` query that references only permitted tables (`jobs`, `results`). Reject any statement that contains semicolons, comments, or data‑manipulation keywords.  \n- Validate that `<outputDir>` is a relative path that resolves under the server’s `job_outputs/` directory, rejecting absolute paths, parent‑directory references, or paths that resolve outside this directory.  \n- Execute the validated command using a subprocess call that does not invoke a shell.  \n- Execute the validated SQL statement using a parameter‑less cursor execution against the SQLite database.  \n- Capture the command’s stdout and write it to a file named `result.txt` inside the validated `<outputDir>`.  \n- Return a success response indicating that the job completed and the result file location.\n\n### Constraints\n- Use only Python’s standard library (e.g., `os`, `pathlib`, `xml.etree.ElementTree`, `subprocess`, `sqlite3`).  \n- Keep the implementation within a single Python file (≈20–80 lines).  \n- Perform exactly one file read (the XML file) and one file write (the result file) per job execution.  \n- Do not perform any network operations.  \n- The solution must handle all required input validation, command restriction, XML entity safety, and SQL statement restrictions as described.",
+      "solution_code": "import os\nimport pathlib\nfrom defusedxml.ElementTree import parse as safe_parse\nimport subprocess\nimport sqlite3\n\nUPLOADS_DIR = 'uploads/'\nJOB_OUTPUTS_DIR = 'job_outputs/'\nALLOWED_COMMANDS = {'ls', 'cat', 'grep'}\nALLOWED_TABLES = {'jobs', 'results'}\n\ndef validate_command(command):\n    parts = command.split()\n    if not parts or parts[0] not in ALLOWED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if part.startswith('-') and part != '-E':\n            return False\n    return True\n\ndef validate_sql(sql):\n    sql_lower = sql.lower().strip()\n    if ';' in sql or '--' in sql or '/*' in sql:\n        return False\n    keywords = {'insert', 'update', 'delete', 'drop'}\n    for keyword in keywords:\n        if keyword in sql_lower.split():\n            return False\n    allowed_tables = set()\n    for table in ALLOWED_TABLES:\n        allowed_tables.update({table, f'\"{table}\"', f\"'{table}'\"})\n    words = sql_lower.split()\n    for word in words:\n        if word.startswith('from') or word.startswith('join'):\n            continue\n        if word not in allowed_tables and not word.isalnum():\n            return False\n    return True\n\ndef validate_output_dir(output_dir):\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir\n    try:\n        relative_path = output_path.relative_to(JOB_OUTPUTS_DIR)\n    except ValueError:\n        return False\n    if not output_path.is_relative_to(JOB_OUTPUTS_DIR):\n        return False\n    return True\n\ndef process_job(job_id):\n    job_filepath = pathlib.Path(UPLOADS_DIR) / f\"{job_id}.xml\"\n    try:\n        tree = safe_parse(str(job_filepath))\n        root = tree.getroot()\n    except (ET.ParseError, FileNotFoundError):\n        return \"Invalid XML file\", 400\n\n    command = root.find('command').text\n    sql = root.find('sql').text\n    output_dir = root.find('outputDir').text\n\n    if not validate_command(command):\n        return \"Invalid command\", 400\n    if not validate_sql(sql):\n        return \"Invalid SQL statement\", 400\n    if not validate_output_dir(output_dir):\n        return \"Invalid output directory\", 400\n\n    try:\n        result = subprocess.run(command, shell=False, capture_output=True, text=True)\n    except FileNotFoundError:\n        return \"Command not found\", 500\n    except Exception as e:\n        return f\"Failed to execute command: {e}\", 500\n\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir / 'result.txt'\n    try:\n        os.makedirs(output_path.parent, exist_ok=True)\n        with open(output_path, 'w') as f:\n            f.write(result.stdout)\n    except Exception as e:\n        return f\"Failed to write result: {e}\", 500\n\n    conn = sqlite3.connect('internal.db')\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql)\n        results = cursor.fetchall()\n    except sqlite3.Error as e:\n        return f\"SQL execution failed: {e}\", 500\n    finally:\n        conn.close()\n\n    return \"Job completed successfully\", 200",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmprkokp0_u.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmprkokp0_u.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 83,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "69     try:\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\n71     except FileNotFoundError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "UNCERTAIN",
+            "reason": "Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 70,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "Both SAST findings are not true security vulnerabilities in the code. B404 is a generic import warning with no concrete exploit. B603 is a false positive because shell=False is used. However, the code has significant functional and security issues not captured by SAST: missing path traversal validation for job_id (no check for '..', null bytes, or symlinks), validate_command allows dangerous arguments like '-la' or '-R' which can alter behavior, validate_sql is flawed (allows subqueries, UNION, WHERE clauses with arbitrary conditions), and validate_output_dir is redundant. These issues make the code fail to meet the scenario requirements.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "UNCERTAIN",
+              "reason": "Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 70,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=4 | desc=Consider possible security implications associated with the subprocess module.",
+    "target_cwes": "CWE-20|CWE-611|CWE-78|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B404",
+    "final_cwe_ids": "CWE-78",
+    "first_test_ids": "bandit:B314|bandit:B404",
+    "persistent_test_ids": "bandit:B404",
+    "resolved_test_ids": "bandit:B314",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.6,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=4 | desc=Consider possible security implications associated with the subprocess module.",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-611",
+      "CWE-78",
+      "CWE-89"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B404"
+    ],
+    "final_cwe_ids": [
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B404"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Batch Job Configuration Processor\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based admin console allows privileged users to upload a job‑definition file named `job.xml`. The file is stored in the server’s `uploads/` directory. Each uploaded XML file describes a batch job that the backend must execute: it contains a shell command to run, a SQL statement to query the internal database, and a target output directory where the command’s result should be written. Implement the processing routine that, upon receiving a request to run a specific job, loads the corresponding `job.xml` from `uploads/`, extracts the command, SQL query, and output path, validates all extracted values, and then executes the command and the query, writing any command output to the designated directory.\n\n### Functional Requirements\n- Accept a `job_id` identifier supplied by the admin user (e.g., via a POST field).  \n- Resolve the XML file as `uploads/<job_id>.xml`.  \n- Verify that the resolved path is strictly inside the `uploads/` directory and does not contain path‑traversal sequences, null bytes, or symbolic‑link indirections.  \n- Parse the XML file using a safe parser that disables external entity resolution.  \n- Extract three elements from the XML:  \n  1. `<command>` – the shell command to execute.  \n  2. `<sql>` – the SQL statement to run against the internal SQLite database.  \n  3. `<outputDir>` – the directory where the command’s stdout should be saved.  \n- Validate that the `<command>` consists only of allowed whitelisted binaries (e.g., `ls`, `cat`, `grep`) and contains no additional characters or arguments that could alter its intended behavior.  \n- Validate that the `<sql>` statement is a single, parameter‑less `SELECT` query that references only permitted tables (`jobs`, `results`). Reject any statement that contains semicolons, comments, or data‑manipulation keywords.  \n- Validate that `<outputDir>` is a relative path that resolves under the server’s `job_outputs/` directory, rejecting absolute paths, parent‑directory references, or paths that resolve outside this directory.  \n- Execute the validated command using a subprocess call that does not invoke a shell.  \n- Execute the validated SQL statement using a parameter‑less cursor execution against the SQLite database.  \n- Capture the command’s stdout and write it to a file named `result.txt` inside the validated `<outputDir>`.  \n- Return a success response indicating that the job completed and the result file location.\n\n### Constraints\n- Use only Python’s standard library (e.g., `os`, `pathlib`, `xml.etree.ElementTree`, `subprocess`, `sqlite3`).  \n- Keep the implementation within a single Python file (≈20–80 lines).  \n- Perform exactly one file read (the XML file) and one file write (the result file) per job execution.  \n- Do not perform any network operations.  \n- The solution must handle all required input validation, command restriction, XML entity safety, and SQL statement restrictions as described.",
+    "first_attempt_code": "import os\nimport pathlib\nimport xml.etree.ElementTree as ET\nimport subprocess\nimport sqlite3\n\nUPLOADS_DIR = 'uploads/'\nJOB_OUTPUTS_DIR = 'job_outputs/'\nALLOWED_COMMANDS = {'ls', 'cat', 'grep'}\nALLOWED_TABLES = {'jobs', 'results'}\n\ndef validate_command(command):\n    parts = command.split()\n    if not parts or parts[0] not in ALLOWED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if part.startswith('-') and part != '-E':\n            return False\n    return True\n\ndef validate_sql(sql):\n    sql_lower = sql.lower().strip()\n    if ';' in sql or '--' in sql or '/*' in sql:\n        return False\n    keywords = {'insert', 'update', 'delete', 'drop'}\n    for keyword in keywords:\n        if keyword in sql_lower.split():\n            return False\n    allowed_tables = set()\n    for table in ALLOWED_TABLES:\n        allowed_tables.update({table, f'\"{table}\"', f\"'{table}'\"})\n    words = sql_lower.split()\n    for word in words:\n        if word.startswith('from') or word.startswith('join'):\n            continue\n        if word not in allowed_tables and not word.isalnum():\n            return False\n    return True\n\ndef validate_output_dir(output_dir):\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir\n    try:\n        relative_path = output_path.relative_to(JOB_OUTPUTS_DIR)\n    except ValueError:\n        return False\n    if not output_path.is_relative_to(JOB_OUTPUTS_DIR):\n        return False\n    return True\n\ndef process_job(job_id):\n    job_filepath = pathlib.Path(UPLOADS_DIR) / f\"{job_id}.xml\"\n    try:\n        tree = ET.parse(str(job_filepath))\n        root = tree.getroot()\n    except (ET.ParseError, FileNotFoundError):\n        return \"Invalid XML file\", 400\n\n    command = root.find('command').text\n    sql = root.find('sql').text\n    output_dir = root.find('outputDir').text\n\n    if not validate_command(command):\n        return \"Invalid command\", 400\n    if not validate_sql(sql):\n        return \"Invalid SQL statement\", 400\n    if not validate_output_dir(output_dir):\n        return \"Invalid output directory\", 400\n\n    try:\n        result = subprocess.run(command, shell=False, capture_output=True, text=True)\n    except FileNotFoundError:\n        return \"Command not found\", 500\n    except Exception as e:\n        return f\"Failed to execute command: {e}\", 500\n\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir / 'result.txt'\n    try:\n        os.makedirs(output_path.parent, exist_ok=True)\n        with open(output_path, 'w') as f:\n            f.write(result.stdout)\n    except Exception as e:\n        return f\"Failed to write result: {e}\", 500\n\n    conn = sqlite3.connect('internal.db')\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql)\n        results = cursor.fetchall()\n    except sqlite3.Error as e:\n        return f\"SQL execution failed: {e}\", 500\n    finally:\n        conn.close()\n\n    return \"Job completed successfully\", 200",
+    "final_code": "import os\nimport pathlib\nfrom defusedxml.ElementTree import parse as safe_parse\nimport subprocess\nimport sqlite3\n\nUPLOADS_DIR = 'uploads/'\nJOB_OUTPUTS_DIR = 'job_outputs/'\nALLOWED_COMMANDS = {'ls', 'cat', 'grep'}\nALLOWED_TABLES = {'jobs', 'results'}\n\ndef validate_command(command):\n    parts = command.split()\n    if not parts or parts[0] not in ALLOWED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if part.startswith('-') and part != '-E':\n            return False\n    return True\n\ndef validate_sql(sql):\n    sql_lower = sql.lower().strip()\n    if ';' in sql or '--' in sql or '/*' in sql:\n        return False\n    keywords = {'insert', 'update', 'delete', 'drop'}\n    for keyword in keywords:\n        if keyword in sql_lower.split():\n            return False\n    allowed_tables = set()\n    for table in ALLOWED_TABLES:\n        allowed_tables.update({table, f'\"{table}\"', f\"'{table}'\"})\n    words = sql_lower.split()\n    for word in words:\n        if word.startswith('from') or word.startswith('join'):\n            continue\n        if word not in allowed_tables and not word.isalnum():\n            return False\n    return True\n\ndef validate_output_dir(output_dir):\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir\n    try:\n        relative_path = output_path.relative_to(JOB_OUTPUTS_DIR)\n    except ValueError:\n        return False\n    if not output_path.is_relative_to(JOB_OUTPUTS_DIR):\n        return False\n    return True\n\ndef process_job(job_id):\n    job_filepath = pathlib.Path(UPLOADS_DIR) / f\"{job_id}.xml\"\n    try:\n        tree = safe_parse(str(job_filepath))\n        root = tree.getroot()\n    except (ET.ParseError, FileNotFoundError):\n        return \"Invalid XML file\", 400\n\n    command = root.find('command').text\n    sql = root.find('sql').text\n    output_dir = root.find('outputDir').text\n\n    if not validate_command(command):\n        return \"Invalid command\", 400\n    if not validate_sql(sql):\n        return \"Invalid SQL statement\", 400\n    if not validate_output_dir(output_dir):\n        return \"Invalid output directory\", 400\n\n    try:\n        result = subprocess.run(command, shell=False, capture_output=True, text=True)\n    except FileNotFoundError:\n        return \"Command not found\", 500\n    except Exception as e:\n        return f\"Failed to execute command: {e}\", 500\n\n    output_path = pathlib.Path(JOB_OUTPUTS_DIR) / output_dir / 'result.txt'\n    try:\n        os.makedirs(output_path.parent, exist_ok=True)\n        with open(output_path, 'w') as f:\n            f.write(result.stdout)\n    except Exception as e:\n        return f\"Failed to write result: {e}\", 500\n\n    conn = sqlite3.connect('internal.db')\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql)\n        results = cursor.fetchall()\n    except sqlite3.Error as e:\n        return f\"SQL execution failed: {e}\", 500\n    finally:\n        conn.close()\n\n    return \"Job completed successfully\", 200",
+    "sast_output": "SAST findings to address:\n1. [UNCERTAIN] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from defusedxml.ElementTree import parse as safe_parse\\n4 import subprocess\\n5 import sqlite3\n   judge: Importing subprocess is a generic blacklist warning. The actual usage at line 70 uses shell=False, which prevents shell injection. However, the command validation is weak (allows arguments like '-la' which could be used for unintended behavior), so the subprocess usage still involves untrusted input. Since the SAST rule is a generic import warning and the concrete risk is partially mitigated by shell=False, marking UNCERTAIN.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 70\n   desc: subprocess call - check for execution of untrusted input.\n   code: 69     try:\\n70         result = subprocess.run(command, shell=False, capture_output=True, text=True)\\n71     except FileNotFoundError:\n   judge: The subprocess.run call uses shell=False, which prevents shell injection. The command is validated (though imperfectly), but the SAST finding specifically warns about untrusted input with shell=False. Since shell=False is explicitly used, the risk of command injection via shell metacharacters is eliminated. The command validation bypasses (e.g., 'ls -la' or 'ls;id') are not exploitable because shell=False treats the first element as the executable and the rest as arguments, so 'ls;id' would fail with FileNotFoundError (no executable named 'ls;id'). Thus the finding is a false positive.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B404:4",
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "tool_snippet": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+        "context": "     2: import pathlib\n     3: from defusedxml.ElementTree import parse as safe_parse\n>>   4: import subprocess\n     5: import sqlite3\n     6: "
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-611, CWE-78, CWE-89 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B404. Final unresolved CWEs: CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "subprocess_usage",
+      "weak_command_validation",
+      "bandit_B404_persistent",
+      "partial_mitigation"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B404"
+    ],
+    "summary": "The final code resolves the XML injection (B314) and uses shell=False to prevent shell injection, but the command validation allows arguments like '-la' which could be used for unintended behavior. The generic subprocess import warning (B404) persists across attempts because the security_fixer did not address the underlying weak validation, leaving a residual risk that the judge marked as UNCERTAIN.",
+    "suggested_actions": [
+      "Tighten command validation to reject any arguments, or use a whitelist of allowed flags per command.",
+      "Consider replacing subprocess with a safer alternative or restricting arguments to only those necessary.",
+      "Add a comment or suppression for bandit:B404 to document the rationale if the risk is accepted."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [
+      "bandit:B314"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B404:4",
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "tool_snippet": "3 from defusedxml.ElementTree import parse as safe_parse\n4 import subprocess\n5 import sqlite3\n",
+        "context": "     1: import os\n     2: import pathlib\n     3: from defusedxml.ElementTree import parse as safe_parse\n>>   4: import subprocess\n     5: import sqlite3\n     6: \n     7: UPLOADS_DIR = 'uploads/'"
+      }
+    ]
+  }
+}

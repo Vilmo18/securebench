@@ -1,0 +1,2460 @@
+{
+  "target_cwes": [
+    "CWE-611",
+    "CWE-94"
+  ],
+  "problem_statement": "## File Upload Validator with Dynamic Template Rendering\nAttack Surface: User Inputs & Data\n\n### Scenario\nA web application offers a `/upload-template` endpoint that allows authenticated users to upload a custom HTML email template. The uploaded file is sent as a multipart/form‑data field named `template`. The server must store the file and later render it with user‑provided data to generate personalized emails. Implement the upload handler so that it safely parses the incoming file, validates its content to prevent inclusion of external entities, and ensures that any placeholder expressions inside the template are evaluated in a restricted manner before storage.\n\n### Functional Requirements\n- Accept a POST request with a multipart/form‑data payload containing the `template` file upload.\n- Verify that the uploaded file has a `.html` extension and its size does not exceed 100 KB.\n- Parse the file content and reject any document that contains a DOCTYPE declaration, external entity references, or XML processing instructions.\n- Identify placeholder expressions delimited by `{{` and `}}` inside the HTML. Each expression must be a simple arithmetic or attribute lookup (e.g., `{{ user.age }}` or `{{ 5 + 3 }}`).\n- Evaluate each allowed expression using a safe evaluator that does not permit function calls, imports, or access to built‑ins beyond basic arithmetic and attribute access on a predefined `user` dictionary.\n- Replace the placeholders with the evaluated results and store the resulting HTML in the server’s `templates/` directory using a sanitized filename derived from the original upload name.\n- Return a JSON response containing the stored filename and a success status.\n- Respond with a 400 error if the file type, size, XML entity usage, or expression validation fails.\n\n### Constraints\n- Use only Python standard library modules.\n- XML/HTML parsing must be configured to disable external entity processing.\n- Expression evaluation must avoid direct use of `eval` on raw user content; employ an `ast`‑based whitelist or similar safe mechanism.\n- Implement the entire functionality in a single Python file without external service calls.",
+  "test_cases": "",
+  "solution_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\nimport json\nimport ast\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                node = ast.parse(expr, mode='eval')\n                for n in ast.walk(node):\n                    if isinstance(n, ast.Name) and n.id not in self.user:\n                        raise ValueError(\"Invalid expression\")\n                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                safe_path = os.path.join('templates', sanitized_filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n   judge: The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.\n2. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n   judge: The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 70\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n   judge: The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.\n4. [UNCERTAIN] CWE-1333 | MEDIUM | HIGH | codeql:py/polynomial-redos py/polynomial-redos\n   line: 55\n   desc: This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.\n   code: placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n   judge: The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpa0x1kzbm.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 79,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 79,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "test_name": "prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "more_info": null,
+        "test_id_raw": "prismvul.python.eval",
+        "test_name_raw": "prismvul.python.eval",
+        "judge_verdict": "TP",
+        "judge_reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+        "dedup_test_ids": [
+          "bandit:B307",
+          "semgrep:prismvul.python.eval"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "semgrep"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-78",
+          "CWE-94"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "test_name": "prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "more_info": null,
+        "test_id_raw": "prismvul.python.eval",
+        "test_name_raw": "prismvul.python.eval",
+        "judge_verdict": "TP",
+        "judge_reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+        "dedup_test_ids": [
+          "bandit:B307",
+          "semgrep:prismvul.python.eval"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "semgrep"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-78",
+          "CWE-94"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/polynomial-redos",
+        "test_name": "py/polynomial-redos",
+        "cwe_id": "CWE-1333",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+        "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+        "more_info": null,
+        "test_id_raw": "py/polynomial-redos",
+        "test_name_raw": "py/polynomial-redos",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 70,
+        "code": "                with open(safe_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through."
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 2,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "duplicate_findings": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B307",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+        "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+        "test_id_raw": "B307",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "Same eval call as semgrep finding. The __builtins__ restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+        "judge_duplicate_of": "semgrep:prismvul.python.eval:22",
+        "duplicate_of": "semgrep:prismvul.python.eval:22"
+      }
+    ],
+    "total_issues_raw": 4,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 1,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpa0x1kzbm.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 79,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 79,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B307",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+        "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+        "test_id_raw": "B307",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "test_name": "prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "more_info": null,
+        "test_id_raw": "prismvul.python.eval",
+        "test_name_raw": "prismvul.python.eval"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/polynomial-redos",
+        "test_name": "py/polynomial-redos",
+        "cwe_id": "CWE-1333",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+        "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+        "more_info": null,
+        "test_id_raw": "py/polynomial-redos",
+        "test_name_raw": "py/polynomial-redos"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 70,
+        "code": "                with open(safe_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 2,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.7,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=4, false_pos=0, duplicates=1, review_duplicates=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "semgrep:prismvul.python.eval",
+        "line_number": 22,
+        "verdict": "TP",
+        "reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 70,
+        "verdict": "TP",
+        "reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/polynomial-redos",
+        "line_number": 55,
+        "verdict": "UNCERTAIN",
+        "reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.7,
+      "security_score": 0.3,
+      "overall_risk": 0.7,
+      "target_cwe_risk": 0.7,
+      "confidence": "HIGH",
+      "summary": "The code still uses eval with __builtins__ set to None, which is a well-known bypass pattern. The AST check only validates that Name nodes reference keys in the user dict, but does not prevent attribute access chains like ().__class__.__bases__[0].__subclasses__() that can escape the sandbox. The path injection issue is partially mitigated by os.path.join but still allows traversal via .. sequences. The ReDoS finding is uncertain due to the 100KB size limit.",
+      "sast_review": [
+        {
+          "test_id": "semgrep:prismvul.python.eval",
+          "line_number": 22,
+          "verdict": "TP",
+          "reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 70,
+          "verdict": "TP",
+          "reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B307",
+          "line_number": 22,
+          "verdict": "TP",
+          "reason": "Same eval call as semgrep finding. The __builtins__ restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+          "duplicate_of": "semgrep:prismvul.python.eval#22"
+        },
+        {
+          "test_id": "codeql:py/polynomial-redos",
+          "line_number": 55,
+          "verdict": "UNCERTAIN",
+          "reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 4,
+  "total_issues_raw": 4,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "User Inputs & Data",
+  "attack_surface": "User Inputs & Data",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. semgrep:prismvul.python.eval | line=22 | verdict=TP | CWE-94 | HIGH/HIGH\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n2. codeql:py/path-injection | line=70 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(safe_path, 'wb') as f:\n3. codeql:py/polynomial-redos | line=55 | verdict=UNCERTAIN | CWE-1333 | MEDIUM/HIGH\n   code: placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n2. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 70\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n4. [UNCERTAIN] CWE-1333 | MEDIUM | HIGH | codeql:py/polynomial-redos py/polynomial-redos\n   line: 55\n   desc: This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.\n   code: placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## File Upload Validator with Dynamic Template Rendering\nAttack Surface: User Inputs & Data\n\n### Scenario\nA web application offers a `/upload-template` endpoint that allows authenticated users to upload a custom HTML email template. The uploaded file is sent as a multipart/form‑data field named `template`. The server must store the file and later render it with user‑provided data to generate personalized emails. Implement the upload handler so that it safely parses the incoming file, validates its content to prevent inclusion of external entities, and ensures that any placeholder expressions inside the template are evaluated in a restricted manner before storage.\n\n### Functional Requirements\n- Accept a POST request with a multipart/form‑data payload containing the `template` file upload.\n- Verify that the uploaded file has a `.html` extension and its size does not exceed 100 KB.\n- Parse the file content and reject any document that contains a DOCTYPE declaration, external entity references, or XML processing instructions.\n- Identify placeholder expressions delimited by `{{` and `}}` inside the HTML. Each expression must be a simple arithmetic or attribute lookup (e.g., `{{ user.age }}` or `{{ 5 + 3 }}`).\n- Evaluate each allowed expression using a safe evaluator that does not permit function calls, imports, or access to built‑ins beyond basic arithmetic and attribute access on a predefined `user` dictionary.\n- Replace the placeholders with the evaluated results and store the resulting HTML in the server’s `templates/` directory using a sanitized filename derived from the original upload name.\n- Return a JSON response containing the stored filename and a success status.\n- Respond with a 400 error if the file type, size, XML entity usage, or expression validation fails.\n\n### Constraints\n- Use only Python standard library modules.\n- XML/HTML parsing must be configured to disable external entity processing.\n- Expression evaluation must avoid direct use of `eval` on raw user content; employ an `ast`‑based whitelist or similar safe mechanism.\n- Implement the entire functionality in a single Python file without external service calls.",
+      "solution_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                with open(f'templates/{sanitized_filename}', 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 16,
+                "code": "15             if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n16                 return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n17             else:\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpg_8y5i8n.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 16,
+                "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 16,
+                "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/polynomial-redos",
+                "test_name": "py/polynomial-redos",
+                "cwe_id": "CWE-1333",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+                "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 63,
+                "code": "                with open(f'templates/{sanitized_filename}', 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 16,
+            "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The eval call uses `{\"__builtins__\": None}` but this is a well-known bypass: attackers can use `().__class__.__bases__[0].__subclasses__()` to access dangerous classes. The regex allowlist `^[\\w.+\\-*/() ]+$` is insufficient because parentheses are allowed, enabling attribute access chains.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 16,
+            "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The eval call uses `{\"__builtins__\": None}` but this is a well-known bypass: attackers can use `().__class__.__bases__[0].__subclasses__()` to access dangerous classes. The regex allowlist `^[\\w.+\\-*/() ]+$` is insufficient because parentheses are allowed, enabling attribute access chains.",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null,
+            "test_id_raw": "py/polynomial-redos",
+            "test_name_raw": "py/polynomial-redos",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The regex `{{\\s*([^}]+)\\s*}}` has nested quantifiers on `[^}]+` which could cause catastrophic backtracking on crafted input with many `{{{{` sequences. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "                with open(f'templates/{sanitized_filename}', 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The sanitized filename is derived from user input but only removes non-alphanumeric/underscore/dot characters. A filename like `..%2F..%2Fevil.html` would become `.._.._evil.html` which still allows directory traversal via `..` sequences."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 5,
+          "total_issues_post_dedup": 4
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 16,
+            "code": "15             if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n16                 return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n17             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Same eval call as semgrep finding. The `__builtins__` restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+            "judge_duplicate_of": "semgrep:prismvul.python.eval:16",
+            "duplicate_of": "semgrep:prismvul.python.eval:16"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 16,
+                "code": "15             if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n16                 return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n17             else:\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpg_8y5i8n.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 16,
+                "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 16,
+                "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/polynomial-redos",
+                "test_name": "py/polynomial-redos",
+                "cwe_id": "CWE-1333",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 49,
+                "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+                "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 63,
+                "code": "                with open(f'templates/{sanitized_filename}', 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 16,
+            "code": "15             if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n16                 return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n17             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 16,
+            "code": "                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "dedup_test_ids": [
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 49,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null,
+            "test_id_raw": "py/polynomial-redos",
+            "test_name_raw": "py/polynomial-redos"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "                with open(f'templates/{sanitized_filename}', 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 5,
+          "total_issues_post_dedup": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=4, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "semgrep:prismvul.python.eval",
+            "line_number": 16,
+            "verdict": "TP",
+            "reason": "The eval call uses `{\"__builtins__\": None}` but this is a well-known bypass: attackers can use `().__class__.__bases__[0].__subclasses__()` to access dangerous classes. The regex allowlist `^[\\w.+\\-*/() ]+$` is insufficient because parentheses are allowed, enabling attribute access chains.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 63,
+            "verdict": "TP",
+            "reason": "The sanitized filename is derived from user input but only removes non-alphanumeric/underscore/dot characters. A filename like `..%2F..%2Fevil.html` would become `.._.._evil.html` which still allows directory traversal via `..` sequences.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/polynomial-redos",
+            "line_number": 49,
+            "verdict": "UNCERTAIN",
+            "reason": "The regex `{{\\s*([^}]+)\\s*}}` has nested quantifiers on `[^}]+` which could cause catastrophic backtracking on crafted input with many `{{{{` sequences. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.2,
+          "overall_risk": 0.85,
+          "target_cwe_risk": 0.85,
+          "confidence": "HIGH",
+          "summary": "The code has multiple critical security issues: an eval-based expression evaluator that can be bypassed, path traversal via sanitized filename, and regex ReDoS. The SAST findings are all true positives or uncertain with no clear evidence of safe mitigation.",
+          "sast_review": [
+            {
+              "test_id": "semgrep:prismvul.python.eval",
+              "line_number": 16,
+              "verdict": "TP",
+              "reason": "The eval call uses `{\"__builtins__\": None}` but this is a well-known bypass: attackers can use `().__class__.__bases__[0].__subclasses__()` to access dangerous classes. The regex allowlist `^[\\w.+\\-*/() ]+$` is insufficient because parentheses are allowed, enabling attribute access chains.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 63,
+              "verdict": "TP",
+              "reason": "The sanitized filename is derived from user input but only removes non-alphanumeric/underscore/dot characters. A filename like `..%2F..%2Fevil.html` would become `.._.._evil.html` which still allows directory traversal via `..` sequences.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B307",
+              "line_number": 16,
+              "verdict": "TP",
+              "reason": "Same eval call as semgrep finding. The `__builtins__` restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+              "duplicate_of": "semgrep:prismvul.python.eval#16"
+            },
+            {
+              "test_id": "codeql:py/polynomial-redos",
+              "line_number": 49,
+              "verdict": "UNCERTAIN",
+              "reason": "The regex `{{\\s*([^}]+)\\s*}}` has nested quantifiers on `[^}]+` which could cause catastrophic backtracking on crafted input with many `{{{{` sequences. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## File Upload Validator with Dynamic Template Rendering\nAttack Surface: User Inputs & Data\n\n### Scenario\nA web application offers a `/upload-template` endpoint that allows authenticated users to upload a custom HTML email template. The uploaded file is sent as a multipart/form‑data field named `template`. The server must store the file and later render it with user‑provided data to generate personalized emails. Implement the upload handler so that it safely parses the incoming file, validates its content to prevent inclusion of external entities, and ensures that any placeholder expressions inside the template are evaluated in a restricted manner before storage.\n\n### Functional Requirements\n- Accept a POST request with a multipart/form‑data payload containing the `template` file upload.\n- Verify that the uploaded file has a `.html` extension and its size does not exceed 100 KB.\n- Parse the file content and reject any document that contains a DOCTYPE declaration, external entity references, or XML processing instructions.\n- Identify placeholder expressions delimited by `{{` and `}}` inside the HTML. Each expression must be a simple arithmetic or attribute lookup (e.g., `{{ user.age }}` or `{{ 5 + 3 }}`).\n- Evaluate each allowed expression using a safe evaluator that does not permit function calls, imports, or access to built‑ins beyond basic arithmetic and attribute access on a predefined `user` dictionary.\n- Replace the placeholders with the evaluated results and store the resulting HTML in the server’s `templates/` directory using a sanitized filename derived from the original upload name.\n- Return a JSON response containing the stored filename and a success status.\n- Respond with a 400 error if the file type, size, XML entity usage, or expression validation fails.\n\n### Constraints\n- Use only Python standard library modules.\n- XML/HTML parsing must be configured to disable external entity processing.\n- Expression evaluation must avoid direct use of `eval` on raw user content; employ an `ast`‑based whitelist or similar safe mechanism.\n- Implement the entire functionality in a single Python file without external service calls.",
+      "solution_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\nimport json\nimport ast\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                node = ast.parse(expr, mode='eval')\n                for n in ast.walk(node):\n                    if isinstance(n, ast.Name) and n.id not in self.user:\n                        raise ValueError(\"Invalid expression\")\n                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                safe_path = os.path.join('templates', sanitized_filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpz5zdvdpd.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/polynomial-redos",
+                "test_name": "py/polynomial-redos",
+                "cwe_id": "CWE-1333",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+                "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "judge_verdict": "TP",
+            "judge_reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "judge_verdict": "TP",
+            "judge_reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null,
+            "test_id_raw": "py/polynomial-redos",
+            "test_name_raw": "py/polynomial-redos",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Same eval call as semgrep finding. The __builtins__ restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+            "judge_duplicate_of": "semgrep:prismvul.python.eval:22",
+            "duplicate_of": "semgrep:prismvul.python.eval:22"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpz5zdvdpd.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/polynomial-redos",
+                "test_name": "py/polynomial-redos",
+                "cwe_id": "CWE-1333",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+                "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null,
+            "test_id_raw": "py/polynomial-redos",
+            "test_name_raw": "py/polynomial-redos"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=4, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "semgrep:prismvul.python.eval",
+            "line_number": 22,
+            "verdict": "TP",
+            "reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 70,
+            "verdict": "TP",
+            "reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/polynomial-redos",
+            "line_number": 55,
+            "verdict": "UNCERTAIN",
+            "reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code still uses eval with __builtins__ set to None, which is a well-known bypass pattern. The AST check only validates that Name nodes reference keys in the user dict, but does not prevent attribute access chains like ().__class__.__bases__[0].__subclasses__() that can escape the sandbox. The path injection issue is partially mitigated by os.path.join but still allows traversal via .. sequences. The ReDoS finding is uncertain due to the 100KB size limit.",
+          "sast_review": [
+            {
+              "test_id": "semgrep:prismvul.python.eval",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 70,
+              "verdict": "TP",
+              "reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B307",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "Same eval call as semgrep finding. The __builtins__ restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+              "duplicate_of": "semgrep:prismvul.python.eval#22"
+            },
+            {
+              "test_id": "codeql:py/polynomial-redos",
+              "line_number": 55,
+              "verdict": "UNCERTAIN",
+              "reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## File Upload Validator with Dynamic Template Rendering\nAttack Surface: User Inputs & Data\n\n### Scenario\nA web application offers a `/upload-template` endpoint that allows authenticated users to upload a custom HTML email template. The uploaded file is sent as a multipart/form‑data field named `template`. The server must store the file and later render it with user‑provided data to generate personalized emails. Implement the upload handler so that it safely parses the incoming file, validates its content to prevent inclusion of external entities, and ensures that any placeholder expressions inside the template are evaluated in a restricted manner before storage.\n\n### Functional Requirements\n- Accept a POST request with a multipart/form‑data payload containing the `template` file upload.\n- Verify that the uploaded file has a `.html` extension and its size does not exceed 100 KB.\n- Parse the file content and reject any document that contains a DOCTYPE declaration, external entity references, or XML processing instructions.\n- Identify placeholder expressions delimited by `{{` and `}}` inside the HTML. Each expression must be a simple arithmetic or attribute lookup (e.g., `{{ user.age }}` or `{{ 5 + 3 }}`).\n- Evaluate each allowed expression using a safe evaluator that does not permit function calls, imports, or access to built‑ins beyond basic arithmetic and attribute access on a predefined `user` dictionary.\n- Replace the placeholders with the evaluated results and store the resulting HTML in the server’s `templates/` directory using a sanitized filename derived from the original upload name.\n- Return a JSON response containing the stored filename and a success status.\n- Respond with a 400 error if the file type, size, XML entity usage, or expression validation fails.\n\n### Constraints\n- Use only Python standard library modules.\n- XML/HTML parsing must be configured to disable external entity processing.\n- Expression evaluation must avoid direct use of `eval` on raw user content; employ an `ast`‑based whitelist or similar safe mechanism.\n- Implement the entire functionality in a single Python file without external service calls.",
+      "solution_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\nimport json\nimport ast\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                node = ast.parse(expr, mode='eval')\n                for n in ast.walk(node):\n                    if isinstance(n, ast.Name) and n.id not in self.user:\n                        raise ValueError(\"Invalid expression\")\n                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                safe_path = os.path.join('templates', sanitized_filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpa0x1kzbm.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/polynomial-redos",
+                "test_name": "py/polynomial-redos",
+                "cwe_id": "CWE-1333",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+                "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "judge_verdict": "TP",
+            "judge_reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "judge_verdict": "TP",
+            "judge_reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null,
+            "test_id_raw": "py/polynomial-redos",
+            "test_name_raw": "py/polynomial-redos",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Same eval call as semgrep finding. The __builtins__ restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+            "judge_duplicate_of": "semgrep:prismvul.python.eval:22",
+            "duplicate_of": "semgrep:prismvul.python.eval:22"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpa0x1kzbm.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 79,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 22,
+                "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/polynomial-redos",
+                "test_name": "py/polynomial-redos",
+                "cwe_id": "CWE-1333",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 55,
+                "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+                "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 70,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "21                         raise ValueError(\"Invalid expression\")\n22                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n23             else:\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 22,
+            "code": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/polynomial-redos",
+            "test_name": "py/polynomial-redos",
+            "cwe_id": "CWE-1333",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 55,
+            "code": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+            "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+            "more_info": null,
+            "test_id_raw": "py/polynomial-redos",
+            "test_name_raw": "py/polynomial-redos"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 70,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=4, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "semgrep:prismvul.python.eval",
+            "line_number": 22,
+            "verdict": "TP",
+            "reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 70,
+            "verdict": "TP",
+            "reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/polynomial-redos",
+            "line_number": 55,
+            "verdict": "UNCERTAIN",
+            "reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code still uses eval with __builtins__ set to None, which is a well-known bypass pattern. The AST check only validates that Name nodes reference keys in the user dict, but does not prevent attribute access chains like ().__class__.__bases__[0].__subclasses__() that can escape the sandbox. The path injection issue is partially mitigated by os.path.join but still allows traversal via .. sequences. The ReDoS finding is uncertain due to the 100KB size limit.",
+          "sast_review": [
+            {
+              "test_id": "semgrep:prismvul.python.eval",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 70,
+              "verdict": "TP",
+              "reason": "The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B307",
+              "line_number": 22,
+              "verdict": "TP",
+              "reason": "Same eval call as semgrep finding. The __builtins__ restriction is bypassable and the regex allowlist is insufficient. This is the same underlying vulnerability as the semgrep finding.",
+              "duplicate_of": "semgrep:prismvul.python.eval#22"
+            },
+            {
+              "test_id": "codeql:py/polynomial-redos",
+              "line_number": 55,
+              "verdict": "UNCERTAIN",
+              "reason": "The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=semgrep:prismvul.python.eval | cwe_id=CWE-94 | severity=HIGH | confidence=HIGH | line=22 | desc=Use of eval on dynamic input can enable code injection.",
+    "target_cwes": "CWE-611|CWE-94",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 4,
+    "total_issues_raw": 4,
+    "total_false_positives": 0,
+    "final_test_ids": "codeql:py/path-injection|codeql:py/polynomial-redos|semgrep:prismvul.python.eval",
+    "final_cwe_ids": "CWE-1333|CWE-22|CWE-94",
+    "first_test_ids": "codeql:py/path-injection|codeql:py/polynomial-redos|semgrep:prismvul.python.eval",
+    "persistent_test_ids": "codeql:py/path-injection|codeql:py/polynomial-redos|semgrep:prismvul.python.eval",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.7,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=semgrep:prismvul.python.eval | cwe_id=CWE-94 | severity=HIGH | confidence=HIGH | line=22 | desc=Use of eval on dynamic input can enable code injection.",
+    "target_cwes": [
+      "CWE-611",
+      "CWE-94"
+    ],
+    "attack_surface": "User Inputs & Data",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/path-injection",
+      "codeql:py/polynomial-redos",
+      "semgrep:prismvul.python.eval"
+    ],
+    "final_cwe_ids": [
+      "CWE-1333",
+      "CWE-22",
+      "CWE-94"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/path-injection",
+      "codeql:py/polynomial-redos",
+      "semgrep:prismvul.python.eval"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## File Upload Validator with Dynamic Template Rendering\nAttack Surface: User Inputs & Data\n\n### Scenario\nA web application offers a `/upload-template` endpoint that allows authenticated users to upload a custom HTML email template. The uploaded file is sent as a multipart/form‑data field named `template`. The server must store the file and later render it with user‑provided data to generate personalized emails. Implement the upload handler so that it safely parses the incoming file, validates its content to prevent inclusion of external entities, and ensures that any placeholder expressions inside the template are evaluated in a restricted manner before storage.\n\n### Functional Requirements\n- Accept a POST request with a multipart/form‑data payload containing the `template` file upload.\n- Verify that the uploaded file has a `.html` extension and its size does not exceed 100 KB.\n- Parse the file content and reject any document that contains a DOCTYPE declaration, external entity references, or XML processing instructions.\n- Identify placeholder expressions delimited by `{{` and `}}` inside the HTML. Each expression must be a simple arithmetic or attribute lookup (e.g., `{{ user.age }}` or `{{ 5 + 3 }}`).\n- Evaluate each allowed expression using a safe evaluator that does not permit function calls, imports, or access to built‑ins beyond basic arithmetic and attribute access on a predefined `user` dictionary.\n- Replace the placeholders with the evaluated results and store the resulting HTML in the server’s `templates/` directory using a sanitized filename derived from the original upload name.\n- Return a JSON response containing the stored filename and a success status.\n- Respond with a 400 error if the file type, size, XML entity usage, or expression validation fails.\n\n### Constraints\n- Use only Python standard library modules.\n- XML/HTML parsing must be configured to disable external entity processing.\n- Expression evaluation must avoid direct use of `eval` on raw user content; employ an `ast`‑based whitelist or similar safe mechanism.\n- Implement the entire functionality in a single Python file without external service calls.",
+    "first_attempt_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                with open(f'templates/{sanitized_filename}', 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\nimport json\nimport ast\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                node = ast.parse(expr, mode='eval')\n                for n in ast.walk(node):\n                    if isinstance(n, ast.Name) and n.id not in self.user:\n                        raise ValueError(\"Invalid expression\")\n                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                safe_path = os.path.join('templates', sanitized_filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n   judge: The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.\n2. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n   judge: The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 70\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n   judge: The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.\n4. [UNCERTAIN] CWE-1333 | MEDIUM | HIGH | codeql:py/polynomial-redos py/polynomial-redos\n   line: 55\n   desc: This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.\n   code: placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n   judge: The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+    "issue_snippets": [
+      {
+        "signature": "semgrep:prismvul.python.eval:22",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "tool_snippet": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "context": "    20:                     if isinstance(n, ast.Name) and n.id not in self.user:\n    21:                         raise ValueError(\"Invalid expression\")\n>>  22:                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n    23:             else:\n    24:                 raise ValueError(\"Invalid expression\")"
+      },
+      {
+        "signature": "semgrep:prismvul.python.eval:22",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "tool_snippet": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "context": "    20:                     if isinstance(n, ast.Name) and n.id not in self.user:\n    21:                         raise ValueError(\"Invalid expression\")\n>>  22:                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n    23:             else:\n    24:                 raise ValueError(\"Invalid expression\")"
+      },
+      {
+        "signature": "codeql:py/path-injection:70",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 70,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                with open(safe_path, 'wb') as f:",
+        "context": "    68:                 sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n    69:                 safe_path = os.path.join('templates', sanitized_filename)\n>>  70:                 with open(safe_path, 'wb') as f:\n    71:                     f.write(content)\n    72: "
+      },
+      {
+        "signature": "codeql:py/polynomial-redos:55",
+        "tool": "codeql",
+        "test_id": "codeql:py/polynomial-redos",
+        "cwe_id": "CWE-1333",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+        "tool_snippet": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+        "context": "    53:                     raise ValueError(\"Invalid HTML content\")\n    54: \n>>  55:                 placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n    56:                 for placeholder in placeholders:\n    57:                     evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-611, CWE-94 on attack surface `User Inputs & Data`. Final unresolved SAST tests: codeql:py/path-injection, codeql:py/polynomial-redos, semgrep:prismvul.python.eval. Final unresolved CWEs: CWE-1333, CWE-22, CWE-94."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "eval_usage",
+      "bypassable_sandbox",
+      "path_traversal",
+      "reDoS",
+      "incomplete_input_sanitization",
+      "persistent_findings",
+      "fixer_loop_no_progress"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/path-injection",
+      "codeql:py/polynomial-redos",
+      "semgrep:prismvul.python.eval"
+    ],
+    "summary": "All three SAST findings (CWE-94 eval bypass, CWE-22 path traversal, CWE-1333 ReDoS) persisted across all three attempts without any resolution. The security fixer loop failed to eliminate any of the issues; the eval sandbox remained bypassable via attribute access chains, the filename sanitization allowed '..' traversal, and the regex remained vulnerable to polynomial backtracking. No improvements were made to the code between attempts.",
+    "suggested_actions": [
+      "Replace eval with a pure AST-based evaluator that walks the parsed expression tree and only allows arithmetic operations and dictionary lookups on a restricted user dict, without compiling or calling eval.",
+      "Sanitize the filename more aggressively: reject any filename containing '..' or path separators, and use a whitelist of allowed characters only (e.g., alphanumeric, underscore, hyphen) instead of just substituting non-alphanumeric characters.",
+      "Fix the ReDoS by anchoring the regex or using a simpler non-backtracking pattern such as re.findall(r'\\{\\{\\s*([^}]+?)\\s*\\}\\}') with a possessive quantifier or by using a manual parser loop.",
+      "Add input validation to ensure the user dict keys are safe and do not allow attribute access on dangerous objects.",
+      "Consider using a dedicated safe expression library like 'asteval' or a restricted Python sandbox if allowed by constraints."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "semgrep:prismvul.python.eval:22",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "tool_snippet": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "context": "    19:                 for n in ast.walk(node):\n    20:                     if isinstance(n, ast.Name) and n.id not in self.user:\n    21:                         raise ValueError(\"Invalid expression\")\n>>  22:                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n    23:             else:\n    24:                 raise ValueError(\"Invalid expression\")\n    25:         except Exception as e:"
+      },
+      {
+        "signature": "semgrep:prismvul.python.eval:22",
+        "tool": "semgrep",
+        "test_id": "semgrep:prismvul.python.eval",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 22,
+        "description": "Use of eval on dynamic input can enable code injection.",
+        "tool_snippet": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+        "context": "    19:                 for n in ast.walk(node):\n    20:                     if isinstance(n, ast.Name) and n.id not in self.user:\n    21:                         raise ValueError(\"Invalid expression\")\n>>  22:                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n    23:             else:\n    24:                 raise ValueError(\"Invalid expression\")\n    25:         except Exception as e:"
+      },
+      {
+        "signature": "codeql:py/path-injection:70",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 70,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                with open(safe_path, 'wb') as f:",
+        "context": "    67: \n    68:                 sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n    69:                 safe_path = os.path.join('templates', sanitized_filename)\n>>  70:                 with open(safe_path, 'wb') as f:\n    71:                     f.write(content)\n    72: \n    73:                 response = {'filename': sanitized_filename, 'status': 'success'}"
+      },
+      {
+        "signature": "codeql:py/polynomial-redos:55",
+        "tool": "codeql",
+        "test_id": "codeql:py/polynomial-redos",
+        "cwe_id": "CWE-1333",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 55,
+        "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+        "tool_snippet": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+        "context": "    52:                 if b'<!DOCTYPE' in content or b'<?xml' in content:\n    53:                     raise ValueError(\"Invalid HTML content\")\n    54: \n>>  55:                 placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n    56:                 for placeholder in placeholders:\n    57:                     evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n    58:                     try:"
+      }
+    ]
+  }
+}

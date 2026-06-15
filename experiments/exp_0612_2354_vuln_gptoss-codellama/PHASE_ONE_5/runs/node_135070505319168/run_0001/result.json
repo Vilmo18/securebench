@@ -1,0 +1,1807 @@
+{
+  "target_cwes": [
+    "CWE-862",
+    "CWE-89",
+    "CWE-94",
+    "CWE-352",
+    "CWE-502"
+  ],
+  "problem_statement": "## Configuration Management Dashboard Attack Surface: Storage & Filesystem\n### Scenario\nAn internal web application provides an administrator dashboard that allows users to upload configuration files, submit database queries, and delete existing configuration files. The uploaded files are stored on disk, processed as Python scripts, and may be serialized JSON that is later deserialized. The dashboard should enforce proper authorization, protect against SQL injection, avoid code injection through uploaded scripts, guard against CSRF on delete operations, and safely deserialize configuration data.\n### Functional Requirements\n- Accept a file upload via a multipart/form‑data request and store the file in the protected `config_files/` directory, ensuring the file name is sanitized and does not escape the target directory.\n- Parse the uploaded file as a Python script and execute it in a sandboxed environment, rejecting any attempts to import disallowed modules or call forbidden functions.\n- Provide an endpoint that accepts a user‑supplied `query` parameter and executes it against the internal SQLite database, ensuring that the query is parameterized to prevent unintended modification of the database schema.\n- Allow authorized users to delete a configuration file by specifying its name; the deletion must be protected by an anti‑CSRF token that is validated on every request.\n- Accept a serialized configuration object in JSON format, safely deserialize it using a whitelist of allowed types, and store the resulting configuration data in a persistent JSON file within the `config_files/` directory.\n- Return appropriate HTTP status codes for success (200), unauthorized access (401), forbidden actions (403), bad request (400), and server errors (500).\n- Log all file upload, query execution, and delete operations with timestamps and the acting user’s identifier.\n### Constraints\n- Implement the entire functionality in a single Python file using only the standard library.\n- Perform at most one file‑system read or write per request.\n- Do not use external services or network access. \n- The solution must handle concurrent requests reliably without data corruption.",
+  "test_cases": "",
+  "solution_code": "import os\nimport json\nfrom flask import Flask, request, send_file, make_response\nfrom flask_sqlalchemy import SQLAlchemy\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.dialects.sqlite import SQLiteDialect\nfrom sqlalchemy.engine import Engine\nfrom sqlalchemy.exc import SQLAlchemyError\nfrom werkzeug.security import check_password_hash, generate_password_hash\nfrom functools import wraps\nimport logging\nimport re\n\napp = Flask(__name__)\napp.config[\"SQLALCHEMY_DATABASE_URI\"] = \"sqlite:///config.db\"\ndb = SQLAlchemy(app)\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = db.Column(db.Integer, primary_key=True)\n    username = db.Column(db.String(64), unique=True, nullable=False)\n    password = db.Column(db.String(128), nullable=False)\n\nclass ConfigFile(Base):\n    __tablename__ = \"config_files\"\n    id = db.Column(db.Integer, primary_key=True)\n    name = db.Column(db.String(64), unique=True, nullable=False)\n    content = db.Column(db.Text, nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\nclass Query(Base):\n    __tablename__ = \"queries\"\n    id = db.Column(db.Integer, primary_key=True)\n    query = db.Column(db.String(1024), nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\ndef check_csrf_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.form.get(\"csrf_token\")\n        if not token or token != session[\"csrf_token\"]:\n            return \"CSRF token mismatch\", 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route(\"/login\", methods=[\"POST\"])\ndef login():\n    username = request.form.get(\"username\")\n    password = request.form.get(\"password\")\n    user = User.query.filter_by(username=username).first()\n    if not user or not check_password_hash(user.password, password):\n        return \"Invalid credentials\", 401\n    session[\"user\"] = username\n    session[\"csrf_token\"] = generate_password_hash(os.urandom(32))\n    return \"Logged in successfully\"\n\n@app.route(\"/logout\")\ndef logout():\n    session.pop(\"user\", None)\n    session.pop(\"csrf_token\", None)\n    return \"Logged out successfully\"\n\n@app.route(\"/config/upload\", methods=[\"POST\"])\n@check_csrf_token\ndef upload_config():\n    file = request.files[\"file\"]\n    if not file or not allowed_file(file.filename):\n        return \"Invalid file type\", 400\n    filename = secure_filename(file.filename)\n    content = file.read().decode(\"utf-8\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    new_config = ConfigFile(name=filename, content=content, user_id=user.id)\n    db.session.add(new_config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to create config\", 500\n    return jsonify({\"message\": f\"Config {filename} created successfully\"}), 201\n\n@app.route(\"/config/<string:filename>\", methods=[\"GET\"])\ndef get_config(filename):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    return jsonify({\"content\": config.content})\n\n@app.route(\"/config/delete\", methods=[\"POST\"])\ndef delete_config():\n    filename = request.form.get(\"filename\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    db.session.delete(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to delete config\", 500\n    return jsonify({\"message\": f\"Config {filename} deleted successfully\"}), 201\n\ndef allowed_file(filename):\n    return \".\" in filename and filename.rsplit(\".\", 1)[1].lower() in [\"json\"]\n\ndef secure_filename(filename):\n    return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 121\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.\n2. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 121\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 121,
+            "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmp6fjibpkx.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 108,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 108,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 121,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "test_name": "py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "code": "    app.run(debug=True)",
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "more_info": null,
+        "test_id_raw": "py/flask-debug",
+        "test_name_raw": "py/flask-debug",
+        "judge_verdict": "TP",
+        "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+        "dedup_test_ids": [
+          "bandit:B201",
+          "codeql:py/flask-debug"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-215",
+          "CWE-94"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "test_name": "py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "code": "    app.run(debug=True)",
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "more_info": null,
+        "test_id_raw": "py/flask-debug",
+        "test_name_raw": "py/flask-debug",
+        "judge_verdict": "TP",
+        "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+        "dedup_test_ids": [
+          "bandit:B201",
+          "codeql:py/flask-debug"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-215",
+          "CWE-94"
+        ],
+        "dedup_count": 1
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 1
+    },
+    "duplicate_findings": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B201",
+        "test_name": "flask_debug_true",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "MEDIUM",
+        "line_number": 121,
+        "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+        "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+        "test_id_raw": "B201",
+        "test_name_raw": "flask_debug_true",
+        "judge_verdict": "TP",
+        "judge_reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line121.",
+        "judge_duplicate_of": "codeql:py/flask-debug",
+        "duplicate_of": "codeql:py/flask-debug"
+      }
+    ],
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 1,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 121,
+            "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmp6fjibpkx.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 108,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 108,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 121,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B201",
+        "test_name": "flask_debug_true",
+        "cwe_id": "CWE-94",
+        "severity": "HIGH",
+        "confidence": "MEDIUM",
+        "line_number": 121,
+        "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+        "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+        "test_id_raw": "B201",
+        "test_name_raw": "flask_debug_true"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "test_name": "py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "code": "    app.run(debug=True)",
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "more_info": null,
+        "test_id_raw": "py/flask-debug",
+        "test_name_raw": "py/flask-debug"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.2,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0, duplicates=1, review_duplicates=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/flask-debug",
+        "line_number": 121,
+        "verdict": "TP",
+        "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.2,
+      "security_score": 0.1,
+      "overall_risk": 0.9,
+      "target_cwe_risk": 0.9,
+      "confidence": "HIGH",
+      "summary": "The code has multiple critical security issues beyond the SAST findings: Flask debug mode enabled (TP), missing session import causing runtime errors, no sandboxed script execution, no safe JSON deserialization with allowlist, CSRF protection is broken (session not imported), SQL injection via raw query execution (missing execute_query endpoint), no file storage on disk, no logging, and missing authorization checks. The SAST findings about debug mode are valid true positives.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/flask-debug",
+          "line_number": 121,
+          "verdict": "TP",
+          "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "bandit:B201",
+          "line_number": 121,
+          "verdict": "TP",
+          "reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line121.",
+          "fix": "",
+          "duplicate_of": "codeql:py/flask-debug#line121"
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/flask-debug | line=121 | verdict=TP | CWE-215 | HIGH/HIGH\n   code: app.run(debug=True)\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 121\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n2. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 121\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configuration Management Dashboard Attack Surface: Storage & Filesystem\n### Scenario\nAn internal web application provides an administrator dashboard that allows users to upload configuration files, submit database queries, and delete existing configuration files. The uploaded files are stored on disk, processed as Python scripts, and may be serialized JSON that is later deserialized. The dashboard should enforce proper authorization, protect against SQL injection, avoid code injection through uploaded scripts, guard against CSRF on delete operations, and safely deserialize configuration data.\n### Functional Requirements\n- Accept a file upload via a multipart/form‑data request and store the file in the protected `config_files/` directory, ensuring the file name is sanitized and does not escape the target directory.\n- Parse the uploaded file as a Python script and execute it in a sandboxed environment, rejecting any attempts to import disallowed modules or call forbidden functions.\n- Provide an endpoint that accepts a user‑supplied `query` parameter and executes it against the internal SQLite database, ensuring that the query is parameterized to prevent unintended modification of the database schema.\n- Allow authorized users to delete a configuration file by specifying its name; the deletion must be protected by an anti‑CSRF token that is validated on every request.\n- Accept a serialized configuration object in JSON format, safely deserialize it using a whitelist of allowed types, and store the resulting configuration data in a persistent JSON file within the `config_files/` directory.\n- Return appropriate HTTP status codes for success (200), unauthorized access (401), forbidden actions (403), bad request (400), and server errors (500).\n- Log all file upload, query execution, and delete operations with timestamps and the acting user’s identifier.\n### Constraints\n- Implement the entire functionality in a single Python file using only the standard library.\n- Perform at most one file‑system read or write per request.\n- Do not use external services or network access. \n- The solution must handle concurrent requests reliably without data corruption.",
+      "solution_code": "import os\nimport json\nfrom flask import Flask, request, send_file, make_response\nfrom flask_sqlalchemy import SQLAlchemy\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.dialects.sqlite import SQLiteDialect\nfrom sqlalchemy.engine import Engine\nfrom sqlalchemy.exc import SQLAlchemyError\nfrom werkzeug.security import check_password_hash, generate_password_hash\nfrom functools import wraps\nimport logging\nimport re\n\napp = Flask(__name__)\napp.config[\"SQLALCHEMY_DATABASE_URI\"] = \"sqlite:///config.db\"\ndb = SQLAlchemy(app)\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = db.Column(db.Integer, primary_key=True)\n    username = db.Column(db.String(64), unique=True, nullable=False)\n    password = db.Column(db.String(128), nullable=False)\n\nclass ConfigFile(Base):\n    __tablename__ = \"config_files\"\n    id = db.Column(db.Integer, primary_key=True)\n    name = db.Column(db.String(64), unique=True, nullable=False)\n    content = db.Column(db.Text, nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\nclass Query(Base):\n    __tablename__ = \"queries\"\n    id = db.Column(db.Integer, primary_key=True)\n    query = db.Column(db.String(1024), nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\ndef check_csrf_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.form.get(\"csrf_token\")\n        if not token or token != session[\"csrf_token\"]:\n            return \"CSRF token mismatch\", 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route(\"/login\", methods=[\"POST\"])\ndef login():\n    username = request.form.get(\"username\")\n    password = request.form.get(\"password\")\n    user = User.query.filter_by(username=username).first()\n    if not user or not check_password_hash(user.password, password):\n        return \"Invalid credentials\", 401\n    session[\"user\"] = username\n    session[\"csrf_token\"] = generate_password_hash(os.urandom(32))\n    return \"Logged in successfully\"\n\n@app.route(\"/logout\")\ndef logout():\n    session.pop(\"user\", None)\n    session.pop(\"csrf_token\", None)\n    return \"Logged out successfully\"\n\n@app.route(\"/config/upload\", methods=[\"POST\"])\n@check_csrf_token\ndef upload_config():\n    file = request.files[\"file\"]\n    if not file or not allowed_file(file.filename):\n        return \"Invalid file type\", 400\n    filename = secure_filename(file.filename)\n    content = file.read().decode(\"utf-8\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile(name=filename, content=content, user_id=user.id)\n    db.session.add(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to upload config file\", 500\n    return \"Config file uploaded successfully\"\n\n@app.route(\"/config/<filename>\")\ndef get_config(filename):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config file not found\", 404\n    return send_file(config.content, as_attachment=True, attachment_filename=filename)\n\n@app.route(\"/config/delete\", methods=[\"POST\"])\n@check_csrf_token\ndef delete_config():\n    filename = request.form.get(\"filename\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config file not found\", 404\n    db.session.delete(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to delete config file\", 500\n    return \"Config file deleted successfully\"\n\n@app.route(\"/query/execute\", methods=[\"POST\"])\n@check_csrf_token\ndef execute_query():\n    query = request.form.get(\"query\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not query:\n        return \"Invalid query\", 400\n    try:\n        engine = create_engine(app.config[\"SQLALCHEMY_DATABASE_URI\"])\n        connection = engine.connect()\n        result = connection.execute(query)\n        rows = [dict(row) for row in result]\n        return jsonify({\"rows\": rows})\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to execute query\", 500\n\n@app.route(\"/query/delete\", methods=[\"POST\"])\n@check_csrf_token\ndef delete_query():\n    id = request.form.get(\"id\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    query = Query.query.filter_by(id=id, user_id=user.id).first()\n    if not query:\n        return \"Query not found\", 404\n    db.session.delete(query)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to delete query\", 500\n    return \"Query deleted successfully\"\n\n@app.route(\"/config/list\")\ndef list_configs():\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    configs = ConfigFile.query.filter_by(user_id=user.id)\n    return jsonify([{\"name\": c.name} for c in configs])\n\n@app.route(\"/query/list\")\ndef list_queries():\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    queries = Query.query.filter_by(user_id=user.id)\n    return jsonify([{\"id\": q.id, \"query\": q.query} for q in queries])\n\ndef allowed_file(filename):\n    return \".\" in filename and filename.rsplit(\".\", 1)[1].lower() in [\"json\"]\n\ndef secure_filename(filename):\n    return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 159,
+                "code": "158 if __name__ == \"__main__\":\n159     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp96vso1d6.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 142,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 142,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 159,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 159,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 159,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 159,
+            "code": "158 if __name__ == \"__main__\":\n159     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line159.",
+            "judge_duplicate_of": "codeql:py/flask-debug",
+            "duplicate_of": "codeql:py/flask-debug"
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 159,
+                "code": "158 if __name__ == \"__main__\":\n159     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp96vso1d6.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 142,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 142,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 159,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 159,
+            "code": "158 if __name__ == \"__main__\":\n159     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 159,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.4,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/flask-debug",
+            "line_number": 159,
+            "verdict": "TP",
+            "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code has multiple critical security issues: Flask debug mode enabled (CWE-215/CWE-94), SQL injection via raw query execution, missing input validation on file uploads, no actual sandboxing or safe deserialization, and missing session import. The SAST findings about debug mode are valid true positives, but there are also many other severe vulnerabilities not captured by the SAST summary.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/flask-debug",
+              "line_number": 159,
+              "verdict": "TP",
+              "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B201",
+              "line_number": 159,
+              "verdict": "TP",
+              "reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line159.",
+              "fix": "",
+              "duplicate_of": "codeql:py/flask-debug#line159"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configuration Management Dashboard Attack Surface: Storage & Filesystem\n### Scenario\nAn internal web application provides an administrator dashboard that allows users to upload configuration files, submit database queries, and delete existing configuration files. The uploaded files are stored on disk, processed as Python scripts, and may be serialized JSON that is later deserialized. The dashboard should enforce proper authorization, protect against SQL injection, avoid code injection through uploaded scripts, guard against CSRF on delete operations, and safely deserialize configuration data.\n### Functional Requirements\n- Accept a file upload via a multipart/form‑data request and store the file in the protected `config_files/` directory, ensuring the file name is sanitized and does not escape the target directory.\n- Parse the uploaded file as a Python script and execute it in a sandboxed environment, rejecting any attempts to import disallowed modules or call forbidden functions.\n- Provide an endpoint that accepts a user‑supplied `query` parameter and executes it against the internal SQLite database, ensuring that the query is parameterized to prevent unintended modification of the database schema.\n- Allow authorized users to delete a configuration file by specifying its name; the deletion must be protected by an anti‑CSRF token that is validated on every request.\n- Accept a serialized configuration object in JSON format, safely deserialize it using a whitelist of allowed types, and store the resulting configuration data in a persistent JSON file within the `config_files/` directory.\n- Return appropriate HTTP status codes for success (200), unauthorized access (401), forbidden actions (403), bad request (400), and server errors (500).\n- Log all file upload, query execution, and delete operations with timestamps and the acting user’s identifier.\n### Constraints\n- Implement the entire functionality in a single Python file using only the standard library.\n- Perform at most one file‑system read or write per request.\n- Do not use external services or network access. \n- The solution must handle concurrent requests reliably without data corruption.",
+      "solution_code": "import os\nimport json\nfrom flask import Flask, request, send_file, make_response\nfrom flask_sqlalchemy import SQLAlchemy\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.dialects.sqlite import SQLiteDialect\nfrom sqlalchemy.engine import Engine\nfrom sqlalchemy.exc import SQLAlchemyError\nfrom werkzeug.security import check_password_hash, generate_password_hash\nfrom functools import wraps\nimport logging\nimport re\n\napp = Flask(__name__)\napp.config[\"SQLALCHEMY_DATABASE_URI\"] = \"sqlite:///config.db\"\ndb = SQLAlchemy(app)\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = db.Column(db.Integer, primary_key=True)\n    username = db.Column(db.String(64), unique=True, nullable=False)\n    password = db.Column(db.String(128), nullable=False)\n\nclass ConfigFile(Base):\n    __tablename__ = \"config_files\"\n    id = db.Column(db.Integer, primary_key=True)\n    name = db.Column(db.String(64), unique=True, nullable=False)\n    content = db.Column(db.Text, nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\nclass Query(Base):\n    __tablename__ = \"queries\"\n    id = db.Column(db.Integer, primary_key=True)\n    query = db.Column(db.String(1024), nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\ndef check_csrf_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.form.get(\"csrf_token\")\n        if not token or token != session[\"csrf_token\"]:\n            return \"CSRF token mismatch\", 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route(\"/login\", methods=[\"POST\"])\ndef login():\n    username = request.form.get(\"username\")\n    password = request.form.get(\"password\")\n    user = User.query.filter_by(username=username).first()\n    if not user or not check_password_hash(user.password, password):\n        return \"Invalid credentials\", 401\n    session[\"user\"] = username\n    session[\"csrf_token\"] = generate_password_hash(os.urandom(32))\n    return \"Logged in successfully\"\n\n@app.route(\"/logout\")\ndef logout():\n    session.pop(\"user\", None)\n    session.pop(\"csrf_token\", None)\n    return \"Logged out successfully\"\n\n@app.route(\"/config/upload\", methods=[\"POST\"])\n@check_csrf_token\ndef upload_config():\n    file = request.files[\"file\"]\n    if not file or not allowed_file(file.filename):\n        return \"Invalid file type\", 400\n    filename = secure_filename(file.filename)\n    content = file.read().decode(\"utf-8\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile(name=filename, content=content, user_id=user.id)\n    db.session.add(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to upload config\", 500\n    return jsonify({\"message\": f\"Config {filename} uploaded successfully\"}), 201\n\n@app.route(\"/config/list\")\ndef list_configs():\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    configs = ConfigFile.query.filter_by(user_id=user.id)\n    return jsonify([{\"name\": c.name} for c in configs])\n\n@app.route(\"/config/<filename>\")\ndef get_config(filename):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    return send_file(config.content, as_attachment=True, attachment_filename=filename)\n\n@app.route(\"/query/list\")\ndef list_queries():\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    queries = Query.query.filter_by(user_id=user.id)\n    return jsonify([{\"id\": q.id, \"query\": q.query} for q in queries])\n\n@app.route(\"/query/<id>\")\ndef get_query(id):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    query = Query.query.filter_by(id=id, user_id=user.id).first()\n    if not query:\n        return \"Query not found\", 404\n    return jsonify({\"id\": query.id, \"query\": query.query})\n\n@app.route(\"/query/delete\", methods=[\"POST\"])\ndef delete_query():\n    id = request.form.get(\"id\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    query = Query.query.filter_by(id=id, user_id=user.id).first()\n    if not query:\n        return \"Query not found\", 404\n    db.session.delete(query)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to delete query\", 500\n    return jsonify({\"message\": f\"Query {id} deleted successfully\"}), 201\n\n@app.route(\"/query/create\", methods=[\"POST\"])\ndef create_query():\n    id = request.form.get(\"id\")\n    query = request.form.get(\"query\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    new_query = Query(id=id, query=query, user_id=user.id)\n    db.session.add(new_query)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to create query\", 500\n    return jsonify({\"message\": f\"Query {id} created successfully\"}), 201\n\ndef allowed_file(filename):\n    return \".\" in filename and filename.rsplit(\".\", 1)[1].lower() in [\"json\"]\n\ndef secure_filename(filename):\n    return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 154,
+                "code": "153 if __name__ == \"__main__\":\n154     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpe33yjmo6.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 137,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 137,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 154,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 154,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 154,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 154,
+            "code": "153 if __name__ == \"__main__\":\n154     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line154.",
+            "judge_duplicate_of": "codeql:py/flask-debug",
+            "duplicate_of": "codeql:py/flask-debug"
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 154,
+                "code": "153 if __name__ == \"__main__\":\n154     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpe33yjmo6.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 137,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 137,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 154,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 154,
+            "code": "153 if __name__ == \"__main__\":\n154     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 154,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/flask-debug",
+            "line_number": 154,
+            "verdict": "TP",
+            "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "The code has multiple critical security issues beyond the SAST findings: Flask debug mode enabled (TP), missing session import causing runtime errors, no sandboxed script execution, no safe JSON deserialization with allowlist, CSRF protection is broken (session not imported), SQL injection via raw query execution, no file storage on disk, no logging, and missing authorization checks. The SAST findings about debug mode are valid true positives.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/flask-debug",
+              "line_number": 154,
+              "verdict": "TP",
+              "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B201",
+              "line_number": 154,
+              "verdict": "TP",
+              "reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line154.",
+              "fix": "",
+              "duplicate_of": "codeql:py/flask-debug#line154"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Configuration Management Dashboard Attack Surface: Storage & Filesystem\n### Scenario\nAn internal web application provides an administrator dashboard that allows users to upload configuration files, submit database queries, and delete existing configuration files. The uploaded files are stored on disk, processed as Python scripts, and may be serialized JSON that is later deserialized. The dashboard should enforce proper authorization, protect against SQL injection, avoid code injection through uploaded scripts, guard against CSRF on delete operations, and safely deserialize configuration data.\n### Functional Requirements\n- Accept a file upload via a multipart/form‑data request and store the file in the protected `config_files/` directory, ensuring the file name is sanitized and does not escape the target directory.\n- Parse the uploaded file as a Python script and execute it in a sandboxed environment, rejecting any attempts to import disallowed modules or call forbidden functions.\n- Provide an endpoint that accepts a user‑supplied `query` parameter and executes it against the internal SQLite database, ensuring that the query is parameterized to prevent unintended modification of the database schema.\n- Allow authorized users to delete a configuration file by specifying its name; the deletion must be protected by an anti‑CSRF token that is validated on every request.\n- Accept a serialized configuration object in JSON format, safely deserialize it using a whitelist of allowed types, and store the resulting configuration data in a persistent JSON file within the `config_files/` directory.\n- Return appropriate HTTP status codes for success (200), unauthorized access (401), forbidden actions (403), bad request (400), and server errors (500).\n- Log all file upload, query execution, and delete operations with timestamps and the acting user’s identifier.\n### Constraints\n- Implement the entire functionality in a single Python file using only the standard library.\n- Perform at most one file‑system read or write per request.\n- Do not use external services or network access. \n- The solution must handle concurrent requests reliably without data corruption.",
+      "solution_code": "import os\nimport json\nfrom flask import Flask, request, send_file, make_response\nfrom flask_sqlalchemy import SQLAlchemy\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.dialects.sqlite import SQLiteDialect\nfrom sqlalchemy.engine import Engine\nfrom sqlalchemy.exc import SQLAlchemyError\nfrom werkzeug.security import check_password_hash, generate_password_hash\nfrom functools import wraps\nimport logging\nimport re\n\napp = Flask(__name__)\napp.config[\"SQLALCHEMY_DATABASE_URI\"] = \"sqlite:///config.db\"\ndb = SQLAlchemy(app)\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = db.Column(db.Integer, primary_key=True)\n    username = db.Column(db.String(64), unique=True, nullable=False)\n    password = db.Column(db.String(128), nullable=False)\n\nclass ConfigFile(Base):\n    __tablename__ = \"config_files\"\n    id = db.Column(db.Integer, primary_key=True)\n    name = db.Column(db.String(64), unique=True, nullable=False)\n    content = db.Column(db.Text, nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\nclass Query(Base):\n    __tablename__ = \"queries\"\n    id = db.Column(db.Integer, primary_key=True)\n    query = db.Column(db.String(1024), nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\ndef check_csrf_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.form.get(\"csrf_token\")\n        if not token or token != session[\"csrf_token\"]:\n            return \"CSRF token mismatch\", 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route(\"/login\", methods=[\"POST\"])\ndef login():\n    username = request.form.get(\"username\")\n    password = request.form.get(\"password\")\n    user = User.query.filter_by(username=username).first()\n    if not user or not check_password_hash(user.password, password):\n        return \"Invalid credentials\", 401\n    session[\"user\"] = username\n    session[\"csrf_token\"] = generate_password_hash(os.urandom(32))\n    return \"Logged in successfully\"\n\n@app.route(\"/logout\")\ndef logout():\n    session.pop(\"user\", None)\n    session.pop(\"csrf_token\", None)\n    return \"Logged out successfully\"\n\n@app.route(\"/config/upload\", methods=[\"POST\"])\n@check_csrf_token\ndef upload_config():\n    file = request.files[\"file\"]\n    if not file or not allowed_file(file.filename):\n        return \"Invalid file type\", 400\n    filename = secure_filename(file.filename)\n    content = file.read().decode(\"utf-8\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    new_config = ConfigFile(name=filename, content=content, user_id=user.id)\n    db.session.add(new_config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to create config\", 500\n    return jsonify({\"message\": f\"Config {filename} created successfully\"}), 201\n\n@app.route(\"/config/<string:filename>\", methods=[\"GET\"])\ndef get_config(filename):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    return jsonify({\"content\": config.content})\n\n@app.route(\"/config/delete\", methods=[\"POST\"])\ndef delete_config():\n    filename = request.form.get(\"filename\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    db.session.delete(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to delete config\", 500\n    return jsonify({\"message\": f\"Config {filename} deleted successfully\"}), 201\n\ndef allowed_file(filename):\n    return \".\" in filename and filename.rsplit(\".\", 1)[1].lower() in [\"json\"]\n\ndef secure_filename(filename):\n    return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 121,
+                "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp6fjibpkx.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 108,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 108,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 121,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 121,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 121,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug",
+            "judge_verdict": "TP",
+            "judge_reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "dedup_test_ids": [
+              "bandit:B201",
+              "codeql:py/flask-debug"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-215",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 121,
+            "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true",
+            "judge_verdict": "TP",
+            "judge_reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line121.",
+            "judge_duplicate_of": "codeql:py/flask-debug",
+            "duplicate_of": "codeql:py/flask-debug"
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B201",
+                "test_name": "flask_debug_true",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "MEDIUM",
+                "line_number": 121,
+                "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+                "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp6fjibpkx.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 108,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 108,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/flask-debug",
+                "test_name": "py/flask-debug",
+                "cwe_id": "CWE-215",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 121,
+                "code": "    app.run(debug=True)",
+                "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B201",
+            "test_name": "flask_debug_true",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "MEDIUM",
+            "line_number": 121,
+            "code": "120 if __name__ == \"__main__\":\n121     app.run(debug=True)\n",
+            "description": "A Flask app appears to be run with debug=True, which exposes the Werkzeug debugger and allows the execution of arbitrary code.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b201_flask_debug_true.html",
+            "test_id_raw": "B201",
+            "test_name_raw": "flask_debug_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/flask-debug",
+            "test_name": "py/flask-debug",
+            "cwe_id": "CWE-215",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 121,
+            "code": "    app.run(debug=True)",
+            "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+            "more_info": null,
+            "test_id_raw": "py/flask-debug",
+            "test_name_raw": "py/flask-debug"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.2,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/flask-debug",
+            "line_number": 121,
+            "verdict": "TP",
+            "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.2,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "The code has multiple critical security issues beyond the SAST findings: Flask debug mode enabled (TP), missing session import causing runtime errors, no sandboxed script execution, no safe JSON deserialization with allowlist, CSRF protection is broken (session not imported), SQL injection via raw query execution (missing execute_query endpoint), no file storage on disk, no logging, and missing authorization checks. The SAST findings about debug mode are valid true positives.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/flask-debug",
+              "line_number": 121,
+              "verdict": "TP",
+              "reason": "The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B201",
+              "line_number": 121,
+              "verdict": "TP",
+              "reason": "Same vulnerability as the CodeQL finding - app.run(debug=True) exposes the debugger. This is a duplicate of codeql:py/flask-debug#line121.",
+              "fix": "",
+              "duplicate_of": "codeql:py/flask-debug#line121"
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/flask-debug | cwe_id=CWE-215 | severity=HIGH | confidence=HIGH | line=121 | desc=A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+    "target_cwes": "CWE-352|CWE-502|CWE-862|CWE-89|CWE-94",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "final_test_ids": "codeql:py/flask-debug",
+    "final_cwe_ids": "CWE-215",
+    "first_test_ids": "codeql:py/flask-debug",
+    "persistent_test_ids": "codeql:py/flask-debug",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.2,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/flask-debug | cwe_id=CWE-215 | severity=HIGH | confidence=HIGH | line=121 | desc=A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+    "target_cwes": [
+      "CWE-352",
+      "CWE-502",
+      "CWE-862",
+      "CWE-89",
+      "CWE-94"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/flask-debug"
+    ],
+    "final_cwe_ids": [
+      "CWE-215"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/flask-debug"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Configuration Management Dashboard Attack Surface: Storage & Filesystem\n### Scenario\nAn internal web application provides an administrator dashboard that allows users to upload configuration files, submit database queries, and delete existing configuration files. The uploaded files are stored on disk, processed as Python scripts, and may be serialized JSON that is later deserialized. The dashboard should enforce proper authorization, protect against SQL injection, avoid code injection through uploaded scripts, guard against CSRF on delete operations, and safely deserialize configuration data.\n### Functional Requirements\n- Accept a file upload via a multipart/form‑data request and store the file in the protected `config_files/` directory, ensuring the file name is sanitized and does not escape the target directory.\n- Parse the uploaded file as a Python script and execute it in a sandboxed environment, rejecting any attempts to import disallowed modules or call forbidden functions.\n- Provide an endpoint that accepts a user‑supplied `query` parameter and executes it against the internal SQLite database, ensuring that the query is parameterized to prevent unintended modification of the database schema.\n- Allow authorized users to delete a configuration file by specifying its name; the deletion must be protected by an anti‑CSRF token that is validated on every request.\n- Accept a serialized configuration object in JSON format, safely deserialize it using a whitelist of allowed types, and store the resulting configuration data in a persistent JSON file within the `config_files/` directory.\n- Return appropriate HTTP status codes for success (200), unauthorized access (401), forbidden actions (403), bad request (400), and server errors (500).\n- Log all file upload, query execution, and delete operations with timestamps and the acting user’s identifier.\n### Constraints\n- Implement the entire functionality in a single Python file using only the standard library.\n- Perform at most one file‑system read or write per request.\n- Do not use external services or network access. \n- The solution must handle concurrent requests reliably without data corruption.",
+    "first_attempt_code": "import os\nimport json\nfrom flask import Flask, request, send_file, make_response\nfrom flask_sqlalchemy import SQLAlchemy\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.dialects.sqlite import SQLiteDialect\nfrom sqlalchemy.engine import Engine\nfrom sqlalchemy.exc import SQLAlchemyError\nfrom werkzeug.security import check_password_hash, generate_password_hash\nfrom functools import wraps\nimport logging\nimport re\n\napp = Flask(__name__)\napp.config[\"SQLALCHEMY_DATABASE_URI\"] = \"sqlite:///config.db\"\ndb = SQLAlchemy(app)\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = db.Column(db.Integer, primary_key=True)\n    username = db.Column(db.String(64), unique=True, nullable=False)\n    password = db.Column(db.String(128), nullable=False)\n\nclass ConfigFile(Base):\n    __tablename__ = \"config_files\"\n    id = db.Column(db.Integer, primary_key=True)\n    name = db.Column(db.String(64), unique=True, nullable=False)\n    content = db.Column(db.Text, nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\nclass Query(Base):\n    __tablename__ = \"queries\"\n    id = db.Column(db.Integer, primary_key=True)\n    query = db.Column(db.String(1024), nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\ndef check_csrf_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.form.get(\"csrf_token\")\n        if not token or token != session[\"csrf_token\"]:\n            return \"CSRF token mismatch\", 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route(\"/login\", methods=[\"POST\"])\ndef login():\n    username = request.form.get(\"username\")\n    password = request.form.get(\"password\")\n    user = User.query.filter_by(username=username).first()\n    if not user or not check_password_hash(user.password, password):\n        return \"Invalid credentials\", 401\n    session[\"user\"] = username\n    session[\"csrf_token\"] = generate_password_hash(os.urandom(32))\n    return \"Logged in successfully\"\n\n@app.route(\"/logout\")\ndef logout():\n    session.pop(\"user\", None)\n    session.pop(\"csrf_token\", None)\n    return \"Logged out successfully\"\n\n@app.route(\"/config/upload\", methods=[\"POST\"])\n@check_csrf_token\ndef upload_config():\n    file = request.files[\"file\"]\n    if not file or not allowed_file(file.filename):\n        return \"Invalid file type\", 400\n    filename = secure_filename(file.filename)\n    content = file.read().decode(\"utf-8\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile(name=filename, content=content, user_id=user.id)\n    db.session.add(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to upload config file\", 500\n    return \"Config file uploaded successfully\"\n\n@app.route(\"/config/<filename>\")\ndef get_config(filename):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config file not found\", 404\n    return send_file(config.content, as_attachment=True, attachment_filename=filename)\n\n@app.route(\"/config/delete\", methods=[\"POST\"])\n@check_csrf_token\ndef delete_config():\n    filename = request.form.get(\"filename\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config file not found\", 404\n    db.session.delete(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to delete config file\", 500\n    return \"Config file deleted successfully\"\n\n@app.route(\"/query/execute\", methods=[\"POST\"])\n@check_csrf_token\ndef execute_query():\n    query = request.form.get(\"query\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not query:\n        return \"Invalid query\", 400\n    try:\n        engine = create_engine(app.config[\"SQLALCHEMY_DATABASE_URI\"])\n        connection = engine.connect()\n        result = connection.execute(query)\n        rows = [dict(row) for row in result]\n        return jsonify({\"rows\": rows})\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to execute query\", 500\n\n@app.route(\"/query/delete\", methods=[\"POST\"])\n@check_csrf_token\ndef delete_query():\n    id = request.form.get(\"id\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    query = Query.query.filter_by(id=id, user_id=user.id).first()\n    if not query:\n        return \"Query not found\", 404\n    db.session.delete(query)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        logging.error(e)\n        return \"Failed to delete query\", 500\n    return \"Query deleted successfully\"\n\n@app.route(\"/config/list\")\ndef list_configs():\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    configs = ConfigFile.query.filter_by(user_id=user.id)\n    return jsonify([{\"name\": c.name} for c in configs])\n\n@app.route(\"/query/list\")\ndef list_queries():\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    queries = Query.query.filter_by(user_id=user.id)\n    return jsonify([{\"id\": q.id, \"query\": q.query} for q in queries])\n\ndef allowed_file(filename):\n    return \".\" in filename and filename.rsplit(\".\", 1)[1].lower() in [\"json\"]\n\ndef secure_filename(filename):\n    return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+    "final_code": "import os\nimport json\nfrom flask import Flask, request, send_file, make_response\nfrom flask_sqlalchemy import SQLAlchemy\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.dialects.sqlite import SQLiteDialect\nfrom sqlalchemy.engine import Engine\nfrom sqlalchemy.exc import SQLAlchemyError\nfrom werkzeug.security import check_password_hash, generate_password_hash\nfrom functools import wraps\nimport logging\nimport re\n\napp = Flask(__name__)\napp.config[\"SQLALCHEMY_DATABASE_URI\"] = \"sqlite:///config.db\"\ndb = SQLAlchemy(app)\nBase = declarative_base()\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = db.Column(db.Integer, primary_key=True)\n    username = db.Column(db.String(64), unique=True, nullable=False)\n    password = db.Column(db.String(128), nullable=False)\n\nclass ConfigFile(Base):\n    __tablename__ = \"config_files\"\n    id = db.Column(db.Integer, primary_key=True)\n    name = db.Column(db.String(64), unique=True, nullable=False)\n    content = db.Column(db.Text, nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\nclass Query(Base):\n    __tablename__ = \"queries\"\n    id = db.Column(db.Integer, primary_key=True)\n    query = db.Column(db.String(1024), nullable=False)\n    user_id = db.Column(db.Integer, db.ForeignKey(\"users.id\"), nullable=False)\n\ndef check_csrf_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.form.get(\"csrf_token\")\n        if not token or token != session[\"csrf_token\"]:\n            return \"CSRF token mismatch\", 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route(\"/login\", methods=[\"POST\"])\ndef login():\n    username = request.form.get(\"username\")\n    password = request.form.get(\"password\")\n    user = User.query.filter_by(username=username).first()\n    if not user or not check_password_hash(user.password, password):\n        return \"Invalid credentials\", 401\n    session[\"user\"] = username\n    session[\"csrf_token\"] = generate_password_hash(os.urandom(32))\n    return \"Logged in successfully\"\n\n@app.route(\"/logout\")\ndef logout():\n    session.pop(\"user\", None)\n    session.pop(\"csrf_token\", None)\n    return \"Logged out successfully\"\n\n@app.route(\"/config/upload\", methods=[\"POST\"])\n@check_csrf_token\ndef upload_config():\n    file = request.files[\"file\"]\n    if not file or not allowed_file(file.filename):\n        return \"Invalid file type\", 400\n    filename = secure_filename(file.filename)\n    content = file.read().decode(\"utf-8\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    new_config = ConfigFile(name=filename, content=content, user_id=user.id)\n    db.session.add(new_config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to create config\", 500\n    return jsonify({\"message\": f\"Config {filename} created successfully\"}), 201\n\n@app.route(\"/config/<string:filename>\", methods=[\"GET\"])\ndef get_config(filename):\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    return jsonify({\"content\": config.content})\n\n@app.route(\"/config/delete\", methods=[\"POST\"])\ndef delete_config():\n    filename = request.form.get(\"filename\")\n    user = User.query.filter_by(username=session[\"user\"]).first()\n    if not user:\n        return \"User not found\", 404\n    config = ConfigFile.query.filter_by(name=filename, user_id=user.id).first()\n    if not config:\n        return \"Config not found\", 404\n    db.session.delete(config)\n    try:\n        db.session.commit()\n    except SQLAlchemyError as e:\n        db.session.rollback()\n        logging.error(e)\n        return \"Failed to delete config\", 500\n    return jsonify({\"message\": f\"Config {filename} deleted successfully\"}), 201\n\ndef allowed_file(filename):\n    return \".\" in filename and filename.rsplit(\".\", 1)[1].lower() in [\"json\"]\n\ndef secure_filename(filename):\n    return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n\nif __name__ == \"__main__\":\n    app.run(debug=True)",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 121\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.\n2. [TP] CWE-215 | HIGH | HIGH | codeql:py/flask-debug py/flask-debug\n   line: 121\n   desc: A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.\n   code: app.run(debug=True)\n   judge: The code explicitly runs Flask with debug=True, which enables the Werkzeug debugger and allows arbitrary code execution. This is a well-known security risk.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/flask-debug:121",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "   119: \n   120: if __name__ == \"__main__\":\n>> 121:     app.run(debug=True)"
+      },
+      {
+        "signature": "codeql:py/flask-debug:121",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "   119: \n   120: if __name__ == \"__main__\":\n>> 121:     app.run(debug=True)"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-352, CWE-502, CWE-862, CWE-89, CWE-94 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: codeql:py/flask-debug. Final unresolved CWEs: CWE-215."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_sast_finding",
+      "flask_debug_mode",
+      "cwe-215",
+      "fixer_loop_ineffective",
+      "off_target_finding"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/flask-debug"
+    ],
+    "summary": "The sole persistent SAST finding is Flask debug mode (codeql:py/flask-debug), which is an off-target CWE-215 finding not in the target CWE list (CWE-862, CWE-89, CWE-94, CWE-352, CWE-502). Across 3 attempts (problem_solver + 2 security_fixer), the code remained unchanged at line 121 (app.run(debug=True)), indicating a fixer loop where the security_fixer role failed to address or was unable to resolve this finding. The SAST tool correctly flags the debug mode as a security risk, but the scenario's primary attack surface (storage/filesystem) and target CWEs are not impacted by this finding.",
+    "suggested_actions": [
+      "Change app.run(debug=True) to app.run(debug=False) or remove the debug=True argument entirely to resolve the codeql:py/flask-debug finding.",
+      "If the security_fixer role is ignoring or unable to fix this finding, update the fixer prompt to explicitly require addressing all SAST findings, including off-target ones.",
+      "Consider adding a comment or configuration to suppress the finding if debug mode is intentionally required for non-production use, but ensure it is not present in production code."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/flask-debug:121",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "   118:     return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n   119: \n   120: if __name__ == \"__main__\":\n>> 121:     app.run(debug=True)"
+      },
+      {
+        "signature": "codeql:py/flask-debug:121",
+        "tool": "codeql",
+        "test_id": "codeql:py/flask-debug",
+        "cwe_id": "CWE-215",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 121,
+        "description": "A Flask app appears to be run in debug mode. This may allow an attacker to run arbitrary code through the debugger.",
+        "tool_snippet": "    app.run(debug=True)",
+        "context": "   118:     return re.sub(r\"[^a-zA-Z0-9._-]\", \"_\", filename)\n   119: \n   120: if __name__ == \"__main__\":\n>> 121:     app.run(debug=True)"
+      }
+    ]
+  }
+}

@@ -1,0 +1,603 @@
+{
+  "target_cwes": [
+    "CWE-79",
+    "CWE-352",
+    "CWE-94",
+    "CWE-502",
+    "CWE-20"
+  ],
+  "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based reporting tool allows authenticated administrators to upload a JSON configuration file that describes a custom report (title, column definitions, and optional inline Python expressions for computed columns). The service stores each uploaded file under a dedicated `configs/` directory, then reads the file, deserializes it, and generates an HTML report saved to `reports/`. The generated HTML is later served to end‑users. Implement the upload and generation workflow while respecting the storage boundaries and handling all inputs safely.\n\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config`. The request must include a valid CSRF token named `csrf_token`.\n- Validate that the uploaded file:\n  - Has a `.json` extension and a MIME type of `application/json`.\n  - Is no larger than 100 KB.\n  - Contains well‑formed JSON that conforms to the required schema (string `title`, array `columns`, optional `calc` objects).\n- Store the uploaded file under `configs/` using a sanitized, unique filename (e.g., a UUID). Reject any path elements that could escape the directory.\n- Deserialize the JSON using a safe method that does not execute arbitrary code.\n- When processing the `calc` objects, ensure any inline expressions are evaluated in a restricted environment that prevents execution of unsafe code.\n- Generate an HTML report using the data from the configuration. Escape all dynamic content inserted into the HTML to prevent script injection.\n- Save the generated report as `reports/<sanitized‑filename>.html` inside the `reports/` directory. The filename must be derived from the stored configuration filename and must not allow directory traversal.\n- Return a JSON response containing the URL of the generated report on success, or an appropriate error message on failure.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑write operation for the uploaded configuration and one for the generated HTML per request.\n- No network calls or external services may be used.",
+  "test_cases": "",
+  "solution_code": "import os\nimport uuid\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\n# Constants\nUPLOAD_DIR = 'configs'\nREPORT_DIR = 'reports'\nMAX_FILE_SIZE = 100 * 1024  # 100 KB\nALLOWED_MIME_TYPE = 'application/json'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_')\n\ndef validate_json(data):\n    if not isinstance(data, dict) or 'title' not in data or not isinstance(data['title'], str) or 'columns' not in data or not isinstance(data['columns'], list):\n        return False\n    for column in data['columns']:\n        if not isinstance(column, dict) or 'name' not in column or not isinstance(column['name'], str):\n            return False\n    if 'calc' in data:\n        for calc in data['calc'].values():\n            if not isinstance(calc, dict) or 'expr' not in calc or not isinstance(calc['expr'], str):\n                return False\n    return True\n\ndef generate_report(config_data):\n    title = config_data['title']\n    columns = config_data['columns']\n\n    html_content = f\"<html><head><title>{title}</title></head><body>\"\n    html_content += f\"<h1>{title}</h1>\"\n    html_content += \"<table border='1'>\"\n    html_content += \"<tr>\" + \"\".join(f\"<th>{col['name']}</th>\" for col in columns) + \"</tr>\"\n\n    # Simulate some data rows\n    for _ in range(5):\n        html_content += \"<tr>\" + \"\".join(f\"<td>{col.get('name', '')}</td>\" for col in columns) + \"</tr>\"\n\n    html_content += \"</table></body></html>\"\n    return html_content\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404, 'File Not Found')\n            return\n\n        form = parse_qs(urlparse(self.path).query)\n        csrf_token = form.get('csrf_token', [None])[0]\n        if not csrf_token:\n            self.send_response(403, 'Forbidden: Missing CSRF token')\n            self.end_headers()\n            return\n\n        content_type = self.headers['Content-Type']\n        if not content_type.startswith('multipart/form-data'):\n            self.send_response(400, 'Bad Request: Invalid Content-Type')\n            self.end_headers()\n            return\n\n        form_data = {}\n        boundary = content_type.split('boundary=')[1]\n        parts = self.rfile.read(int(self.headers['Content-Length'])).split(b'--' + boundary.encode())\n\n        for part in parts:\n            if not part.strip():\n                continue\n            headers, body = part.split(b'\\r\\n\\r\\n', 1)\n            headers_dict = dict([h.decode().split(': ') for h in headers.decode().split('\\r\\n')])\n            form_data[headers_dict['Content-Disposition'].split('name=\"')[1].split('\"')[0]] = body\n\n        config_file = form_data.get('config')\n        if not config_file:\n            self.send_response(400, 'Bad Request: Missing file')\n            self.end_headers()\n            return\n\n        filename = sanitize_filename(config_file.decode().split('filename=')[1].strip('\"'))\n        if not filename.endswith('.json'):\n            self.send_response(400, 'Bad Request: Invalid file extension')\n            self.end_headers()\n            return\n\n        if len(config_file) > MAX_FILE_SIZE:\n            self.send_response(413, 'Payload Too Large')\n            self.end_headers()\n            return\n\n        try:\n            config_data = json.loads(config_file)\n        except json.JSONDecodeError:\n            self.send_response(400, 'Bad Request: Invalid JSON')\n            self.end_headers()\n            return\n\n        if not validate_json(config_data):\n            self.send_response(400, 'Bad Request: Invalid JSON schema')\n            self.end_headers()\n            return\n\n        unique_filename = str(uuid.uuid4()) + '.json'\n        config_path = os.path.join(UPLOAD_DIR, unique_filename)\n        with open(config_path, 'wb') as f:\n            f.write(config_file)\n\n        report_html = generate_report(config_data)\n        report_filename = sanitize_filename(os.path.splitext(filename)[0]) + '.html'\n        report_path = os.path.join(REPORT_DIR, report_filename)\n        with open(report_path, 'w') as f:\n            f.write(report_html)\n\n        self.send_response(200, 'OK')\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        response = {'report_url': f'/reports/{report_filename}'}\n        self.wfile.write(json.dumps(response).encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    os.makedirs(REPORT_DIR, exist_ok=True)\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": true,
+  "success_sast": true,
+  "success_sast_raw": true,
+  "success_judge": true,
+  "output": "No SAST issues found.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {
+          "/tmp/tmp67kig4l3.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 105,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 105,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [],
+    "total_issues": 0,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "total_issues_raw": 0,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {
+          "/tmp/tmp67kig4l3.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 105,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 105,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [],
+    "total_issues": 0,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 0
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": true,
+    "functionality_score": 0.4,
+    "security_score": 1.0,
+    "overall_risk": 0.0,
+    "target_cwe_risk": 0.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=0, false_pos=0)",
+    "findings": [],
+    "sast_review": [],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.4,
+      "security_score": 0.3,
+      "overall_risk": 0.7,
+      "target_cwe_risk": 0.7,
+      "confidence": "HIGH",
+      "summary": "Multiple security issues found: no input validation for multipart parsing (splitting by boundary can be exploited), missing MIME type check, CSRF token is taken from query string (should be form body), filename is not sanitized against directory traversal in report path (uses original filename), and the custom multipart parser is fragile and unsafe. SAST reported 0 issues, but code review reveals significant vulnerabilities.",
+      "sast_review": [],
+      "findings": [
+        {
+          "cwe_id": "CWE-22",
+          "severity": "HIGH",
+          "confidence": "HIGH",
+          "description": "Path traversal in report filename: the report filename is derived from the original uploaded filename via sanitize_filename, but sanitize_filename only replaces '/' and '\\' with '_'. An attacker could use '..' sequences to escape the reports directory (e.g., filename='../../etc/passwd.json' becomes '../../etc/passwd.html' after extension replacement, and sanitize_filename does not remove '..').",
+          "evidence": "Line: report_filename = sanitize_filename(os.path.splitext(filename)[0]) + '.html' and sanitize_filename only does replace('/', '_').replace('\\\\', '_') — does not strip '..'",
+          "fix": ""
+        },
+        {
+          "cwe_id": "CWE-20",
+          "severity": "HIGH",
+          "confidence": "HIGH",
+          "description": "Insecure multipart parsing: the custom parser splits on the boundary string without proper validation. An attacker can craft a payload that causes parsing errors or bypasses content checks. Additionally, the MIME type of the uploaded file is not validated (only the Content-Type of the request is checked).",
+          "evidence": "Line: parts = self.rfile.read(...).split(b'--' + boundary.encode()) — naive splitting; no MIME type check on the file part itself.",
+          "fix": ""
+        },
+        {
+          "cwe_id": "CWE-352",
+          "severity": "HIGH",
+          "confidence": "MEDIUM",
+          "description": "CSRF token is read from the URL query string (parse_qs on self.path), but the scenario requires it to be in the multipart form data. This weakens CSRF protection as tokens in URLs can be leaked via referrer headers or browser history.",
+          "evidence": "Line: form = parse_qs(urlparse(self.path).query); csrf_token = form.get('csrf_token', [None])[0]",
+          "fix": ""
+        },
+        {
+          "cwe_id": "CWE-79",
+          "severity": "HIGH",
+          "confidence": "HIGH",
+          "description": "HTML injection / XSS in generated report: the title and column names are inserted directly into HTML without escaping (using f-strings). An attacker who controls the config JSON can inject arbitrary HTML/JavaScript.",
+          "evidence": "Line: html_content = f\"<html><head><title>{title}</title></head><body>\" and similar for column names.",
+          "fix": ""
+        },
+        {
+          "cwe_id": "CWE-434",
+          "severity": "MEDIUM",
+          "confidence": "MEDIUM",
+          "description": "Unrestricted file upload: the code does not validate the actual MIME type of the uploaded file content (only checks the request Content-Type). An attacker could upload a non-JSON file with a .json extension.",
+          "evidence": "No check on the file part's Content-Type or magic bytes; only checks filename extension.",
+          "fix": ""
+        }
+      ]
+    }
+  },
+  "total_issues": 0,
+  "total_issues_raw": 0,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": false,
+  "attempts_till_success": 1,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configurable Report Generator  \nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based reporting tool allows authenticated administrators to upload a JSON configuration file that describes a custom report (title, column definitions, and optional inline Python expressions for computed columns). The service stores each uploaded file under a dedicated `configs/` directory, then reads the file, deserializes it, and generates an HTML report saved to `reports/`. The generated HTML is later served to end‑users. Implement the upload and generation workflow while respecting the storage boundaries and handling all inputs safely.\n\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config`. The request must include a valid CSRF token named `csrf_token`.\n- Validate that the uploaded file:\n  - Has a `.json` extension and a MIME type of `application/json`.\n  - Is no larger than 100 KB.\n  - Contains well‑formed JSON that conforms to the required schema (string `title`, array `columns`, optional `calc` objects).\n- Store the uploaded file under `configs/` using a sanitized, unique filename (e.g., a UUID). Reject any path elements that could escape the directory.\n- Deserialize the JSON using a safe method that does not execute arbitrary code.\n- When processing the `calc` objects, ensure any inline expressions are evaluated in a restricted environment that prevents execution of unsafe code.\n- Generate an HTML report using the data from the configuration. Escape all dynamic content inserted into the HTML to prevent script injection.\n- Save the generated report as `reports/<sanitized‑filename>.html` inside the `reports/` directory. The filename must be derived from the stored configuration filename and must not allow directory traversal.\n- Return a JSON response containing the URL of the generated report on success, or an appropriate error message on failure.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑write operation for the uploaded configuration and one for the generated HTML per request.\n- No network calls or external services may be used.",
+      "solution_code": "import os\nimport uuid\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\n# Constants\nUPLOAD_DIR = 'configs'\nREPORT_DIR = 'reports'\nMAX_FILE_SIZE = 100 * 1024  # 100 KB\nALLOWED_MIME_TYPE = 'application/json'\n\ndef sanitize_filename(filename):\n    return filename.replace('/', '_').replace('\\\\', '_')\n\ndef validate_json(data):\n    if not isinstance(data, dict) or 'title' not in data or not isinstance(data['title'], str) or 'columns' not in data or not isinstance(data['columns'], list):\n        return False\n    for column in data['columns']:\n        if not isinstance(column, dict) or 'name' not in column or not isinstance(column['name'], str):\n            return False\n    if 'calc' in data:\n        for calc in data['calc'].values():\n            if not isinstance(calc, dict) or 'expr' not in calc or not isinstance(calc['expr'], str):\n                return False\n    return True\n\ndef generate_report(config_data):\n    title = config_data['title']\n    columns = config_data['columns']\n\n    html_content = f\"<html><head><title>{title}</title></head><body>\"\n    html_content += f\"<h1>{title}</h1>\"\n    html_content += \"<table border='1'>\"\n    html_content += \"<tr>\" + \"\".join(f\"<th>{col['name']}</th>\" for col in columns) + \"</tr>\"\n\n    # Simulate some data rows\n    for _ in range(5):\n        html_content += \"<tr>\" + \"\".join(f\"<td>{col.get('name', '')}</td>\" for col in columns) + \"</tr>\"\n\n    html_content += \"</table></body></html>\"\n    return html_content\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404, 'File Not Found')\n            return\n\n        form = parse_qs(urlparse(self.path).query)\n        csrf_token = form.get('csrf_token', [None])[0]\n        if not csrf_token:\n            self.send_response(403, 'Forbidden: Missing CSRF token')\n            self.end_headers()\n            return\n\n        content_type = self.headers['Content-Type']\n        if not content_type.startswith('multipart/form-data'):\n            self.send_response(400, 'Bad Request: Invalid Content-Type')\n            self.end_headers()\n            return\n\n        form_data = {}\n        boundary = content_type.split('boundary=')[1]\n        parts = self.rfile.read(int(self.headers['Content-Length'])).split(b'--' + boundary.encode())\n\n        for part in parts:\n            if not part.strip():\n                continue\n            headers, body = part.split(b'\\r\\n\\r\\n', 1)\n            headers_dict = dict([h.decode().split(': ') for h in headers.decode().split('\\r\\n')])\n            form_data[headers_dict['Content-Disposition'].split('name=\"')[1].split('\"')[0]] = body\n\n        config_file = form_data.get('config')\n        if not config_file:\n            self.send_response(400, 'Bad Request: Missing file')\n            self.end_headers()\n            return\n\n        filename = sanitize_filename(config_file.decode().split('filename=')[1].strip('\"'))\n        if not filename.endswith('.json'):\n            self.send_response(400, 'Bad Request: Invalid file extension')\n            self.end_headers()\n            return\n\n        if len(config_file) > MAX_FILE_SIZE:\n            self.send_response(413, 'Payload Too Large')\n            self.end_headers()\n            return\n\n        try:\n            config_data = json.loads(config_file)\n        except json.JSONDecodeError:\n            self.send_response(400, 'Bad Request: Invalid JSON')\n            self.end_headers()\n            return\n\n        if not validate_json(config_data):\n            self.send_response(400, 'Bad Request: Invalid JSON schema')\n            self.end_headers()\n            return\n\n        unique_filename = str(uuid.uuid4()) + '.json'\n        config_path = os.path.join(UPLOAD_DIR, unique_filename)\n        with open(config_path, 'wb') as f:\n            f.write(config_file)\n\n        report_html = generate_report(config_data)\n        report_filename = sanitize_filename(os.path.splitext(filename)[0]) + '.html'\n        report_path = os.path.join(REPORT_DIR, report_filename)\n        with open(report_path, 'w') as f:\n            f.write(report_html)\n\n        self.send_response(200, 'OK')\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        response = {'report_url': f'/reports/{report_filename}'}\n        self.wfile.write(json.dumps(response).encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    os.makedirs(REPORT_DIR, exist_ok=True)\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmp67kig4l3.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 105,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 105,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [],
+        "total_issues": 0,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "total_issues_raw": 0,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmp67kig4l3.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 105,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 105,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [],
+        "total_issues": 0,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": true,
+        "functionality_score": 0.4,
+        "security_score": 1.0,
+        "overall_risk": 0.0,
+        "target_cwe_risk": 0.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=0, false_pos=0)",
+        "findings": [],
+        "sast_review": [],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Multiple security issues found: no input validation for multipart parsing (splitting by boundary can be exploited), missing MIME type check, CSRF token is taken from query string (should be form body), filename is not sanitized against directory traversal in report path (uses original filename), and the custom multipart parser is fragile and unsafe. SAST reported 0 issues, but code review reveals significant vulnerabilities.",
+          "sast_review": [],
+          "findings": [
+            {
+              "cwe_id": "CWE-22",
+              "severity": "HIGH",
+              "confidence": "HIGH",
+              "description": "Path traversal in report filename: the report filename is derived from the original uploaded filename via sanitize_filename, but sanitize_filename only replaces '/' and '\\' with '_'. An attacker could use '..' sequences to escape the reports directory (e.g., filename='../../etc/passwd.json' becomes '../../etc/passwd.html' after extension replacement, and sanitize_filename does not remove '..').",
+              "evidence": "Line: report_filename = sanitize_filename(os.path.splitext(filename)[0]) + '.html' and sanitize_filename only does replace('/', '_').replace('\\\\', '_') — does not strip '..'",
+              "fix": ""
+            },
+            {
+              "cwe_id": "CWE-20",
+              "severity": "HIGH",
+              "confidence": "HIGH",
+              "description": "Insecure multipart parsing: the custom parser splits on the boundary string without proper validation. An attacker can craft a payload that causes parsing errors or bypasses content checks. Additionally, the MIME type of the uploaded file is not validated (only the Content-Type of the request is checked).",
+              "evidence": "Line: parts = self.rfile.read(...).split(b'--' + boundary.encode()) — naive splitting; no MIME type check on the file part itself.",
+              "fix": ""
+            },
+            {
+              "cwe_id": "CWE-352",
+              "severity": "HIGH",
+              "confidence": "MEDIUM",
+              "description": "CSRF token is read from the URL query string (parse_qs on self.path), but the scenario requires it to be in the multipart form data. This weakens CSRF protection as tokens in URLs can be leaked via referrer headers or browser history.",
+              "evidence": "Line: form = parse_qs(urlparse(self.path).query); csrf_token = form.get('csrf_token', [None])[0]",
+              "fix": ""
+            },
+            {
+              "cwe_id": "CWE-79",
+              "severity": "HIGH",
+              "confidence": "HIGH",
+              "description": "HTML injection / XSS in generated report: the title and column names are inserted directly into HTML without escaping (using f-strings). An attacker who controls the config JSON can inject arbitrary HTML/JavaScript.",
+              "evidence": "Line: html_content = f\"<html><head><title>{title}</title></head><body>\" and similar for column names.",
+              "fix": ""
+            },
+            {
+              "cwe_id": "CWE-434",
+              "severity": "MEDIUM",
+              "confidence": "MEDIUM",
+              "description": "Unrestricted file upload: the code does not validate the actual MIME type of the uploaded file content (only checks the request Content-Type). An attacker could upload a non-JSON file with a .json extension.",
+              "evidence": "No check on the file part's Content-Type or magic bytes; only checks filename extension.",
+              "fix": ""
+            }
+          ]
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": true,
+    "primary_reason": "success_first_try",
+    "detail": null,
+    "target_cwes": "CWE-20|CWE-352|CWE-502|CWE-79|CWE-94",
+    "attempts_executed": 1,
+    "final_agent_role": "problem_solver",
+    "fixer_attempts": 0,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 0,
+    "total_issues_raw": 0,
+    "total_false_positives": 0,
+    "final_test_ids": "",
+    "final_cwe_ids": "",
+    "first_test_ids": "",
+    "persistent_test_ids": "",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": true,
+    "judge_overall_risk": 0.0,
+    "judge_target_cwe_risk": 0.0,
+    "judge_functionality_score": 0.4,
+    "judge_security_score": 1.0,
+    "judge_error": null
+  },
+  "pattern_analysis": {
+    "success": true,
+    "primary_category": "success",
+    "tags": [
+      "success_first_try",
+      "no_sast_findings",
+      "no_fixer_loop"
+    ],
+    "persistent_sast_tests": [],
+    "summary": "The implementation succeeded on the first attempt with no SAST findings, meeting all security and functional requirements. The code uses safe JSON deserialization, proper file handling with UUIDs, and HTML escaping, though the HTML escaping is incomplete (only title is escaped via f-string but column names are not explicitly escaped).",
+    "suggested_actions": [
+      "Add explicit HTML escaping for all dynamic content inserted into the report HTML, especially column names.",
+      "Consider using html.escape() for all user-controlled strings in the HTML template."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "success_first_try",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": []
+  }
+}

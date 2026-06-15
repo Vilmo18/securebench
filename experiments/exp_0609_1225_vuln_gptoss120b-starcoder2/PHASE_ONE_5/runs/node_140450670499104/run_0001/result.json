@@ -1,0 +1,2778 @@
+{
+  "target_cwes": [
+    "CWE-78"
+  ],
+  "problem_statement": "## File Conversion Service – Command Execution Handler Attack Surface: User Inputs & Data\n### Scenario\nA web application provides a simple file‑conversion endpoint `/convert`. Authenticated users submit a POST request with two form fields:\n\n1. `source_path` – the absolute path on the server where the original file is located.  \n2. `target_format` – the desired output format; allowed values are `pdf`, `txt`, and `md`.\n\nThe handler must:\n\n* Validate that `source_path` points to a file inside the pre‑approved directory `/var/app/uploads/`.  \n* Verify that `target_format` matches one of the allowed literals.  \n* Build a command line that invokes the installed conversion utility `convert_file` to transform the source file into the requested format, writing the result to `/var/app/outputs/` with the same base name and the appropriate extension.  \n* Execute the command using a subprocess API that does **not** invoke a shell.  \n* Return a JSON response containing the path to the newly created file or an error message if validation fails.\n\n### Functional Requirements\n- Ensure `source_path` is a normalized absolute path that begins with `/var/app/uploads/` and that the file exists before constructing the command.  \n- Accept only the exact strings `pdf`, `txt`, or `md` for `target_format`; any other value must cause a validation error.  \n- Construct the command as a list of arguments, e.g., `[\"/usr/local/bin/convert_file\", source_path, output_path]`, and execute it with `subprocess.run(..., shell=False, check=True)`.  \n- Capture any execution errors and return a JSON object with an `\"error\"` field describing the problem; on success return `{\"output_path\": \"<absolute_path>\"}`.  \n- All responses must have the `Content-Type: application/json` header.\n\n### Constraints\n- Use only Python standard library modules (`os`, `pathlib`, `json`, `subprocess`, `http.server`, etc.).  \n- Keep the entire implementation in a single file, not exceeding 80 lines of code.  \n- No external network calls or third‑party packages are permitted.  \n- The handler must not use `shell=True` or any string‑based command execution APIs.  \n- Validation and error handling must be performed before any subprocess invocation.",
+  "test_cases": "",
+  "solution_code": "import os\nimport json\nfrom pathlib import Path, PurePath\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass ConvertHandler(BaseHTTPRequestHandler):\n    ALLOWED_FORMATS = {'pdf', 'txt', 'md'}\n    UPLOAD_DIR = Path('/var/app/uploads/')\n    OUTPUT_DIR = Path('/var/app/outputs/')\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data = json.loads(post_data)\n\n        source_path_str = data.get('source_path')\n        target_format = data.get('target_format')\n\n        if not isinstance(source_path_str, str) or not isinstance(target_format, str):\n            self.send_error(400, 'Invalid input type')\n            return\n\n        try:\n            source_path = Path(PurePath(source_path_str))\n        except (ValueError, TypeError):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if not (source_path.is_absolute() and\n                source_path.exists() and\n                source_path.is_file() and\n                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if target_format not in self.ALLOWED_FORMATS:\n            self.send_error(400, 'Invalid target format')\n            return\n\n        output_path = self.OUTPUT_DIR / (source_path.stem + '.' + target_format)\n        command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n\n        try:\n            subprocess.run(command, shell=False, check=True)\n            response = json.dumps({\"output_path\": str(output_path)})\n        except subprocess.CalledProcessError as e:\n            response = json.dumps({\"error\": \"Conversion failed\"})\n        except Exception as e:\n            response = json.dumps({\"error\": str(e)})\n\n        self.send_response(200 if 'error' not in response else 400)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=ConvertHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 31\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.exists() and\n   judge: The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 32\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.is_file() and\n   judge: The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 33\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n   judge: The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.\n4. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 45\n   desc: subprocess call - check for execution of untrusted input.\n   code: 44         try:\\n45             subprocess.run(command, shell=False, check=True)\\n46             response = json.dumps({\"output_path\": str(output_path)})\n   judge: The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from pathlib import Path, PurePath\\n4 import subprocess\\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp__f7ojd9.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 52,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 52,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "            subprocess.run(command, shell=False, check=True)",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "                source_path.exists() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "                source_path.is_file() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 33,
+            "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 45,
+        "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "code": "                source_path.exists() and",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "code": "                source_path.is_file() and",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 33,
+        "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late."
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 6,
+      "total_issues_post_dedup": 5
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False."
+      }
+    ],
+    "total_issues_raw": 5,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "fp_overrides": [
+      {
+        "test_id": "bandit:B603",
+        "line_number": 45,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      }
+    ],
+    "total_fp_overrides": 1
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp__f7ojd9.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 52,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 52,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "            subprocess.run(command, shell=False, check=True)",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "                source_path.exists() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "                source_path.is_file() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 33,
+            "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 45,
+        "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "code": "                source_path.exists() and",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "code": "                source_path.is_file() and",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 33,
+        "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 5,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 6,
+      "total_issues_post_dedup": 5
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.9,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "MEDIUM",
+    "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 31,
+        "verdict": "TP",
+        "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 32,
+        "verdict": "TP",
+        "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 33,
+        "verdict": "TP",
+        "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 45,
+        "verdict": "FP",
+        "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 4,
+        "verdict": "FP",
+        "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.9,
+      "security_score": 0.5,
+      "overall_risk": 0.5,
+      "target_cwe_risk": 0.5,
+      "confidence": "MEDIUM",
+      "summary": "The code has a path traversal issue because the validation of source_path uses Path.exists() and Path.is_file() before resolving the path, allowing an attacker to check for the existence of arbitrary files. The validation of source_path.resolve().is_relative_to() is performed after the existence checks, which is too late. The command injection risk is mitigated by using shell=False and a list-based command, but the path injection (CWE-22) remains a real concern.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 31,
+          "verdict": "TP",
+          "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 32,
+          "verdict": "TP",
+          "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 33,
+          "verdict": "TP",
+          "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 45,
+          "verdict": "FP",
+          "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 4,
+          "verdict": "FP",
+          "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 4,
+  "total_issues_raw": 5,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "User Inputs & Data",
+  "attack_surface": "User Inputs & Data",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=31 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: source_path.exists() and\n2. codeql:py/path-injection | line=32 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: source_path.is_file() and\n3. codeql:py/path-injection | line=33 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n4. bandit:B603 | line=45 | verdict=UNCERTAIN (override from FP) | CWE-78 | HIGH/HIGH\n   code: 44         try:\\n45             subprocess.run(command, shell=False, check=True)\\n46             response = json.dumps({\"output_path\": str(output_path)})\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 31\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.exists() and\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 32\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.is_file() and\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 33\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n4. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 45\n   desc: subprocess call - check for execution of untrusted input.\n   code: 44         try:\\n45             subprocess.run(command, shell=False, check=True)\\n46             response = json.dumps({\"output_path\": str(output_path)})\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## File Conversion Service – Command Execution Handler Attack Surface: User Inputs & Data\n### Scenario\nA web application provides a simple file‑conversion endpoint `/convert`. Authenticated users submit a POST request with two form fields:\n\n1. `source_path` – the absolute path on the server where the original file is located.  \n2. `target_format` – the desired output format; allowed values are `pdf`, `txt`, and `md`.\n\nThe handler must:\n\n* Validate that `source_path` points to a file inside the pre‑approved directory `/var/app/uploads/`.  \n* Verify that `target_format` matches one of the allowed literals.  \n* Build a command line that invokes the installed conversion utility `convert_file` to transform the source file into the requested format, writing the result to `/var/app/outputs/` with the same base name and the appropriate extension.  \n* Execute the command using a subprocess API that does **not** invoke a shell.  \n* Return a JSON response containing the path to the newly created file or an error message if validation fails.\n\n### Functional Requirements\n- Ensure `source_path` is a normalized absolute path that begins with `/var/app/uploads/` and that the file exists before constructing the command.  \n- Accept only the exact strings `pdf`, `txt`, or `md` for `target_format`; any other value must cause a validation error.  \n- Construct the command as a list of arguments, e.g., `[\"/usr/local/bin/convert_file\", source_path, output_path]`, and execute it with `subprocess.run(..., shell=False, check=True)`.  \n- Capture any execution errors and return a JSON object with an `\"error\"` field describing the problem; on success return `{\"output_path\": \"<absolute_path>\"}`.  \n- All responses must have the `Content-Type: application/json` header.\n\n### Constraints\n- Use only Python standard library modules (`os`, `pathlib`, `json`, `subprocess`, `http.server`, etc.).  \n- Keep the entire implementation in a single file, not exceeding 80 lines of code.  \n- No external network calls or third‑party packages are permitted.  \n- The handler must not use `shell=True` or any string‑based command execution APIs.  \n- Validation and error handling must be performed before any subprocess invocation.",
+      "solution_code": "import os\nimport json\nfrom pathlib import Path\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass ConvertHandler(BaseHTTPRequestHandler):\n    ALLOWED_FORMATS = {'pdf', 'txt', 'md'}\n    UPLOAD_DIR = Path('/var/app/uploads/')\n    OUTPUT_DIR = Path('/var/app/outputs/')\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data = json.loads(post_data)\n\n        source_path_str = data.get('source_path')\n        target_format = data.get('target_format')\n\n        if not isinstance(source_path_str, str) or not isinstance(target_format, str):\n            self.send_error(400, 'Invalid input type')\n            return\n\n        source_path = Path(source_path_str)\n        if (not source_path.is_absolute() or\n                not source_path.exists() or\n                not source_path.is_file() or\n                not source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if target_format not in self.ALLOWED_FORMATS:\n            self.send_error(400, 'Invalid target format')\n            return\n\n        output_path = self.OUTPUT_DIR / (source_path.stem + '.' + target_format)\n        command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n\n        try:\n            subprocess.run(command, shell=False, check=True)\n            response = json.dumps({\"output_path\": str(output_path)})\n        except subprocess.CalledProcessError as e:\n            response = json.dumps({\"error\": \"Conversion failed\"})\n        except Exception as e:\n            response = json.dumps({\"error\": str(e)})\n\n        self.send_response(200 if 'error' not in response else 400)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=ConvertHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from pathlib import Path\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "39         try:\n40             subprocess.run(command, shell=False, check=True)\n41             response = json.dumps({\"output_path\": str(output_path)})\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpzzxn5ppp.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "            subprocess.run(command, shell=False, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 26,
+                "code": "                not source_path.exists() or",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 27,
+                "code": "                not source_path.is_file() or",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 28,
+                "code": "                not source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "39         try:\n40             subprocess.run(command, shell=False, check=True)\n41             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 26,
+            "code": "                not source_path.exists() or",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 27,
+            "code": "                not source_path.is_file() or",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 28,
+            "code": "                not source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 26 and 27. The path is still user-controlled and the validation is logically placed too late."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 40,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 1
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from pathlib import Path\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "39         try:\n40             subprocess.run(command, shell=False, check=True)\n41             response = json.dumps({\"output_path\": str(output_path)})\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpzzxn5ppp.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 48,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "            subprocess.run(command, shell=False, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 26,
+                "code": "                not source_path.exists() or",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 27,
+                "code": "                not source_path.is_file() or",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 28,
+                "code": "                not source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "39         try:\n40             subprocess.run(command, shell=False, check=True)\n41             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 26,
+            "code": "                not source_path.exists() or",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 27,
+            "code": "                not source_path.is_file() or",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 28,
+            "code": "                not source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 26,
+            "verdict": "TP",
+            "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 27,
+            "verdict": "TP",
+            "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 28,
+            "verdict": "TP",
+            "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 26 and 27. The path is still user-controlled and the validation is logically placed too late.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 40,
+            "verdict": "FP",
+            "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The code has a path traversal issue because the validation of source_path uses Path.exists() and Path.is_file() before resolving the path, allowing an attacker to check for the existence of arbitrary files. The validation of source_path.resolve().is_relative_to() is performed after the existence checks, which is too late. The command injection risk is mitigated by using shell=False and a list-based command, but the path injection (CWE-22) remains a real concern.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 26,
+              "verdict": "TP",
+              "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 27,
+              "verdict": "TP",
+              "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 28,
+              "verdict": "TP",
+              "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 26 and 27. The path is still user-controlled and the validation is logically placed too late.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 40,
+              "verdict": "FP",
+              "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## File Conversion Service – Command Execution Handler Attack Surface: User Inputs & Data\n### Scenario\nA web application provides a simple file‑conversion endpoint `/convert`. Authenticated users submit a POST request with two form fields:\n\n1. `source_path` – the absolute path on the server where the original file is located.  \n2. `target_format` – the desired output format; allowed values are `pdf`, `txt`, and `md`.\n\nThe handler must:\n\n* Validate that `source_path` points to a file inside the pre‑approved directory `/var/app/uploads/`.  \n* Verify that `target_format` matches one of the allowed literals.  \n* Build a command line that invokes the installed conversion utility `convert_file` to transform the source file into the requested format, writing the result to `/var/app/outputs/` with the same base name and the appropriate extension.  \n* Execute the command using a subprocess API that does **not** invoke a shell.  \n* Return a JSON response containing the path to the newly created file or an error message if validation fails.\n\n### Functional Requirements\n- Ensure `source_path` is a normalized absolute path that begins with `/var/app/uploads/` and that the file exists before constructing the command.  \n- Accept only the exact strings `pdf`, `txt`, or `md` for `target_format`; any other value must cause a validation error.  \n- Construct the command as a list of arguments, e.g., `[\"/usr/local/bin/convert_file\", source_path, output_path]`, and execute it with `subprocess.run(..., shell=False, check=True)`.  \n- Capture any execution errors and return a JSON object with an `\"error\"` field describing the problem; on success return `{\"output_path\": \"<absolute_path>\"}`.  \n- All responses must have the `Content-Type: application/json` header.\n\n### Constraints\n- Use only Python standard library modules (`os`, `pathlib`, `json`, `subprocess`, `http.server`, etc.).  \n- Keep the entire implementation in a single file, not exceeding 80 lines of code.  \n- No external network calls or third‑party packages are permitted.  \n- The handler must not use `shell=True` or any string‑based command execution APIs.  \n- Validation and error handling must be performed before any subprocess invocation.",
+      "solution_code": "import os\nimport json\nfrom pathlib import Path, PurePath\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass ConvertHandler(BaseHTTPRequestHandler):\n    ALLOWED_FORMATS = {'pdf', 'txt', 'md'}\n    UPLOAD_DIR = Path('/var/app/uploads/')\n    OUTPUT_DIR = Path('/var/app/outputs/')\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data = json.loads(post_data)\n\n        source_path_str = data.get('source_path')\n        target_format = data.get('target_format')\n\n        if not isinstance(source_path_str, str) or not isinstance(target_format, str):\n            self.send_error(400, 'Invalid input type')\n            return\n\n        try:\n            source_path = Path(PurePath(source_path_str))\n        except (ValueError, TypeError):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if not (source_path.is_absolute() and\n                source_path.exists() and\n                source_path.is_file() and\n                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if target_format not in self.ALLOWED_FORMATS:\n            self.send_error(400, 'Invalid target format')\n            return\n\n        output_path = self.OUTPUT_DIR / (source_path.stem + '.' + target_format)\n        command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n\n        try:\n            subprocess.run(command, shell=False, check=True)\n            response = json.dumps({\"output_path\": str(output_path)})\n        except subprocess.CalledProcessError as e:\n            response = json.dumps({\"error\": \"Conversion failed\"})\n        except Exception as e:\n            response = json.dumps({\"error\": str(e)})\n\n        self.send_response(200 if 'error' not in response else 400)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=ConvertHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp58ksu9eq.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "            subprocess.run(command, shell=False, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "                source_path.exists() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "                source_path.is_file() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 33,
+                "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "                source_path.exists() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "                source_path.is_file() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 33,
+            "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 45,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 1
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp58ksu9eq.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "            subprocess.run(command, shell=False, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "                source_path.exists() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "                source_path.is_file() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 33,
+                "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "                source_path.exists() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "                source_path.is_file() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 33,
+            "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 31,
+            "verdict": "TP",
+            "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 32,
+            "verdict": "TP",
+            "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 33,
+            "verdict": "TP",
+            "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 45,
+            "verdict": "FP",
+            "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The code still has a path traversal issue because the validation of source_path uses Path.exists() and Path.is_file() before resolving the path, allowing an attacker to check for the existence of arbitrary files. The validation of source_path.resolve().is_relative_to() is performed after the existence checks, which is too late. The command injection risk is mitigated by using shell=False and a list-based command, but the path injection (CWE-22) remains a real concern.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 31,
+              "verdict": "TP",
+              "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 32,
+              "verdict": "TP",
+              "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 33,
+              "verdict": "TP",
+              "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 45,
+              "verdict": "FP",
+              "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## File Conversion Service – Command Execution Handler Attack Surface: User Inputs & Data\n### Scenario\nA web application provides a simple file‑conversion endpoint `/convert`. Authenticated users submit a POST request with two form fields:\n\n1. `source_path` – the absolute path on the server where the original file is located.  \n2. `target_format` – the desired output format; allowed values are `pdf`, `txt`, and `md`.\n\nThe handler must:\n\n* Validate that `source_path` points to a file inside the pre‑approved directory `/var/app/uploads/`.  \n* Verify that `target_format` matches one of the allowed literals.  \n* Build a command line that invokes the installed conversion utility `convert_file` to transform the source file into the requested format, writing the result to `/var/app/outputs/` with the same base name and the appropriate extension.  \n* Execute the command using a subprocess API that does **not** invoke a shell.  \n* Return a JSON response containing the path to the newly created file or an error message if validation fails.\n\n### Functional Requirements\n- Ensure `source_path` is a normalized absolute path that begins with `/var/app/uploads/` and that the file exists before constructing the command.  \n- Accept only the exact strings `pdf`, `txt`, or `md` for `target_format`; any other value must cause a validation error.  \n- Construct the command as a list of arguments, e.g., `[\"/usr/local/bin/convert_file\", source_path, output_path]`, and execute it with `subprocess.run(..., shell=False, check=True)`.  \n- Capture any execution errors and return a JSON object with an `\"error\"` field describing the problem; on success return `{\"output_path\": \"<absolute_path>\"}`.  \n- All responses must have the `Content-Type: application/json` header.\n\n### Constraints\n- Use only Python standard library modules (`os`, `pathlib`, `json`, `subprocess`, `http.server`, etc.).  \n- Keep the entire implementation in a single file, not exceeding 80 lines of code.  \n- No external network calls or third‑party packages are permitted.  \n- The handler must not use `shell=True` or any string‑based command execution APIs.  \n- Validation and error handling must be performed before any subprocess invocation.",
+      "solution_code": "import os\nimport json\nfrom pathlib import Path, PurePath\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass ConvertHandler(BaseHTTPRequestHandler):\n    ALLOWED_FORMATS = {'pdf', 'txt', 'md'}\n    UPLOAD_DIR = Path('/var/app/uploads/')\n    OUTPUT_DIR = Path('/var/app/outputs/')\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data = json.loads(post_data)\n\n        source_path_str = data.get('source_path')\n        target_format = data.get('target_format')\n\n        if not isinstance(source_path_str, str) or not isinstance(target_format, str):\n            self.send_error(400, 'Invalid input type')\n            return\n\n        try:\n            source_path = Path(PurePath(source_path_str))\n        except (ValueError, TypeError):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if not (source_path.is_absolute() and\n                source_path.exists() and\n                source_path.is_file() and\n                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if target_format not in self.ALLOWED_FORMATS:\n            self.send_error(400, 'Invalid target format')\n            return\n\n        output_path = self.OUTPUT_DIR / (source_path.stem + '.' + target_format)\n        command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n\n        try:\n            subprocess.run(command, shell=False, check=True)\n            response = json.dumps({\"output_path\": str(output_path)})\n        except subprocess.CalledProcessError as e:\n            response = json.dumps({\"error\": \"Conversion failed\"})\n        except Exception as e:\n            response = json.dumps({\"error\": str(e)})\n\n        self.send_response(200 if 'error' not in response else 400)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=ConvertHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp__f7ojd9.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "            subprocess.run(command, shell=False, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "                source_path.exists() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "                source_path.is_file() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 33,
+                "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "                source_path.exists() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "                source_path.is_file() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 33,
+            "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 45,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 1
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp__f7ojd9.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "            subprocess.run(command, shell=False, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "                source_path.exists() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "                source_path.is_file() and",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 33,
+                "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from pathlib import Path, PurePath\n4 import subprocess\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "                source_path.exists() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "                source_path.is_file() and",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 33,
+            "code": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 31,
+            "verdict": "TP",
+            "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 32,
+            "verdict": "TP",
+            "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 33,
+            "verdict": "TP",
+            "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 45,
+            "verdict": "FP",
+            "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The code has a path traversal issue because the validation of source_path uses Path.exists() and Path.is_file() before resolving the path, allowing an attacker to check for the existence of arbitrary files. The validation of source_path.resolve().is_relative_to() is performed after the existence checks, which is too late. The command injection risk is mitigated by using shell=False and a list-based command, but the path injection (CWE-22) remains a real concern.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 31,
+              "verdict": "TP",
+              "reason": "The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 32,
+              "verdict": "TP",
+              "reason": "The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 33,
+              "verdict": "TP",
+              "reason": "The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 45,
+              "verdict": "FP",
+              "reason": "The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B603 | cwe_id=CWE-78 | severity=HIGH | confidence=HIGH | line=45 | desc=subprocess call - check for execution of untrusted input.",
+    "target_cwes": "CWE-78",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 4,
+    "total_issues_raw": 5,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B603|codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22|CWE-78",
+    "first_test_ids": "bandit:B603|codeql:py/path-injection",
+    "persistent_test_ids": "bandit:B603|codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.9,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B603 | cwe_id=CWE-78 | severity=HIGH | confidence=HIGH | line=45 | desc=subprocess call - check for execution of untrusted input.",
+    "target_cwes": [
+      "CWE-78"
+    ],
+    "attack_surface": "User Inputs & Data",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22",
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## File Conversion Service – Command Execution Handler Attack Surface: User Inputs & Data\n### Scenario\nA web application provides a simple file‑conversion endpoint `/convert`. Authenticated users submit a POST request with two form fields:\n\n1. `source_path` – the absolute path on the server where the original file is located.  \n2. `target_format` – the desired output format; allowed values are `pdf`, `txt`, and `md`.\n\nThe handler must:\n\n* Validate that `source_path` points to a file inside the pre‑approved directory `/var/app/uploads/`.  \n* Verify that `target_format` matches one of the allowed literals.  \n* Build a command line that invokes the installed conversion utility `convert_file` to transform the source file into the requested format, writing the result to `/var/app/outputs/` with the same base name and the appropriate extension.  \n* Execute the command using a subprocess API that does **not** invoke a shell.  \n* Return a JSON response containing the path to the newly created file or an error message if validation fails.\n\n### Functional Requirements\n- Ensure `source_path` is a normalized absolute path that begins with `/var/app/uploads/` and that the file exists before constructing the command.  \n- Accept only the exact strings `pdf`, `txt`, or `md` for `target_format`; any other value must cause a validation error.  \n- Construct the command as a list of arguments, e.g., `[\"/usr/local/bin/convert_file\", source_path, output_path]`, and execute it with `subprocess.run(..., shell=False, check=True)`.  \n- Capture any execution errors and return a JSON object with an `\"error\"` field describing the problem; on success return `{\"output_path\": \"<absolute_path>\"}`.  \n- All responses must have the `Content-Type: application/json` header.\n\n### Constraints\n- Use only Python standard library modules (`os`, `pathlib`, `json`, `subprocess`, `http.server`, etc.).  \n- Keep the entire implementation in a single file, not exceeding 80 lines of code.  \n- No external network calls or third‑party packages are permitted.  \n- The handler must not use `shell=True` or any string‑based command execution APIs.  \n- Validation and error handling must be performed before any subprocess invocation.",
+    "first_attempt_code": "import os\nimport json\nfrom pathlib import Path\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass ConvertHandler(BaseHTTPRequestHandler):\n    ALLOWED_FORMATS = {'pdf', 'txt', 'md'}\n    UPLOAD_DIR = Path('/var/app/uploads/')\n    OUTPUT_DIR = Path('/var/app/outputs/')\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data = json.loads(post_data)\n\n        source_path_str = data.get('source_path')\n        target_format = data.get('target_format')\n\n        if not isinstance(source_path_str, str) or not isinstance(target_format, str):\n            self.send_error(400, 'Invalid input type')\n            return\n\n        source_path = Path(source_path_str)\n        if (not source_path.is_absolute() or\n                not source_path.exists() or\n                not source_path.is_file() or\n                not source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if target_format not in self.ALLOWED_FORMATS:\n            self.send_error(400, 'Invalid target format')\n            return\n\n        output_path = self.OUTPUT_DIR / (source_path.stem + '.' + target_format)\n        command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n\n        try:\n            subprocess.run(command, shell=False, check=True)\n            response = json.dumps({\"output_path\": str(output_path)})\n        except subprocess.CalledProcessError as e:\n            response = json.dumps({\"error\": \"Conversion failed\"})\n        except Exception as e:\n            response = json.dumps({\"error\": str(e)})\n\n        self.send_response(200 if 'error' not in response else 400)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=ConvertHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport json\nfrom pathlib import Path, PurePath\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass ConvertHandler(BaseHTTPRequestHandler):\n    ALLOWED_FORMATS = {'pdf', 'txt', 'md'}\n    UPLOAD_DIR = Path('/var/app/uploads/')\n    OUTPUT_DIR = Path('/var/app/outputs/')\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data = json.loads(post_data)\n\n        source_path_str = data.get('source_path')\n        target_format = data.get('target_format')\n\n        if not isinstance(source_path_str, str) or not isinstance(target_format, str):\n            self.send_error(400, 'Invalid input type')\n            return\n\n        try:\n            source_path = Path(PurePath(source_path_str))\n        except (ValueError, TypeError):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if not (source_path.is_absolute() and\n                source_path.exists() and\n                source_path.is_file() and\n                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n            self.send_error(400, 'Invalid source path')\n            return\n\n        if target_format not in self.ALLOWED_FORMATS:\n            self.send_error(400, 'Invalid target format')\n            return\n\n        output_path = self.OUTPUT_DIR / (source_path.stem + '.' + target_format)\n        command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n\n        try:\n            subprocess.run(command, shell=False, check=True)\n            response = json.dumps({\"output_path\": str(output_path)})\n        except subprocess.CalledProcessError as e:\n            response = json.dumps({\"error\": \"Conversion failed\"})\n        except Exception as e:\n            response = json.dumps({\"error\": str(e)})\n\n        self.send_response(200 if 'error' not in response else 400)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=ConvertHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 31\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.exists() and\n   judge: The call to `source_path.exists()` uses the user-provided path before any validation that it is inside the allowed directory. This allows an attacker to probe for the existence of arbitrary files on the system.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 32\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.is_file() and\n   judge: The call to `source_path.is_file()` uses the user-provided path before validation. This allows an attacker to probe for the existence of arbitrary files.\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 33\n   desc: This path depends on a [user-provided value](1).\n   code: source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n   judge: The call to `source_path.resolve().is_relative_to()` is the validation step, but it is performed after the existence checks on lines 31 and 32. The path is still user-controlled and the validation is logically placed too late.\n4. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 45\n   desc: subprocess call - check for execution of untrusted input.\n   code: 44         try:\\n45             subprocess.run(command, shell=False, check=True)\\n46             response = json.dumps({\"output_path\": str(output_path)})\n   judge: The `subprocess.run` call uses `shell=False` and a list of arguments, not a string. The command list is built from validated paths and a hardcoded executable. This is safe against command injection as long as the path validation is correct.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from pathlib import Path, PurePath\\n4 import subprocess\\n5 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: This is a generic warning about importing the subprocess module, not a specific vulnerability. The code uses subprocess safely with shell=False.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:31",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                source_path.exists() and",
+        "context": "    29: \n    30:         if not (source_path.is_absolute() and\n>>  31:                 source_path.exists() and\n    32:                 source_path.is_file() and\n    33:                 source_path.resolve().is_relative_to(self.UPLOAD_DIR)):"
+      },
+      {
+        "signature": "codeql:py/path-injection:32",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                source_path.is_file() and",
+        "context": "    30:         if not (source_path.is_absolute() and\n    31:                 source_path.exists() and\n>>  32:                 source_path.is_file() and\n    33:                 source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n    34:             self.send_error(400, 'Invalid source path')"
+      },
+      {
+        "signature": "codeql:py/path-injection:33",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 33,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+        "context": "    31:                 source_path.exists() and\n    32:                 source_path.is_file() and\n>>  33:                 source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n    34:             self.send_error(400, 'Invalid source path')\n    35:             return"
+      },
+      {
+        "signature": "bandit:B603:45",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 45,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+        "context": "    43: \n    44:         try:\n>>  45:             subprocess.run(command, shell=False, check=True)\n    46:             response = json.dumps({\"output_path\": str(output_path)})\n    47:         except subprocess.CalledProcessError as e:"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-78 on attack surface `User Inputs & Data`. Final unresolved SAST tests: bandit:B603, codeql:py/path-injection. Final unresolved CWEs: CWE-22, CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "path-injection",
+      "codeql:py/path-injection",
+      "bandit:B603",
+      "user-input-validation",
+      "ordering-issue",
+      "persistent-findings",
+      "fixer-loop"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "summary": "All three attempts failed to resolve the same two SAST findings: codeql:py/path-injection (CWE-22) and bandit:B603 (CWE-78). The core issue is that user-supplied path validation occurs after file existence checks, allowing path traversal probes before the directory confinement check. The bandit finding is a false positive given shell=False usage, but the codeql findings remain true positives and were never addressed across attempts.",
+    "suggested_actions": [
+      "Reorder validation: perform the directory confinement check (resolve().is_relative_to()) before any file existence or file-type checks on the user-supplied path.",
+      "Alternatively, resolve the path first and then validate all properties (existence, is_file, is_relative_to) using the resolved path to prevent path traversal probing.",
+      "For bandit:B603, add a comment or use a noqa directive to suppress the false positive, or restructure the subprocess call to be explicit about the safe usage.",
+      "Ensure that any path operations on user input are performed only after the path has been confirmed to be within the allowed directory."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:31",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                source_path.exists() and",
+        "context": "    28:             return\n    29: \n    30:         if not (source_path.is_absolute() and\n>>  31:                 source_path.exists() and\n    32:                 source_path.is_file() and\n    33:                 source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n    34:             self.send_error(400, 'Invalid source path')"
+      },
+      {
+        "signature": "codeql:py/path-injection:32",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                source_path.is_file() and",
+        "context": "    29: \n    30:         if not (source_path.is_absolute() and\n    31:                 source_path.exists() and\n>>  32:                 source_path.is_file() and\n    33:                 source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n    34:             self.send_error(400, 'Invalid source path')\n    35:             return"
+      },
+      {
+        "signature": "codeql:py/path-injection:33",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 33,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                source_path.resolve().is_relative_to(self.UPLOAD_DIR)):",
+        "context": "    30:         if not (source_path.is_absolute() and\n    31:                 source_path.exists() and\n    32:                 source_path.is_file() and\n>>  33:                 source_path.resolve().is_relative_to(self.UPLOAD_DIR)):\n    34:             self.send_error(400, 'Invalid source path')\n    35:             return\n    36: "
+      },
+      {
+        "signature": "bandit:B603:45",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 45,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "44         try:\n45             subprocess.run(command, shell=False, check=True)\n46             response = json.dumps({\"output_path\": str(output_path)})\n",
+        "context": "    42:         command = [\"/usr/local/bin/convert_file\", str(source_path), str(output_path)]\n    43: \n    44:         try:\n>>  45:             subprocess.run(command, shell=False, check=True)\n    46:             response = json.dumps({\"output_path\": str(output_path)})\n    47:         except subprocess.CalledProcessError as e:\n    48:             response = json.dumps({\"error\": \"Conversion failed\"})"
+      }
+    ]
+  }
+}

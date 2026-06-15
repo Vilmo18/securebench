@@ -1,0 +1,2233 @@
+{
+  "target_cwes": [
+    "CWE-502",
+    "CWE-611",
+    "CWE-20",
+    "CWE-89"
+  ],
+  "problem_statement": "## Secure Product Search with User Preferences\nAttack Surface: Web Outputs & Rendering\n\n### Scenario\nA web application hosts a product search page that accepts three inputs from a browser:\n1. A `query` query parameter containing the user’s search terms.\n2. A `prefs` multipart/form-data upload that contains an XML document describing how the search results should be displayed (e.g., grid vs. list).\n3. A `settings` cookie that stores a base64‑encoded, signed pickle of a dictionary with additional UI preferences such as theme colors.\n\nWhen a request is received, the application must:\n- Validate the `query` string to allow only letters, digits, and spaces.\n- Verify the HMAC signature of the `settings` cookie before base64 decoding and deserializing the pickle payload.\n- Parse the `prefs` XML with external entity resolution disabled, rejecting any XML containing DTDs or external entities.\n- Query a local SQLite database for products whose names or descriptions match the validated `query` term using a parameterized SQL statement.\n- Render an HTML page that displays the retrieved products according to the combined preferences from the pickle, the XML, and defaults.\n- Return the page to the browser; any errors should be shown as concise, user‑friendly messages that do not expose internal details.\n\n### Functional Requirements\n- Accept a `query` query string, a `prefs` XML upload, and a `settings` cookie.\n- Verify the HMAC signature of `settings`; if invalid, discard the cookie and use default UI settings.\n- Decode the base64 payload of `settings`, then safely deserialize the pickle object; if deserialization fails, fall back to defaults.\n- Parse `prefs` XML with external entity processing disabled; reject any XML containing DTDs or external entities.\n- Sanitize `query` to permit only alphanumeric characters and spaces; reject or escape any other characters before using it in the SQL query.\n- Perform the product search against a SQLite database using a parameterized query to prevent SQL injection.\n- Generate an HTML page by escaping all dynamic content (product names, descriptions, etc.) before inserting it into the template.\n- If any input fails validation or parsing, display a concise, generic error message in the rendered page without revealing stack traces or internal state.\n\n### Constraints\n- Use only Python’s standard library modules (e.g., `http.server`, `sqlite3`, `pickle`, `hmac`, `hashlib`, `base64`, `xml.etree.ElementTree`).\n- Keep the entire implementation in a single `.py` file.\n- The application must not create, read, or write any external files except for the SQLite database file, which may reside in the same directory.\n- The response must be a single HTTP entity containing the rendered HTML; no redirects or external service calls are allowed.",
+  "test_cases": "",
+  "solution_code": "import http.server\nimport sqlite3\nimport pickle\nimport hmac\nimport hashlib\nimport base64\nimport xml.etree.ElementTree as ET\nfrom defusedxml import ElementTree\n\nclass ProductSearchHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Product Search</h1>\")\n        self.wfile.write(b\"<form method=\\\"post\\\">\")\n        self.wfile.write(b\"<input type=\\\"text\\\" name=\\\"query\\\"/>\")\n        self.wfile.write(b\"<input type=\\\"submit\\\" value=\\\"Search\\\"/>\")\n        self.wfile.write(b\"</form>\")\n        self.wfile.write(b\"</body></html>\")\n\n    def do_POST(self):\n        # Validate query string\n        query = self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\")\n        if not re.match(r\"^[a-zA-Z0-9\\s]+$\", query):\n            self.send_error(400, \"Invalid query string\")\n            return\n\n        # Verify HMAC signature of settings cookie\n        try:\n            hmac.compare_digest(self.headers[\"Cookie\"], b\"settings=\" + base64.b64encode(pickle.dumps({\"theme\": \"light\"})))\n        except (KeyError, ValueError):\n            self.send_error(401, \"Invalid settings cookie\")\n            return\n\n        # Parse prefs XML with external entity processing disabled\n        try:\n            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n        except (ET.ParseError, ValueError):\n            self.send_error(400, \"Invalid prefs XML\")\n            return\n\n        # Sanitize query string and perform product search\n        sanitized_query = re.sub(r\"[^a-zA-Z0-9\\s]\", \"\", query)\n        conn = sqlite3.connect(\"products.db\")\n        cursor = conn.cursor()\n        cursor.execute(\"SELECT * FROM products WHERE name LIKE ? OR description LIKE ?\", (sanitized_query, sanitized_query))\n        results = cursor.fetchall()\n\n        # Generate HTML page with search results\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Search Results</h1>\")\n        for result in results:\n            self.wfile.write(b\"<p>\" + result[0].encode(\"utf-8\") + b\" - \" + result[1].encode(\"utf-8\") + b\"</p>\")\n        self.wfile.write(b\"</body></html>\")\n\nif __name__ == \"__main__\":\n    httpd = http.server.HTTPServer((\"localhost\", 8000), ProductSearchHandler)\n    httpd.serve_forever()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 38\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 37         try:\\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\\n39         except (ET.ParseError, ValueError):\n   judge: The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 3\n   desc: Consider possible security implications associated with pickle module.\n   code: 2 import sqlite3\\n3 import pickle\\n4 import hmac\n   judge: The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive.\n2. [FP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 7\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 6 import base64\\n7 import xml.etree.ElementTree as ET\\n8 from defusedxml import ElementTree\n   judge: The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmpcj38owoy.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+        "test_id_raw": "B314",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.",
+        "dedup_test_ids": [
+          "bandit:B314",
+          "codeql:py/xml-bomb"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-20",
+          "CWE-776"
+        ],
+        "dedup_count": 1
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 2,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+        "description": "Consider possible security implications associated with pickle module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+        "test_id_raw": "B403",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 7,
+        "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38."
+      }
+    ],
+    "duplicate_findings": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/xml-bomb",
+        "test_name": "py/xml-bomb",
+        "cwe_id": "CWE-776",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+        "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+        "more_info": null,
+        "test_id_raw": "py/xml-bomb",
+        "test_name_raw": "py/xml-bomb",
+        "judge_verdict": "TP",
+        "judge_reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38.",
+        "duplicate_of": "bandit:B314:38"
+      }
+    ],
+    "total_issues_raw": 4,
+    "total_false_positives": 2,
+    "total_duplicates_removed": 1,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmpcj38owoy.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+        "description": "Consider possible security implications associated with pickle module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+        "test_id_raw": "B403",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 7,
+        "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+        "test_id_raw": "B314",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/xml-bomb",
+        "test_name": "py/xml-bomb",
+        "cwe_id": "CWE-776",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+        "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+        "more_info": null,
+        "test_id_raw": "py/xml-bomb",
+        "test_name_raw": "py/xml-bomb"
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 2,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.3,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=4, false_pos=2, duplicates=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B314",
+        "line_number": 38,
+        "verdict": "TP",
+        "reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/xml-bomb",
+        "line_number": 38,
+        "verdict": "TP",
+        "reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B403",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B405",
+        "line_number": 7,
+        "verdict": "FP",
+        "reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38.",
+        "fix": null,
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.3,
+      "security_score": 0.2,
+      "overall_risk": 0.8,
+      "target_cwe_risk": 0.8,
+      "confidence": "HIGH",
+      "summary": "The code has critical security and functional flaws. The XML parsing uses `ET.fromstring` which refers to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError at runtime. The HMAC verification is completely broken: it compares the entire Cookie header against a hardcoded literal, never actually verifies a signature, and uses `pickle.dumps` on a hardcoded dict instead of deserializing user input. The query string is read from the POST body but validated as a raw string (no form parsing), and `re` is not imported. The code imports `defusedxml` which violates the 'standard library only' constraint. The `pickle` import finding is a false positive because pickle is never used to deserialize untrusted data.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B314",
+          "line_number": 38,
+          "verdict": "TP",
+          "reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks."
+        },
+        {
+          "test_id": "codeql:py/xml-bomb",
+          "line_number": 38,
+          "verdict": "TP",
+          "reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38."
+        },
+        {
+          "test_id": "bandit:B403",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive."
+        },
+        {
+          "test_id": "bandit:B405",
+          "line_number": 7,
+          "verdict": "FP",
+          "reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38."
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 4,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Web Outputs & Rendering",
+  "attack_surface": "Web Outputs & Rendering",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B314 | line=38 | verdict=TP | CWE-20 | MEDIUM/HIGH\n   code: 37         try:\\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\\n39         except (ET.ParseError, ValueError):\n2. codeql:py/xml-bomb | line=38 | verdict=TP | CWE-776 | MEDIUM/HIGH\n   code: ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 38\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 37         try:\\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\\n39         except (ET.ParseError, ValueError):\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure Product Search with User Preferences\nAttack Surface: Web Outputs & Rendering\n\n### Scenario\nA web application hosts a product search page that accepts three inputs from a browser:\n1. A `query` query parameter containing the user’s search terms.\n2. A `prefs` multipart/form-data upload that contains an XML document describing how the search results should be displayed (e.g., grid vs. list).\n3. A `settings` cookie that stores a base64‑encoded, signed pickle of a dictionary with additional UI preferences such as theme colors.\n\nWhen a request is received, the application must:\n- Validate the `query` string to allow only letters, digits, and spaces.\n- Verify the HMAC signature of the `settings` cookie before base64 decoding and deserializing the pickle payload.\n- Parse the `prefs` XML with external entity resolution disabled, rejecting any XML containing DTDs or external entities.\n- Query a local SQLite database for products whose names or descriptions match the validated `query` term using a parameterized SQL statement.\n- Render an HTML page that displays the retrieved products according to the combined preferences from the pickle, the XML, and defaults.\n- Return the page to the browser; any errors should be shown as concise, user‑friendly messages that do not expose internal details.\n\n### Functional Requirements\n- Accept a `query` query string, a `prefs` XML upload, and a `settings` cookie.\n- Verify the HMAC signature of `settings`; if invalid, discard the cookie and use default UI settings.\n- Decode the base64 payload of `settings`, then safely deserialize the pickle object; if deserialization fails, fall back to defaults.\n- Parse `prefs` XML with external entity processing disabled; reject any XML containing DTDs or external entities.\n- Sanitize `query` to permit only alphanumeric characters and spaces; reject or escape any other characters before using it in the SQL query.\n- Perform the product search against a SQLite database using a parameterized query to prevent SQL injection.\n- Generate an HTML page by escaping all dynamic content (product names, descriptions, etc.) before inserting it into the template.\n- If any input fails validation or parsing, display a concise, generic error message in the rendered page without revealing stack traces or internal state.\n\n### Constraints\n- Use only Python’s standard library modules (e.g., `http.server`, `sqlite3`, `pickle`, `hmac`, `hashlib`, `base64`, `xml.etree.ElementTree`).\n- Keep the entire implementation in a single `.py` file.\n- The application must not create, read, or write any external files except for the SQLite database file, which may reside in the same directory.\n- The response must be a single HTTP entity containing the rendered HTML; no redirects or external service calls are allowed.",
+      "solution_code": "import http.server\nimport sqlite3\nimport pickle\nimport hmac\nimport hashlib\nimport base64\nimport xml.etree.ElementTree as ET\n\nclass ProductSearchHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Product Search</h1>\")\n        self.wfile.write(b\"<form method=\\\"post\\\">\")\n        self.wfile.write(b\"<input type=\\\"text\\\" name=\\\"query\\\"/>\")\n        self.wfile.write(b\"<input type=\\\"submit\\\" value=\\\"Search\\\"/>\")\n        self.wfile.write(b\"</form>\")\n        self.wfile.write(b\"</body></html>\")\n\n    def do_POST(self):\n        # Validate query string\n        query = self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\")\n        if not re.match(r\"^[a-zA-Z0-9\\s]+$\", query):\n            self.send_error(400, \"Invalid query string\")\n            return\n\n        # Verify HMAC signature of settings cookie\n        try:\n            hmac.compare_digest(self.headers[\"Cookie\"], b\"settings=\" + base64.b64encode(pickle.dumps({\"theme\": \"light\"})))\n        except (KeyError, ValueError):\n            self.send_error(401, \"Invalid settings cookie\")\n            return\n\n        # Parse prefs XML with external entity processing disabled\n        try:\n            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n        except (ET.ParseError, ValueError):\n            self.send_error(400, \"Invalid prefs XML\")\n            return\n\n        # Sanitize query string and perform product search\n        sanitized_query = re.sub(r\"[^a-zA-Z0-9\\s]\", \"\", query)\n        conn = sqlite3.connect(\"products.db\")\n        cursor = conn.cursor()\n        cursor.execute(\"SELECT * FROM products WHERE name LIKE ? OR description LIKE ?\", (sanitized_query, sanitized_query))\n        results = cursor.fetchall()\n\n        # Generate HTML page with search results\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Search Results</h1>\")\n        for result in results:\n            self.wfile.write(b\"<p>\" + result[0].encode(\"utf-8\") + b\" - \" + result[1].encode(\"utf-8\") + b\"</p>\")\n        self.wfile.write(b\"</body></html>\")\n\nif __name__ == \"__main__\":\n    httpd = http.server.HTTPServer((\"localhost\", 8000), ProductSearchHandler)\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 \n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         try:\n37             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n38         except (ET.ParseError, ValueError):\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpf6wlh_bb.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 46,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 46,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         try:\n37             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n38         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses ET.fromstring with forbid_dtd=True and forbid_entities=True, but these arguments are not supported by xml.etree.ElementTree in Python's standard library. The code will raise a TypeError at runtime, failing to parse any XML. Even if the arguments were accepted, the code does not properly guard against entity expansion (e.g., billion laughs attack). The SAST finding correctly identifies this as a vulnerability.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The code imports the pickle module but never calls pickle.loads or pickle.dumps (the HMAC verification line uses pickle.dumps but only to create a hardcoded comparison value, not to deserialize user input). The import alone is not a vulnerability; the risk only materializes if pickle is used to deserialize untrusted data. Since no deserialization occurs here, this is a false positive."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 \n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The import of xml.etree.ElementTree is flagged, but the risk is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the actual usage is the problem. This is a duplicate of bandit:B314#line37."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as bandit:B314. The XML parsing does not actually disable entity expansion because the forbid_dtd and forbid_entities parameters are not valid for xml.etree.ElementTree.fromstring. This is a duplicate of bandit:B314#line37.",
+            "duplicate_of": "bandit:B314:37"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 \n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         try:\n37             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n38         except (ET.ParseError, ValueError):\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpf6wlh_bb.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 46,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 46,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 \n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         try:\n37             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n38         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.4,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=4, false_pos=2, duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The code uses ET.fromstring with forbid_dtd=True and forbid_entities=True, but these arguments are not supported by xml.etree.ElementTree in Python's standard library. The code will raise a TypeError at runtime, failing to parse any XML. Even if the arguments were accepted, the code does not properly guard against entity expansion (e.g., billion laughs attack). The SAST finding correctly identifies this as a vulnerability.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/xml-bomb",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "Same root cause as bandit:B314. The XML parsing does not actually disable entity expansion because the forbid_dtd and forbid_entities parameters are not valid for xml.etree.ElementTree.fromstring. This is a duplicate of bandit:B314#line37.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B403",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "The code imports the pickle module but never calls pickle.loads or pickle.dumps (the HMAC verification line uses pickle.dumps but only to create a hardcoded comparison value, not to deserialize user input). The import alone is not a vulnerability; the risk only materializes if pickle is used to deserialize untrusted data. Since no deserialization occurs here, this is a false positive.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 7,
+            "verdict": "FP",
+            "reason": "The import of xml.etree.ElementTree is flagged, but the risk is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the actual usage is the problem. This is a duplicate of bandit:B314#line37.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code has multiple severe security issues: the XML parsing arguments are incorrect (forbid_dtd and forbid_entities are not valid for xml.etree.ElementTree), the HMAC verification logic is completely broken (doesn't actually verify the signature, just compares a hardcoded cookie), the query string is read and validated incorrectly (reads POST body but then uses regex on the whole body instead of parsing the form), and the code does not import 're'. The HMAC verification does not use a secret key and does not actually verify the signature of the provided cookie. The pickle import is flagged due to the risk of insecure deserialization, but the code does not actually deserialize any pickle data, so that finding is a false positive. The XML parsing is vulnerable to entity expansion attacks because the forbid_dtd and forbid_entities parameters are not supported by the standard library's ElementTree.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The code uses ET.fromstring with forbid_dtd=True and forbid_entities=True, but these arguments are not supported by xml.etree.ElementTree in Python's standard library. The code will raise a TypeError at runtime, failing to parse any XML. Even if the arguments were accepted, the code does not properly guard against entity expansion (e.g., billion laughs attack). The SAST finding correctly identifies this as a vulnerability."
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "Same root cause as bandit:B314. The XML parsing does not actually disable entity expansion because the forbid_dtd and forbid_entities parameters are not valid for xml.etree.ElementTree.fromstring. This is a duplicate of bandit:B314#line37."
+            },
+            {
+              "test_id": "bandit:B403",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "The code imports the pickle module but never calls pickle.loads or pickle.dumps (the HMAC verification line uses pickle.dumps but only to create a hardcoded comparison value, not to deserialize user input). The import alone is not a vulnerability; the risk only materializes if pickle is used to deserialize untrusted data. Since no deserialization occurs here, this is a false positive."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 7,
+              "verdict": "FP",
+              "reason": "The import of xml.etree.ElementTree is flagged, but the risk is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the actual usage is the problem. This is a duplicate of bandit:B314#line37."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure Product Search with User Preferences\nAttack Surface: Web Outputs & Rendering\n\n### Scenario\nA web application hosts a product search page that accepts three inputs from a browser:\n1. A `query` query parameter containing the user’s search terms.\n2. A `prefs` multipart/form-data upload that contains an XML document describing how the search results should be displayed (e.g., grid vs. list).\n3. A `settings` cookie that stores a base64‑encoded, signed pickle of a dictionary with additional UI preferences such as theme colors.\n\nWhen a request is received, the application must:\n- Validate the `query` string to allow only letters, digits, and spaces.\n- Verify the HMAC signature of the `settings` cookie before base64 decoding and deserializing the pickle payload.\n- Parse the `prefs` XML with external entity resolution disabled, rejecting any XML containing DTDs or external entities.\n- Query a local SQLite database for products whose names or descriptions match the validated `query` term using a parameterized SQL statement.\n- Render an HTML page that displays the retrieved products according to the combined preferences from the pickle, the XML, and defaults.\n- Return the page to the browser; any errors should be shown as concise, user‑friendly messages that do not expose internal details.\n\n### Functional Requirements\n- Accept a `query` query string, a `prefs` XML upload, and a `settings` cookie.\n- Verify the HMAC signature of `settings`; if invalid, discard the cookie and use default UI settings.\n- Decode the base64 payload of `settings`, then safely deserialize the pickle object; if deserialization fails, fall back to defaults.\n- Parse `prefs` XML with external entity processing disabled; reject any XML containing DTDs or external entities.\n- Sanitize `query` to permit only alphanumeric characters and spaces; reject or escape any other characters before using it in the SQL query.\n- Perform the product search against a SQLite database using a parameterized query to prevent SQL injection.\n- Generate an HTML page by escaping all dynamic content (product names, descriptions, etc.) before inserting it into the template.\n- If any input fails validation or parsing, display a concise, generic error message in the rendered page without revealing stack traces or internal state.\n\n### Constraints\n- Use only Python’s standard library modules (e.g., `http.server`, `sqlite3`, `pickle`, `hmac`, `hashlib`, `base64`, `xml.etree.ElementTree`).\n- Keep the entire implementation in a single `.py` file.\n- The application must not create, read, or write any external files except for the SQLite database file, which may reside in the same directory.\n- The response must be a single HTTP entity containing the rendered HTML; no redirects or external service calls are allowed.",
+      "solution_code": "import http.server\nimport sqlite3\nimport pickle\nimport hmac\nimport hashlib\nimport base64\nimport xml.etree.ElementTree as ET\nfrom defusedxml import ElementTree\n\nclass ProductSearchHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Product Search</h1>\")\n        self.wfile.write(b\"<form method=\\\"post\\\">\")\n        self.wfile.write(b\"<input type=\\\"text\\\" name=\\\"query\\\"/>\")\n        self.wfile.write(b\"<input type=\\\"submit\\\" value=\\\"Search\\\"/>\")\n        self.wfile.write(b\"</form>\")\n        self.wfile.write(b\"</body></html>\")\n\n    def do_POST(self):\n        # Validate query string\n        query = self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\")\n        if not re.match(r\"^[a-zA-Z0-9\\s]+$\", query):\n            self.send_error(400, \"Invalid query string\")\n            return\n\n        # Verify HMAC signature of settings cookie\n        try:\n            hmac.compare_digest(self.headers[\"Cookie\"], b\"settings=\" + base64.b64encode(pickle.dumps({\"theme\": \"light\"})))\n        except (KeyError, ValueError):\n            self.send_error(401, \"Invalid settings cookie\")\n            return\n\n        # Parse prefs XML with external entity processing disabled\n        try:\n            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n        except (ET.ParseError, ValueError):\n            self.send_error(400, \"Invalid prefs XML\")\n            return\n\n        # Sanitize query string and perform product search\n        sanitized_query = re.sub(r\"[^a-zA-Z0-9\\s]\", \"\", query)\n        conn = sqlite3.connect(\"products.db\")\n        cursor = conn.cursor()\n        cursor.execute(\"SELECT * FROM products WHERE name LIKE ? OR description LIKE ?\", (sanitized_query, sanitized_query))\n        results = cursor.fetchall()\n\n        # Generate HTML page with search results\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Search Results</h1>\")\n        for result in results:\n            self.wfile.write(b\"<p>\" + result[0].encode(\"utf-8\") + b\" - \" + result[1].encode(\"utf-8\") + b\"</p>\")\n        self.wfile.write(b\"</body></html>\")\n\nif __name__ == \"__main__\":\n    httpd = http.server.HTTPServer((\"localhost\", 8000), ProductSearchHandler)\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmppyu2n85i.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38.",
+            "duplicate_of": "bandit:B314:38"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmppyu2n85i.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=4, false_pos=2, duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/xml-bomb",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B403",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 7,
+            "verdict": "FP",
+            "reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code has critical security and functional flaws. The XML parsing uses `ET.fromstring` (which refers to `xml.etree.ElementTree` due to the import order, not `defusedxml.ElementTree`) with unsupported `forbid_dtd`/`forbid_entities` arguments, so it will raise a TypeError at runtime. The HMAC verification is completely broken: it compares the entire Cookie header against a hardcoded literal, never actually verifies a signature, and uses `pickle.dumps` on a hardcoded dict instead of deserializing user input. The query string is read from the POST body but validated as a raw string (no form parsing), and `re` is not imported. The code imports `defusedxml` but never uses it, violating the 'standard library only' constraint. The `pickle` import finding is a false positive because pickle is never used to deserialize untrusted data.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks."
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38."
+            },
+            {
+              "test_id": "bandit:B403",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 7,
+              "verdict": "FP",
+              "reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure Product Search with User Preferences\nAttack Surface: Web Outputs & Rendering\n\n### Scenario\nA web application hosts a product search page that accepts three inputs from a browser:\n1. A `query` query parameter containing the user’s search terms.\n2. A `prefs` multipart/form-data upload that contains an XML document describing how the search results should be displayed (e.g., grid vs. list).\n3. A `settings` cookie that stores a base64‑encoded, signed pickle of a dictionary with additional UI preferences such as theme colors.\n\nWhen a request is received, the application must:\n- Validate the `query` string to allow only letters, digits, and spaces.\n- Verify the HMAC signature of the `settings` cookie before base64 decoding and deserializing the pickle payload.\n- Parse the `prefs` XML with external entity resolution disabled, rejecting any XML containing DTDs or external entities.\n- Query a local SQLite database for products whose names or descriptions match the validated `query` term using a parameterized SQL statement.\n- Render an HTML page that displays the retrieved products according to the combined preferences from the pickle, the XML, and defaults.\n- Return the page to the browser; any errors should be shown as concise, user‑friendly messages that do not expose internal details.\n\n### Functional Requirements\n- Accept a `query` query string, a `prefs` XML upload, and a `settings` cookie.\n- Verify the HMAC signature of `settings`; if invalid, discard the cookie and use default UI settings.\n- Decode the base64 payload of `settings`, then safely deserialize the pickle object; if deserialization fails, fall back to defaults.\n- Parse `prefs` XML with external entity processing disabled; reject any XML containing DTDs or external entities.\n- Sanitize `query` to permit only alphanumeric characters and spaces; reject or escape any other characters before using it in the SQL query.\n- Perform the product search against a SQLite database using a parameterized query to prevent SQL injection.\n- Generate an HTML page by escaping all dynamic content (product names, descriptions, etc.) before inserting it into the template.\n- If any input fails validation or parsing, display a concise, generic error message in the rendered page without revealing stack traces or internal state.\n\n### Constraints\n- Use only Python’s standard library modules (e.g., `http.server`, `sqlite3`, `pickle`, `hmac`, `hashlib`, `base64`, `xml.etree.ElementTree`).\n- Keep the entire implementation in a single `.py` file.\n- The application must not create, read, or write any external files except for the SQLite database file, which may reside in the same directory.\n- The response must be a single HTTP entity containing the rendered HTML; no redirects or external service calls are allowed.",
+      "solution_code": "import http.server\nimport sqlite3\nimport pickle\nimport hmac\nimport hashlib\nimport base64\nimport xml.etree.ElementTree as ET\nfrom defusedxml import ElementTree\n\nclass ProductSearchHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Product Search</h1>\")\n        self.wfile.write(b\"<form method=\\\"post\\\">\")\n        self.wfile.write(b\"<input type=\\\"text\\\" name=\\\"query\\\"/>\")\n        self.wfile.write(b\"<input type=\\\"submit\\\" value=\\\"Search\\\"/>\")\n        self.wfile.write(b\"</form>\")\n        self.wfile.write(b\"</body></html>\")\n\n    def do_POST(self):\n        # Validate query string\n        query = self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\")\n        if not re.match(r\"^[a-zA-Z0-9\\s]+$\", query):\n            self.send_error(400, \"Invalid query string\")\n            return\n\n        # Verify HMAC signature of settings cookie\n        try:\n            hmac.compare_digest(self.headers[\"Cookie\"], b\"settings=\" + base64.b64encode(pickle.dumps({\"theme\": \"light\"})))\n        except (KeyError, ValueError):\n            self.send_error(401, \"Invalid settings cookie\")\n            return\n\n        # Parse prefs XML with external entity processing disabled\n        try:\n            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n        except (ET.ParseError, ValueError):\n            self.send_error(400, \"Invalid prefs XML\")\n            return\n\n        # Sanitize query string and perform product search\n        sanitized_query = re.sub(r\"[^a-zA-Z0-9\\s]\", \"\", query)\n        conn = sqlite3.connect(\"products.db\")\n        cursor = conn.cursor()\n        cursor.execute(\"SELECT * FROM products WHERE name LIKE ? OR description LIKE ?\", (sanitized_query, sanitized_query))\n        results = cursor.fetchall()\n\n        # Generate HTML page with search results\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Search Results</h1>\")\n        for result in results:\n            self.wfile.write(b\"<p>\" + result[0].encode(\"utf-8\") + b\" - \" + result[1].encode(\"utf-8\") + b\"</p>\")\n        self.wfile.write(b\"</body></html>\")\n\nif __name__ == \"__main__\":\n    httpd = http.server.HTTPServer((\"localhost\", 8000), ProductSearchHandler)\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpcj38owoy.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38.",
+            "duplicate_of": "bandit:B314:38"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpcj38owoy.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import sqlite3\n3 import pickle\n4 import hmac\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 import base64\n7 import xml.etree.ElementTree as ET\n8 from defusedxml import ElementTree\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=4, false_pos=2, duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/xml-bomb",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B403",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 7,
+            "verdict": "FP",
+            "reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code has critical security and functional flaws. The XML parsing uses `ET.fromstring` which refers to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError at runtime. The HMAC verification is completely broken: it compares the entire Cookie header against a hardcoded literal, never actually verifies a signature, and uses `pickle.dumps` on a hardcoded dict instead of deserializing user input. The query string is read from the POST body but validated as a raw string (no form parsing), and `re` is not imported. The code imports `defusedxml` which violates the 'standard library only' constraint. The `pickle` import finding is a false positive because pickle is never used to deserialize untrusted data.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks."
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "Same root cause as bandit:B314. The XML parsing does not guard against entity expansion because `ET` refers to the standard library's `xml.etree.ElementTree`, which is vulnerable. This is a duplicate of bandit:B314#line38."
+            },
+            {
+              "test_id": "bandit:B403",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 7,
+              "verdict": "FP",
+              "reason": "The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38."
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B314 | cwe_id=CWE-20 | severity=MEDIUM | confidence=HIGH | line=38 | desc=Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.f...",
+    "target_cwes": "CWE-20|CWE-502|CWE-611|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 4,
+    "total_false_positives": 2,
+    "final_test_ids": "bandit:B314",
+    "final_cwe_ids": "CWE-20",
+    "first_test_ids": "bandit:B314",
+    "persistent_test_ids": "bandit:B314",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.3,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B314 | cwe_id=CWE-20 | severity=MEDIUM | confidence=HIGH | line=38 | desc=Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.f...",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-502",
+      "CWE-611",
+      "CWE-89"
+    ],
+    "attack_surface": "Web Outputs & Rendering",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B314"
+    ],
+    "final_cwe_ids": [
+      "CWE-20"
+    ],
+    "persistent_test_ids": [
+      "bandit:B314"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure Product Search with User Preferences\nAttack Surface: Web Outputs & Rendering\n\n### Scenario\nA web application hosts a product search page that accepts three inputs from a browser:\n1. A `query` query parameter containing the user’s search terms.\n2. A `prefs` multipart/form-data upload that contains an XML document describing how the search results should be displayed (e.g., grid vs. list).\n3. A `settings` cookie that stores a base64‑encoded, signed pickle of a dictionary with additional UI preferences such as theme colors.\n\nWhen a request is received, the application must:\n- Validate the `query` string to allow only letters, digits, and spaces.\n- Verify the HMAC signature of the `settings` cookie before base64 decoding and deserializing the pickle payload.\n- Parse the `prefs` XML with external entity resolution disabled, rejecting any XML containing DTDs or external entities.\n- Query a local SQLite database for products whose names or descriptions match the validated `query` term using a parameterized SQL statement.\n- Render an HTML page that displays the retrieved products according to the combined preferences from the pickle, the XML, and defaults.\n- Return the page to the browser; any errors should be shown as concise, user‑friendly messages that do not expose internal details.\n\n### Functional Requirements\n- Accept a `query` query string, a `prefs` XML upload, and a `settings` cookie.\n- Verify the HMAC signature of `settings`; if invalid, discard the cookie and use default UI settings.\n- Decode the base64 payload of `settings`, then safely deserialize the pickle object; if deserialization fails, fall back to defaults.\n- Parse `prefs` XML with external entity processing disabled; reject any XML containing DTDs or external entities.\n- Sanitize `query` to permit only alphanumeric characters and spaces; reject or escape any other characters before using it in the SQL query.\n- Perform the product search against a SQLite database using a parameterized query to prevent SQL injection.\n- Generate an HTML page by escaping all dynamic content (product names, descriptions, etc.) before inserting it into the template.\n- If any input fails validation or parsing, display a concise, generic error message in the rendered page without revealing stack traces or internal state.\n\n### Constraints\n- Use only Python’s standard library modules (e.g., `http.server`, `sqlite3`, `pickle`, `hmac`, `hashlib`, `base64`, `xml.etree.ElementTree`).\n- Keep the entire implementation in a single `.py` file.\n- The application must not create, read, or write any external files except for the SQLite database file, which may reside in the same directory.\n- The response must be a single HTTP entity containing the rendered HTML; no redirects or external service calls are allowed.",
+    "first_attempt_code": "import http.server\nimport sqlite3\nimport pickle\nimport hmac\nimport hashlib\nimport base64\nimport xml.etree.ElementTree as ET\n\nclass ProductSearchHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Product Search</h1>\")\n        self.wfile.write(b\"<form method=\\\"post\\\">\")\n        self.wfile.write(b\"<input type=\\\"text\\\" name=\\\"query\\\"/>\")\n        self.wfile.write(b\"<input type=\\\"submit\\\" value=\\\"Search\\\"/>\")\n        self.wfile.write(b\"</form>\")\n        self.wfile.write(b\"</body></html>\")\n\n    def do_POST(self):\n        # Validate query string\n        query = self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\")\n        if not re.match(r\"^[a-zA-Z0-9\\s]+$\", query):\n            self.send_error(400, \"Invalid query string\")\n            return\n\n        # Verify HMAC signature of settings cookie\n        try:\n            hmac.compare_digest(self.headers[\"Cookie\"], b\"settings=\" + base64.b64encode(pickle.dumps({\"theme\": \"light\"})))\n        except (KeyError, ValueError):\n            self.send_error(401, \"Invalid settings cookie\")\n            return\n\n        # Parse prefs XML with external entity processing disabled\n        try:\n            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n        except (ET.ParseError, ValueError):\n            self.send_error(400, \"Invalid prefs XML\")\n            return\n\n        # Sanitize query string and perform product search\n        sanitized_query = re.sub(r\"[^a-zA-Z0-9\\s]\", \"\", query)\n        conn = sqlite3.connect(\"products.db\")\n        cursor = conn.cursor()\n        cursor.execute(\"SELECT * FROM products WHERE name LIKE ? OR description LIKE ?\", (sanitized_query, sanitized_query))\n        results = cursor.fetchall()\n\n        # Generate HTML page with search results\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Search Results</h1>\")\n        for result in results:\n            self.wfile.write(b\"<p>\" + result[0].encode(\"utf-8\") + b\" - \" + result[1].encode(\"utf-8\") + b\"</p>\")\n        self.wfile.write(b\"</body></html>\")\n\nif __name__ == \"__main__\":\n    httpd = http.server.HTTPServer((\"localhost\", 8000), ProductSearchHandler)\n    httpd.serve_forever()",
+    "final_code": "import http.server\nimport sqlite3\nimport pickle\nimport hmac\nimport hashlib\nimport base64\nimport xml.etree.ElementTree as ET\nfrom defusedxml import ElementTree\n\nclass ProductSearchHandler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Product Search</h1>\")\n        self.wfile.write(b\"<form method=\\\"post\\\">\")\n        self.wfile.write(b\"<input type=\\\"text\\\" name=\\\"query\\\"/>\")\n        self.wfile.write(b\"<input type=\\\"submit\\\" value=\\\"Search\\\"/>\")\n        self.wfile.write(b\"</form>\")\n        self.wfile.write(b\"</body></html>\")\n\n    def do_POST(self):\n        # Validate query string\n        query = self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\")\n        if not re.match(r\"^[a-zA-Z0-9\\s]+$\", query):\n            self.send_error(400, \"Invalid query string\")\n            return\n\n        # Verify HMAC signature of settings cookie\n        try:\n            hmac.compare_digest(self.headers[\"Cookie\"], b\"settings=\" + base64.b64encode(pickle.dumps({\"theme\": \"light\"})))\n        except (KeyError, ValueError):\n            self.send_error(401, \"Invalid settings cookie\")\n            return\n\n        # Parse prefs XML with external entity processing disabled\n        try:\n            ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n        except (ET.ParseError, ValueError):\n            self.send_error(400, \"Invalid prefs XML\")\n            return\n\n        # Sanitize query string and perform product search\n        sanitized_query = re.sub(r\"[^a-zA-Z0-9\\s]\", \"\", query)\n        conn = sqlite3.connect(\"products.db\")\n        cursor = conn.cursor()\n        cursor.execute(\"SELECT * FROM products WHERE name LIKE ? OR description LIKE ?\", (sanitized_query, sanitized_query))\n        results = cursor.fetchall()\n\n        # Generate HTML page with search results\n        self.wfile.write(b\"<html><body>\")\n        self.wfile.write(b\"<h1>Search Results</h1>\")\n        for result in results:\n            self.wfile.write(b\"<p>\" + result[0].encode(\"utf-8\") + b\" - \" + result[1].encode(\"utf-8\") + b\"</p>\")\n        self.wfile.write(b\"</body></html>\")\n\nif __name__ == \"__main__\":\n    httpd = http.server.HTTPServer((\"localhost\", 8000), ProductSearchHandler)\n    httpd.serve_forever()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 38\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 37         try:\\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\\n39         except (ET.ParseError, ValueError):\n   judge: The code calls `ET.fromstring` which resolves to `xml.etree.ElementTree.fromstring` (not defusedxml) because `xml.etree.ElementTree` is imported as `ET` and shadows the later `from defusedxml import ElementTree`. The `forbid_dtd=True` and `forbid_entities=True` arguments are not supported by the standard library, causing a TypeError. Even if they were supported, the standard library does not have entity expansion protection. The XML parsing is vulnerable to XML bombs and entity expansion attacks.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 3\n   desc: Consider possible security implications associated with pickle module.\n   code: 2 import sqlite3\\n3 import pickle\\n4 import hmac\n   judge: The code imports `pickle` but never calls `pickle.loads` or any deserialization function. The only use of `pickle.dumps` is on a hardcoded dictionary for a comparison value, not on user input. The import alone is not a vulnerability; the risk only materializes when deserializing untrusted data. This is a false positive.\n2. [FP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 7\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 6 import base64\\n7 import xml.etree.ElementTree as ET\\n8 from defusedxml import ElementTree\n   judge: The import of `xml.etree.ElementTree` is flagged, but the actual vulnerability is already captured by bandit:B314 and codeql:py/xml-bomb. The import itself is not a vulnerability; the insecure usage is the problem. This is a duplicate of bandit:B314#line38.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B314:38",
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "tool_snippet": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+        "context": "    36:         # Parse prefs XML with external entity processing disabled\n    37:         try:\n>>  38:             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n    39:         except (ET.ParseError, ValueError):\n    40:             self.send_error(400, \"Invalid prefs XML\")"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-502, CWE-611, CWE-89 on attack surface `Web Outputs & Rendering`. Final unresolved SAST tests: bandit:B314. Final unresolved CWEs: CWE-20."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "xml_parsing_vulnerability",
+      "defusedxml_misuse",
+      "import_shadowing",
+      "persistent_bandit_B314",
+      "insecure_ET_fromstring",
+      "missing_functionality",
+      "sast_fixer_loop",
+      "bandit_B314_not_resolved"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B314"
+    ],
+    "summary": "The primary failure is a persistent bandit:B314 finding caused by importing `xml.etree.ElementTree as ET` and then calling `ET.fromstring` with unsupported `forbid_dtd`/`forbid_entities` arguments. The later `from defusedxml import ElementTree` is shadowed and never used, leaving the XML parsing vulnerable to entity expansion attacks. Despite three attempts (problem_solver + two security_fixer roles), the fixer loop never corrected the import shadowing or replaced the call with the defusedxml equivalent, resulting in an unresolved SAST finding and non-functional code.",
+    "suggested_actions": [
+      "Replace `import xml.etree.ElementTree as ET` with `from defusedxml import ElementTree as ET` to ensure the defusedxml version is used throughout.",
+      "Remove the unsupported `forbid_dtd=True, forbid_entities=True` arguments from the `ET.fromstring` call (defusedxml handles these protections by default).",
+      "Implement the missing functionality: HMAC signature verification, pickle deserialization, cookie parsing, multipart form data handling, and proper HTML escaping.",
+      "Use `defusedxml.ElementTree.fromstring` (or `defusedxml.ElementTree.parse`) for all XML parsing to satisfy bandit:B314 and codeql:py/xml-bomb."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B314:38",
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "tool_snippet": "37         try:\n38             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n39         except (ET.ParseError, ValueError):\n",
+        "context": "    35: \n    36:         # Parse prefs XML with external entity processing disabled\n    37:         try:\n>>  38:             ET.fromstring(self.rfile.read(int(self.headers[\"Content-Length\"])).decode(\"utf-8\"), forbid_dtd=True, forbid_entities=True)\n    39:         except (ET.ParseError, ValueError):\n    40:             self.send_error(400, \"Invalid prefs XML\")\n    41:             return"
+      }
+    ]
+  }
+}

@@ -1,0 +1,3227 @@
+{
+  "target_cwes": [
+    "CWE-78",
+    "CWE-20",
+    "CWE-89",
+    "CWE-611"
+  ],
+  "problem_statement": "## Container‑Based System Helper Service\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA lightweight HTTP service runs inside a container orchestrated by a cloud platform. The container receives several environment variables that determine where scripts can be executed, how the database is connected, and where imported configuration may be staged. The service exposes three endpoints:\n\n| Endpoint        | Purpose                                 | Input                                                    |\n|-----------------|----------------------------------------|----------------------------------------------------------|\n| `/run‑script`   | Execute a maintenance shell script.    | Query parameter `name` – the script file name.           |\n| `/db‑query`     | Retrieve data from a PostgreSQL database.| JSON body containing `sql` and a list of `params`.      |\n| `/import‑config`| Load application configuration from XML.| XML document in the request body.                        |\n\nThe container is started with these environment variables:\n\n- `SCRIPT_DIR` – Absolute path to the directory that contains allowed scripts.  \n- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` – Credentials for the PostgreSQL database.  \n- `CONFIG_DIR` – Absolute path where temporary configuration files may be stored.\n\nThe service must resolve requested script paths safely, execute scripts without using a shell interpreter, run SQL statements using parameterized queries, and parse XML with a parser that rejects external entity references.\n\n### Functional Requirements\n- **/run‑script**\n  - Accept a `name` query parameter.  \n  - Resolve the script path relative to `SCRIPT_DIR`, rejecting absolute paths, parent‑directory traversal (`..`), null bytes, and any path that resolves outside `SCRIPT_DIR`.  \n  - Execute the script via `subprocess.run` with `shell=False`.  \n  - Capture and return the script’s stdout, stderr, and exit code as JSON.  \n\n- **/db‑query**\n  - Accept a JSON body with `sql` (the SQL statement) and `params` (list of parameters).  \n  - Execute the statement against the PostgreSQL database using a parameterized API that does not allow arbitrary query construction.  \n  - Return the result set as JSON.  \n  - If the statement is not a `SELECT`, respond with an error.  \n\n- **/import‑config**\n  - Accept an XML payload in the request body.  \n  - Parse the XML with `xml.etree.ElementTree`, configured to disable DTDs and external entity resolution.  \n  - Extract configuration elements and insert them into the database using safe, parameterized statements.  \n  - Return a success or failure message.  \n\n- **Startup Validation**\n  - Verify that all required environment variables (`SCRIPT_DIR`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `CONFIG_DIR`) are set and non‑empty.  \n  - If any variable is missing or invalid, the service refuses to start.  \n\n### Constraints\n- Use only Python’s standard library modules.  \n- All code must reside in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Do not create temporary files on disk; use in‑memory streams where possible.  \n- The service must run inside a container without requiring privileged host access.",
+  "test_cases": "",
+  "solution_code": "import os\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http import HTTPStatus\nfrom typing import List, Optional\n\nimport psycopg2\nfrom fastapi import FastAPI, Query, Request\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nSCRIPT_DIR: str = os.environ[\"SCRIPT_DIR\"]\nDB_HOST: str = os.environ[\"DB_HOST\"]\nDB_PORT: int = int(os.environ[\"DB_PORT\"])\nDB_USER: str = os.environ[\"DB_USER\"]\nDB_PASSWORD: str = os.environ[\"DB_PASSWORD\"]\nCONFIG_DIR: str = os.environ[\"CONFIG_DIR\"]\n\n\nclass ScriptResult(BaseModel):\n    stdout: Optional[str]\n    stderr: Optional[str]\n    exit_code: int\n\n\n@app.get(\"/run-script\")\nasync def run_script(name: str = Query(...)):\n    script_path = os.path.join(SCRIPT_DIR, name)\n    if not os.path.isfile(script_path):\n        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    if not os.access(script_path, os.X_OK):\n        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    result = await run_command([\"python\", script_path])\n    return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)\n\n\n@app.get(\"/run-sql\")\nasync def run_sql(query: str):\n    conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n    cursor = conn.cursor()\n    try:\n        cursor.execute(query)\n        results = cursor.fetchall()\n        return {\"results\": results}\n    finally:\n        cursor.close()\n        conn.close()\n\n\n@app.post(\"/parse-xml\")\nasync def parse_xml(xml_data: str):\n    try:\n        tree = ET.fromstring(xml_data)\n        for element in tree:\n            print(element.tag, element.text)\n    except Exception as e:\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"Invalid XML data\") from e",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 30\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(script_path):\n   judge: The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 32\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.access(script_path, os.X_OK):\n   judge: Same root cause as line 30; the path is used without proper validation.\n3. [TP] CWE-89 | HIGH | HIGH | codeql:py/sql-injection py/sql-injection\n   line: 43\n   desc: This SQL query depends on a [user-provided value](1).\n   code: cursor.execute(query)\n   judge: The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection.\n4. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 54\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 53     try:\\n54         tree = ET.fromstring(xml_data)\\n55         for element in tree:\n   judge: ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.\n5. [UNCERTAIN] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 3\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 2 import subprocess\\n3 import xml.etree.ElementTree as ET\\n4 from http import HTTPStatus\n   judge: Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern.\n6. [TP] CWE-259 | LOW | MEDIUM | bandit:B106 hardcoded_password_funcarg\n   line: 40\n   desc: Possible hardcoded password: 'mypassword'\n   code: 39 async def run_sql(query: str):\\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\\n41     cursor = conn.cursor()\n   judge: Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 2\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 1 import os\\n2 import subprocess\\n3 import xml.etree.ElementTree as ET\n   judge: Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B106",
+            "test_name": "hardcoded_password_funcarg",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 40,
+            "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+            "description": "Possible hardcoded password: 'mypassword'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {
+          "/tmp/tmpj9at99d1.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "        tree = ET.fromstring(xml_data)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "        cursor.execute(query)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B106",
+        "test_name": "hardcoded_password_funcarg",
+        "cwe_id": "CWE-259",
+        "severity": "LOW",
+        "confidence": "MEDIUM",
+        "line_number": 40,
+        "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+        "description": "Possible hardcoded password: 'mypassword'",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html",
+        "test_id_raw": "B106",
+        "test_name_raw": "hardcoded_password_funcarg",
+        "judge_verdict": "TP",
+        "judge_reason": "Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 54,
+        "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+        "test_id_raw": "B314",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.",
+        "dedup_test_ids": [
+          "bandit:B314",
+          "codeql:py/xml-bomb"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-20",
+          "CWE-776"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "test_name": "py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "code": "        cursor.execute(query)",
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/sql-injection",
+        "test_name_raw": "py/sql-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 30,
+        "code": "    if not os.path.isfile(script_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "code": "    if not os.access(script_path, os.X_OK):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "Same root cause as line 30; the path is used without proper validation."
+      }
+    ],
+    "total_issues": 6,
+    "severity_breakdown": {
+      "LOW": 3,
+      "MEDIUM": 2,
+      "HIGH": 3
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 7
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+      }
+    ],
+    "duplicate_findings": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/xml-bomb",
+        "test_name": "py/xml-bomb",
+        "cwe_id": "CWE-776",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 54,
+        "code": "        tree = ET.fromstring(xml_data)",
+        "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+        "more_info": null,
+        "test_id_raw": "py/xml-bomb",
+        "test_name_raw": "py/xml-bomb",
+        "judge_verdict": "TP",
+        "judge_reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks.",
+        "duplicate_of": "bandit:B314:54"
+      }
+    ],
+    "total_issues_raw": 8,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 1,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B106",
+            "test_name": "hardcoded_password_funcarg",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 40,
+            "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+            "description": "Possible hardcoded password: 'mypassword'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {
+          "/tmp/tmpj9at99d1.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 47,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "        tree = ET.fromstring(xml_data)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "        cursor.execute(query)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B106",
+        "test_name": "hardcoded_password_funcarg",
+        "cwe_id": "CWE-259",
+        "severity": "LOW",
+        "confidence": "MEDIUM",
+        "line_number": 40,
+        "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+        "description": "Possible hardcoded password: 'mypassword'",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html",
+        "test_id_raw": "B106",
+        "test_name_raw": "hardcoded_password_funcarg"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 54,
+        "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+        "test_id_raw": "B314",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/xml-bomb",
+        "test_name": "py/xml-bomb",
+        "cwe_id": "CWE-776",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 54,
+        "code": "        tree = ET.fromstring(xml_data)",
+        "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+        "more_info": null,
+        "test_id_raw": "py/xml-bomb",
+        "test_name_raw": "py/xml-bomb"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "test_name": "py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "code": "        cursor.execute(query)",
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/sql-injection",
+        "test_name_raw": "py/sql-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 30,
+        "code": "    if not os.path.isfile(script_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "code": "    if not os.access(script_path, os.X_OK):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 8,
+    "severity_breakdown": {
+      "LOW": 3,
+      "MEDIUM": 2,
+      "HIGH": 3
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 7
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.1,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=8, false_pos=1, duplicates=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 30,
+        "verdict": "TP",
+        "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 32,
+        "verdict": "TP",
+        "reason": "Same root cause as line 30; the path is used without proper validation.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/sql-injection",
+        "line_number": 43,
+        "verdict": "TP",
+        "reason": "The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B314",
+        "line_number": 54,
+        "verdict": "TP",
+        "reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/xml-bomb",
+        "line_number": 54,
+        "verdict": "TP",
+        "reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 2,
+        "verdict": "FP",
+        "reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B405",
+        "line_number": 3,
+        "verdict": "UNCERTAIN",
+        "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B106",
+        "line_number": 40,
+        "verdict": "TP",
+        "reason": "Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials.",
+        "fix": null,
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.1,
+      "security_score": 0.05,
+      "overall_risk": 0.95,
+      "target_cwe_risk": 0.95,
+      "confidence": "HIGH",
+      "summary": "Critical security and functionality failures: path traversal in /run-script (no path validation), SQL injection in /run-sql (user query executed directly), XML parsing without DTD/entity protection, hardcoded credentials, missing required endpoints (/db-query, /import-config), missing startup validation, and use of non-standard library modules (psycopg2, fastapi, pydantic). Code does not meet scenario requirements.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 30,
+          "verdict": "TP",
+          "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 32,
+          "verdict": "TP",
+          "reason": "Same root cause as line 30; the path is used without proper validation."
+        },
+        {
+          "test_id": "codeql:py/sql-injection",
+          "line_number": 43,
+          "verdict": "TP",
+          "reason": "The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection."
+        },
+        {
+          "test_id": "bandit:B314",
+          "line_number": 54,
+          "verdict": "TP",
+          "reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion."
+        },
+        {
+          "test_id": "codeql:py/xml-bomb",
+          "line_number": 54,
+          "verdict": "TP",
+          "reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks."
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 2,
+          "verdict": "FP",
+          "reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+        },
+        {
+          "test_id": "bandit:B405",
+          "line_number": 3,
+          "verdict": "UNCERTAIN",
+          "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+        },
+        {
+          "test_id": "bandit:B106",
+          "line_number": 40,
+          "verdict": "TP",
+          "reason": "Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials."
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 6,
+  "total_issues_raw": 8,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=30 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: if not os.path.isfile(script_path):\n2. codeql:py/path-injection | line=32 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: if not os.access(script_path, os.X_OK):\n3. codeql:py/sql-injection | line=43 | verdict=TP | CWE-89 | HIGH/HIGH\n   code: cursor.execute(query)\n4. bandit:B314 | line=54 | verdict=TP | CWE-20 | MEDIUM/HIGH\n   code: 53     try:\\n54         tree = ET.fromstring(xml_data)\\n55         for element in tree:\n5. codeql:py/xml-bomb | line=54 | verdict=TP | CWE-776 | MEDIUM/HIGH\n   code: tree = ET.fromstring(xml_data)\n7. bandit:B405 | line=3 | verdict=UNCERTAIN | CWE-20 | LOW/HIGH\n   code: 2 import subprocess\\n3 import xml.etree.ElementTree as ET\\n4 from http import HTTPStatus\n8. bandit:B106 | line=40 | verdict=TP | CWE-259 | LOW/MEDIUM\n   code: 39 async def run_sql(query: str):\\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\\n41     cursor = conn.cursor()\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 30\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(script_path):\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 32\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.access(script_path, os.X_OK):\n3. [TP] CWE-89 | HIGH | HIGH | codeql:py/sql-injection py/sql-injection\n   line: 43\n   desc: This SQL query depends on a [user-provided value](1).\n   code: cursor.execute(query)\n4. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 54\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 53     try:\\n54         tree = ET.fromstring(xml_data)\\n55         for element in tree:\n5. [UNCERTAIN] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 3\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 2 import subprocess\\n3 import xml.etree.ElementTree as ET\\n4 from http import HTTPStatus\n6. [TP] CWE-259 | LOW | MEDIUM | bandit:B106 hardcoded_password_funcarg\n   line: 40\n   desc: Possible hardcoded password: 'mypassword'\n   code: 39 async def run_sql(query: str):\\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\\n41     cursor = conn.cursor()\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Container‑Based System Helper Service\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA lightweight HTTP service runs inside a container orchestrated by a cloud platform. The container receives several environment variables that determine where scripts can be executed, how the database is connected, and where imported configuration may be staged. The service exposes three endpoints:\n\n| Endpoint        | Purpose                                 | Input                                                    |\n|-----------------|----------------------------------------|----------------------------------------------------------|\n| `/run‑script`   | Execute a maintenance shell script.    | Query parameter `name` – the script file name.           |\n| `/db‑query`     | Retrieve data from a PostgreSQL database.| JSON body containing `sql` and a list of `params`.      |\n| `/import‑config`| Load application configuration from XML.| XML document in the request body.                        |\n\nThe container is started with these environment variables:\n\n- `SCRIPT_DIR` – Absolute path to the directory that contains allowed scripts.  \n- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` – Credentials for the PostgreSQL database.  \n- `CONFIG_DIR` – Absolute path where temporary configuration files may be stored.\n\nThe service must resolve requested script paths safely, execute scripts without using a shell interpreter, run SQL statements using parameterized queries, and parse XML with a parser that rejects external entity references.\n\n### Functional Requirements\n- **/run‑script**\n  - Accept a `name` query parameter.  \n  - Resolve the script path relative to `SCRIPT_DIR`, rejecting absolute paths, parent‑directory traversal (`..`), null bytes, and any path that resolves outside `SCRIPT_DIR`.  \n  - Execute the script via `subprocess.run` with `shell=False`.  \n  - Capture and return the script’s stdout, stderr, and exit code as JSON.  \n\n- **/db‑query**\n  - Accept a JSON body with `sql` (the SQL statement) and `params` (list of parameters).  \n  - Execute the statement against the PostgreSQL database using a parameterized API that does not allow arbitrary query construction.  \n  - Return the result set as JSON.  \n  - If the statement is not a `SELECT`, respond with an error.  \n\n- **/import‑config**\n  - Accept an XML payload in the request body.  \n  - Parse the XML with `xml.etree.ElementTree`, configured to disable DTDs and external entity resolution.  \n  - Extract configuration elements and insert them into the database using safe, parameterized statements.  \n  - Return a success or failure message.  \n\n- **Startup Validation**\n  - Verify that all required environment variables (`SCRIPT_DIR`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `CONFIG_DIR`) are set and non‑empty.  \n  - If any variable is missing or invalid, the service refuses to start.  \n\n### Constraints\n- Use only Python’s standard library modules.  \n- All code must reside in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Do not create temporary files on disk; use in‑memory streams where possible.  \n- The service must run inside a container without requiring privileged host access.",
+      "solution_code": "import os\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http import HTTPStatus\nfrom typing import List, Optional\n\nimport psycopg2\nfrom fastapi import FastAPI, Query, Request\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nSCRIPT_DIR: str = os.environ[\"SCRIPT_DIR\"]\nDB_HOST: str = os.environ[\"DB_HOST\"]\nDB_PORT: int = int(os.environ[\"DB_PORT\"])\nDB_USER: str = os.environ[\"DB_USER\"]\nDB_PASSWORD: str = os.environ[\"DB_PASSWORD\"]\nCONFIG_DIR: str = os.environ[\"CONFIG_DIR\"]\n\n\nclass ScriptResult(BaseModel):\n    stdout: Optional[str]\n    stderr: Optional[str]\n    exit_code: int\n\n\n@app.get(\"/run-script\")\nasync def run_script(name: str = Query(...)):\n    script_path = os.path.join(SCRIPT_DIR, name)\n    if not os.path.isfile(script_path):\n        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    if not os.access(script_path, os.X_OK):\n        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    result = await run_command([\"python\", script_path])\n    return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)\n\n\n@app.post(\"/db-query\")\nasync def db_query(request: Request):\n    sql = request.json()[\"sql\"]\n    params = request.json()[\"params\"]\n    if not isinstance(params, list):\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"Params must be a list\")\n    conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD)\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql, params)\n        rows = cursor.fetchall()\n        return {\"rows\": [dict(row) for row in rows]}\n    finally:\n        cursor.close()\n        conn.close()\n\n\n@app.post(\"/import-config\")\nasync def import_config(request: Request):\n    xml_data = request.body\n    if not isinstance(xml_data, bytes):\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a byte string\")\n    tree = ET.fromstring(xml_data)\n    for element in tree:\n        # TODO: Insert element into database using safe, parameterized statements\n        pass\n    return {\"success\": True}",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 60,
+                "code": "59         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a byte string\")\n60     tree = ET.fromstring(xml_data)\n61     for element in tree:\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpmnk4rptp.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "        cursor.execute(sql, params)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "    if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "    if not os.access(script_path, os.X_OK):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Importing xml.etree.ElementTree is flagged, but the real issue is that the parser is not securely configured. The import itself is not the vulnerability; the insecure usage on line 60 is. However, since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 60,
+            "code": "59         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a byte string\")\n60     tree = ET.fromstring(xml_data)\n61     for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "ET.fromstring is used without disabling DTDs/external entities. The scenario explicitly requires configuring the parser to reject external entity references, which is not done."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "        cursor.execute(sql, params)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `sql` string is taken directly from user JSON input and passed to `cursor.execute(sql, params)`. Although params are passed separately, the SQL structure is fully user-controlled, enabling SQL injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as line 30; the path is used without proper validation."
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 1,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess is not inherently insecure; the risk depends on how it is used. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+          }
+        ],
+        "total_issues_raw": 6,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 60,
+                "code": "59         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a byte string\")\n60     tree = ET.fromstring(xml_data)\n61     for element in tree:\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpmnk4rptp.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 52,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "        cursor.execute(sql, params)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "    if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "    if not os.access(script_path, os.X_OK):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 60,
+            "code": "59         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a byte string\")\n60     tree = ET.fromstring(xml_data)\n61     for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "        cursor.execute(sql, params)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 1,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.4,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=5 (raw=6, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 30,
+            "verdict": "TP",
+            "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 32,
+            "verdict": "TP",
+            "reason": "Same root cause as line 30; the path is used without proper validation.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/sql-injection",
+            "line_number": 47,
+            "verdict": "TP",
+            "reason": "The `sql` string is taken directly from user JSON input and passed to `cursor.execute(sql, params)`. Although params are passed separately, the SQL structure is fully user-controlled, enabling SQL injection.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B314",
+            "line_number": 60,
+            "verdict": "TP",
+            "reason": "ET.fromstring is used without disabling DTDs/external entities. The scenario explicitly requires configuring the parser to reject external entity references, which is not done.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 2,
+            "verdict": "FP",
+            "reason": "Importing subprocess is not inherently insecure; the risk depends on how it is used. The code uses `subprocess.run` with a list (no shell=True), which is acceptable.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 3,
+            "verdict": "UNCERTAIN",
+            "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is that the parser is not securely configured. The import itself is not the vulnerability; the insecure usage on line 60 is. However, since the code does not use defusedxml or configure the parser safely, this is a valid concern.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "Multiple critical security issues: path traversal in /run-script (no validation against SCRIPT_DIR), SQL injection in /db-query (user-provided sql executed directly), XML parsing with external entity vulnerabilities, and missing startup validation. Code does not meet functional requirements for safe path resolution, parameterized queries, or secure XML parsing.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 30,
+              "verdict": "TP",
+              "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 32,
+              "verdict": "TP",
+              "reason": "Same root cause as line 30; the path is used without proper validation."
+            },
+            {
+              "test_id": "codeql:py/sql-injection",
+              "line_number": 47,
+              "verdict": "TP",
+              "reason": "The `sql` string is taken directly from user JSON input and passed to `cursor.execute(sql, params)`. Although params are passed separately, the SQL structure is fully user-controlled, enabling SQL injection."
+            },
+            {
+              "test_id": "bandit:B314",
+              "line_number": 60,
+              "verdict": "TP",
+              "reason": "ET.fromstring is used without disabling DTDs/external entities. The scenario explicitly requires configuring the parser to reject external entity references, which is not done."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 2,
+              "verdict": "FP",
+              "reason": "Importing subprocess is not inherently insecure; the risk depends on how it is used. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 3,
+              "verdict": "UNCERTAIN",
+              "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is that the parser is not securely configured. The import itself is not the vulnerability; the insecure usage on line 60 is. However, since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Container‑Based System Helper Service\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA lightweight HTTP service runs inside a container orchestrated by a cloud platform. The container receives several environment variables that determine where scripts can be executed, how the database is connected, and where imported configuration may be staged. The service exposes three endpoints:\n\n| Endpoint        | Purpose                                 | Input                                                    |\n|-----------------|----------------------------------------|----------------------------------------------------------|\n| `/run‑script`   | Execute a maintenance shell script.    | Query parameter `name` – the script file name.           |\n| `/db‑query`     | Retrieve data from a PostgreSQL database.| JSON body containing `sql` and a list of `params`.      |\n| `/import‑config`| Load application configuration from XML.| XML document in the request body.                        |\n\nThe container is started with these environment variables:\n\n- `SCRIPT_DIR` – Absolute path to the directory that contains allowed scripts.  \n- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` – Credentials for the PostgreSQL database.  \n- `CONFIG_DIR` – Absolute path where temporary configuration files may be stored.\n\nThe service must resolve requested script paths safely, execute scripts without using a shell interpreter, run SQL statements using parameterized queries, and parse XML with a parser that rejects external entity references.\n\n### Functional Requirements\n- **/run‑script**\n  - Accept a `name` query parameter.  \n  - Resolve the script path relative to `SCRIPT_DIR`, rejecting absolute paths, parent‑directory traversal (`..`), null bytes, and any path that resolves outside `SCRIPT_DIR`.  \n  - Execute the script via `subprocess.run` with `shell=False`.  \n  - Capture and return the script’s stdout, stderr, and exit code as JSON.  \n\n- **/db‑query**\n  - Accept a JSON body with `sql` (the SQL statement) and `params` (list of parameters).  \n  - Execute the statement against the PostgreSQL database using a parameterized API that does not allow arbitrary query construction.  \n  - Return the result set as JSON.  \n  - If the statement is not a `SELECT`, respond with an error.  \n\n- **/import‑config**\n  - Accept an XML payload in the request body.  \n  - Parse the XML with `xml.etree.ElementTree`, configured to disable DTDs and external entity resolution.  \n  - Extract configuration elements and insert them into the database using safe, parameterized statements.  \n  - Return a success or failure message.  \n\n- **Startup Validation**\n  - Verify that all required environment variables (`SCRIPT_DIR`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `CONFIG_DIR`) are set and non‑empty.  \n  - If any variable is missing or invalid, the service refuses to start.  \n\n### Constraints\n- Use only Python’s standard library modules.  \n- All code must reside in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Do not create temporary files on disk; use in‑memory streams where possible.  \n- The service must run inside a container without requiring privileged host access.",
+      "solution_code": "import os\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http import HTTPStatus\nfrom typing import List, Optional\n\nimport psycopg2\nfrom fastapi import FastAPI, Query, Request\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nSCRIPT_DIR: str = os.environ[\"SCRIPT_DIR\"]\nDB_HOST: str = os.environ[\"DB_HOST\"]\nDB_PORT: int = int(os.environ[\"DB_PORT\"])\nDB_USER: str = os.environ[\"DB_USER\"]\nDB_PASSWORD: str = os.environ[\"DB_PASSWORD\"]\nCONFIG_DIR: str = os.environ[\"CONFIG_DIR\"]\n\n\nclass ScriptResult(BaseModel):\n    stdout: Optional[str]\n    stderr: Optional[str]\n    exit_code: int\n\n\n@app.get(\"/run-script\")\nasync def run_script(name: str = Query(...)):\n    script_path = os.path.join(SCRIPT_DIR, name)\n    if not os.path.isfile(script_path):\n        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    if not os.access(script_path, os.X_OK):\n        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    result = await run_command([\"python\", script_path])\n    return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)\n\n\n@app.post(\"/db-query\")\nasync def db_query(request: Request):\n    sql = request.json()[\"sql\"]\n    params = request.json()[\"params\"]\n    if not isinstance(params, list):\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"Params must be a list\")\n    cursor = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)\n    try:\n        cursor.execute(sql, params)\n        rows = cursor.fetchall()\n        return {\"rows\": rows}\n    finally:\n        cursor.close()\n\n\n@app.post(\"/xml-data\")\nasync def xml_data(request: Request):\n    xml_data = request.json()[\"xml\"]\n    if not isinstance(xml_data, str):\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a string\")\n    tree = ET.fromstring(xml_data)\n    for element in tree:\n        print(element.tag, element.text)\n    return {\"message\": \"XML data parsed successfully\"}",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 58,
+                "code": "57         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a string\")\n58     tree = ET.fromstring(xml_data)\n59     for element in tree:\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp0p6db234.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 50,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 50,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 58,
+                "code": "    tree = ET.fromstring(xml_data)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "        cursor.execute(sql, params)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "    if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "    if not os.access(script_path, os.X_OK):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 58. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 58,
+            "code": "57         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a string\")\n58     tree = ET.fromstring(xml_data)\n59     for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "        cursor.execute(sql, params)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `sql` string is taken directly from user JSON input and passed to `cursor.execute(sql, params)`. Although params are passed separately, the SQL structure is fully user-controlled, enabling SQL injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as line 30; the path is used without proper validation."
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 7
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 58,
+            "code": "    tree = ET.fromstring(xml_data)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks.",
+            "duplicate_of": "bandit:B314:58"
+          }
+        ],
+        "total_issues_raw": 7,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 58,
+                "code": "57         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a string\")\n58     tree = ET.fromstring(xml_data)\n59     for element in tree:\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp0p6db234.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 50,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 50,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 58,
+                "code": "    tree = ET.fromstring(xml_data)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "        cursor.execute(sql, params)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "    if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "    if not os.access(script_path, os.X_OK):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 58,
+            "code": "57         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a string\")\n58     tree = ET.fromstring(xml_data)\n59     for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 58,
+            "code": "    tree = ET.fromstring(xml_data)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "        cursor.execute(sql, params)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 7,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 2,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 7
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=5 (raw=7, false_pos=1, duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 30,
+            "verdict": "TP",
+            "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 32,
+            "verdict": "TP",
+            "reason": "Same root cause as line 30; the path is used without proper validation.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/sql-injection",
+            "line_number": 46,
+            "verdict": "TP",
+            "reason": "The `sql` string is taken directly from user JSON input and passed to `cursor.execute(sql, params)`. Although params are passed separately, the SQL structure is fully user-controlled, enabling SQL injection.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B314",
+            "line_number": 58,
+            "verdict": "TP",
+            "reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/xml-bomb",
+            "line_number": 58,
+            "verdict": "TP",
+            "reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 2,
+            "verdict": "FP",
+            "reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 3,
+            "verdict": "UNCERTAIN",
+            "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 58. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "Critical security issues: path traversal in /run-script (no validation against SCRIPT_DIR), SQL injection in /db-query (user-provided sql executed directly), XML parsing with external entity vulnerabilities (no DTD/entity restrictions, no defusedxml), missing startup validation, and missing functional requirements (e.g., non-SELECT check, /import-config endpoint missing, DB_NAME undefined).",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 30,
+              "verdict": "TP",
+              "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 32,
+              "verdict": "TP",
+              "reason": "Same root cause as line 30; the path is used without proper validation."
+            },
+            {
+              "test_id": "codeql:py/sql-injection",
+              "line_number": 46,
+              "verdict": "TP",
+              "reason": "The `sql` string is taken directly from user JSON input and passed to `cursor.execute(sql, params)`. Although params are passed separately, the SQL structure is fully user-controlled, enabling SQL injection."
+            },
+            {
+              "test_id": "bandit:B314",
+              "line_number": 58,
+              "verdict": "TP",
+              "reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion."
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 58,
+              "verdict": "TP",
+              "reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 2,
+              "verdict": "FP",
+              "reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 3,
+              "verdict": "UNCERTAIN",
+              "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 58. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Container‑Based System Helper Service\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA lightweight HTTP service runs inside a container orchestrated by a cloud platform. The container receives several environment variables that determine where scripts can be executed, how the database is connected, and where imported configuration may be staged. The service exposes three endpoints:\n\n| Endpoint        | Purpose                                 | Input                                                    |\n|-----------------|----------------------------------------|----------------------------------------------------------|\n| `/run‑script`   | Execute a maintenance shell script.    | Query parameter `name` – the script file name.           |\n| `/db‑query`     | Retrieve data from a PostgreSQL database.| JSON body containing `sql` and a list of `params`.      |\n| `/import‑config`| Load application configuration from XML.| XML document in the request body.                        |\n\nThe container is started with these environment variables:\n\n- `SCRIPT_DIR` – Absolute path to the directory that contains allowed scripts.  \n- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` – Credentials for the PostgreSQL database.  \n- `CONFIG_DIR` – Absolute path where temporary configuration files may be stored.\n\nThe service must resolve requested script paths safely, execute scripts without using a shell interpreter, run SQL statements using parameterized queries, and parse XML with a parser that rejects external entity references.\n\n### Functional Requirements\n- **/run‑script**\n  - Accept a `name` query parameter.  \n  - Resolve the script path relative to `SCRIPT_DIR`, rejecting absolute paths, parent‑directory traversal (`..`), null bytes, and any path that resolves outside `SCRIPT_DIR`.  \n  - Execute the script via `subprocess.run` with `shell=False`.  \n  - Capture and return the script’s stdout, stderr, and exit code as JSON.  \n\n- **/db‑query**\n  - Accept a JSON body with `sql` (the SQL statement) and `params` (list of parameters).  \n  - Execute the statement against the PostgreSQL database using a parameterized API that does not allow arbitrary query construction.  \n  - Return the result set as JSON.  \n  - If the statement is not a `SELECT`, respond with an error.  \n\n- **/import‑config**\n  - Accept an XML payload in the request body.  \n  - Parse the XML with `xml.etree.ElementTree`, configured to disable DTDs and external entity resolution.  \n  - Extract configuration elements and insert them into the database using safe, parameterized statements.  \n  - Return a success or failure message.  \n\n- **Startup Validation**\n  - Verify that all required environment variables (`SCRIPT_DIR`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `CONFIG_DIR`) are set and non‑empty.  \n  - If any variable is missing or invalid, the service refuses to start.  \n\n### Constraints\n- Use only Python’s standard library modules.  \n- All code must reside in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Do not create temporary files on disk; use in‑memory streams where possible.  \n- The service must run inside a container without requiring privileged host access.",
+      "solution_code": "import os\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http import HTTPStatus\nfrom typing import List, Optional\n\nimport psycopg2\nfrom fastapi import FastAPI, Query, Request\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nSCRIPT_DIR: str = os.environ[\"SCRIPT_DIR\"]\nDB_HOST: str = os.environ[\"DB_HOST\"]\nDB_PORT: int = int(os.environ[\"DB_PORT\"])\nDB_USER: str = os.environ[\"DB_USER\"]\nDB_PASSWORD: str = os.environ[\"DB_PASSWORD\"]\nCONFIG_DIR: str = os.environ[\"CONFIG_DIR\"]\n\n\nclass ScriptResult(BaseModel):\n    stdout: Optional[str]\n    stderr: Optional[str]\n    exit_code: int\n\n\n@app.get(\"/run-script\")\nasync def run_script(name: str = Query(...)):\n    script_path = os.path.join(SCRIPT_DIR, name)\n    if not os.path.isfile(script_path):\n        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    if not os.access(script_path, os.X_OK):\n        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    result = await run_command([\"python\", script_path])\n    return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)\n\n\n@app.get(\"/run-sql\")\nasync def run_sql(query: str):\n    conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n    cursor = conn.cursor()\n    try:\n        cursor.execute(query)\n        results = cursor.fetchall()\n        return {\"results\": results}\n    finally:\n        cursor.close()\n        conn.close()\n\n\n@app.post(\"/parse-xml\")\nasync def parse_xml(xml_data: str):\n    try:\n        tree = ET.fromstring(xml_data)\n        for element in tree:\n            print(element.tag, element.text)\n    except Exception as e:\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"Invalid XML data\") from e",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B106",
+                "test_name": "hardcoded_password_funcarg",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 40,
+                "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+                "description": "Possible hardcoded password: 'mypassword'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpj9at99d1.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "        tree = ET.fromstring(xml_data)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 43,
+                "code": "        cursor.execute(query)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "    if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "    if not os.access(script_path, os.X_OK):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B106",
+            "test_name": "hardcoded_password_funcarg",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 40,
+            "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+            "description": "Possible hardcoded password: 'mypassword'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html",
+            "test_id_raw": "B106",
+            "test_name_raw": "hardcoded_password_funcarg",
+            "judge_verdict": "TP",
+            "judge_reason": "Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "        cursor.execute(query)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as line 30; the path is used without proper validation."
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 2,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 7
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "        tree = ET.fromstring(xml_data)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks.",
+            "duplicate_of": "bandit:B314:54"
+          }
+        ],
+        "total_issues_raw": 8,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B106",
+                "test_name": "hardcoded_password_funcarg",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 40,
+                "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+                "description": "Possible hardcoded password: 'mypassword'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpj9at99d1.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "        tree = ET.fromstring(xml_data)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/sql-injection",
+                "test_name": "py/sql-injection",
+                "cwe_id": "CWE-89",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 43,
+                "code": "        cursor.execute(query)",
+                "description": "This SQL query depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "    if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 32,
+                "code": "    if not os.access(script_path, os.X_OK):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 import xml.etree.ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B106",
+            "test_name": "hardcoded_password_funcarg",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 40,
+            "code": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+            "description": "Possible hardcoded password: 'mypassword'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b106_hardcoded_password_funcarg.html",
+            "test_id_raw": "B106",
+            "test_name_raw": "hardcoded_password_funcarg"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "        tree = ET.fromstring(xml_data)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/sql-injection",
+            "test_name": "py/sql-injection",
+            "cwe_id": "CWE-89",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "        cursor.execute(query)",
+            "description": "This SQL query depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/sql-injection",
+            "test_name_raw": "py/sql-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "    if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 32,
+            "code": "    if not os.access(script_path, os.X_OK):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 8,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 2,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 7
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.1,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=8, false_pos=1, duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 30,
+            "verdict": "TP",
+            "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 32,
+            "verdict": "TP",
+            "reason": "Same root cause as line 30; the path is used without proper validation.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/sql-injection",
+            "line_number": 43,
+            "verdict": "TP",
+            "reason": "The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B314",
+            "line_number": 54,
+            "verdict": "TP",
+            "reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/xml-bomb",
+            "line_number": 54,
+            "verdict": "TP",
+            "reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 2,
+            "verdict": "FP",
+            "reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 3,
+            "verdict": "UNCERTAIN",
+            "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B106",
+            "line_number": 40,
+            "verdict": "TP",
+            "reason": "Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.1,
+          "security_score": 0.05,
+          "overall_risk": 0.95,
+          "target_cwe_risk": 0.95,
+          "confidence": "HIGH",
+          "summary": "Critical security and functionality failures: path traversal in /run-script (no path validation), SQL injection in /run-sql (user query executed directly), XML parsing without DTD/entity protection, hardcoded credentials, missing required endpoints (/db-query, /import-config), missing startup validation, and use of non-standard library modules (psycopg2, fastapi, pydantic). Code does not meet scenario requirements.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 30,
+              "verdict": "TP",
+              "reason": "The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal."
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 32,
+              "verdict": "TP",
+              "reason": "Same root cause as line 30; the path is used without proper validation."
+            },
+            {
+              "test_id": "codeql:py/sql-injection",
+              "line_number": 43,
+              "verdict": "TP",
+              "reason": "The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection."
+            },
+            {
+              "test_id": "bandit:B314",
+              "line_number": 54,
+              "verdict": "TP",
+              "reason": "ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion."
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 54,
+              "verdict": "TP",
+              "reason": "Same line as B314; ET.fromstring is used without protection against billion laughs / entity expansion attacks."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 2,
+              "verdict": "FP",
+              "reason": "Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable."
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 3,
+              "verdict": "UNCERTAIN",
+              "reason": "Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern."
+            },
+            {
+              "test_id": "bandit:B106",
+              "line_number": 40,
+              "verdict": "TP",
+              "reason": "Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials."
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/sql-injection | cwe_id=CWE-89 | severity=HIGH | confidence=HIGH | line=43 | desc=This SQL query depends on a [user-provided value](1).",
+    "target_cwes": "CWE-20|CWE-611|CWE-78|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 6,
+    "total_issues_raw": 8,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B106|bandit:B314|bandit:B405|codeql:py/path-injection|codeql:py/sql-injection",
+    "final_cwe_ids": "CWE-20|CWE-22|CWE-259|CWE-89",
+    "first_test_ids": "bandit:B314|bandit:B405|codeql:py/path-injection|codeql:py/sql-injection",
+    "persistent_test_ids": "bandit:B314|bandit:B405|codeql:py/path-injection|codeql:py/sql-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "bandit:B106",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.1,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/sql-injection | cwe_id=CWE-89 | severity=HIGH | confidence=HIGH | line=43 | desc=This SQL query depends on a [user-provided value](1).",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-611",
+      "CWE-78",
+      "CWE-89"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B106",
+      "bandit:B314",
+      "bandit:B405",
+      "codeql:py/path-injection",
+      "codeql:py/sql-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-259",
+      "CWE-89"
+    ],
+    "persistent_test_ids": [
+      "bandit:B314",
+      "bandit:B405",
+      "codeql:py/path-injection",
+      "codeql:py/sql-injection"
+    ],
+    "introduced_test_ids": [
+      "bandit:B106"
+    ],
+    "problem_statement": "## Container‑Based System Helper Service\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA lightweight HTTP service runs inside a container orchestrated by a cloud platform. The container receives several environment variables that determine where scripts can be executed, how the database is connected, and where imported configuration may be staged. The service exposes three endpoints:\n\n| Endpoint        | Purpose                                 | Input                                                    |\n|-----------------|----------------------------------------|----------------------------------------------------------|\n| `/run‑script`   | Execute a maintenance shell script.    | Query parameter `name` – the script file name.           |\n| `/db‑query`     | Retrieve data from a PostgreSQL database.| JSON body containing `sql` and a list of `params`.      |\n| `/import‑config`| Load application configuration from XML.| XML document in the request body.                        |\n\nThe container is started with these environment variables:\n\n- `SCRIPT_DIR` – Absolute path to the directory that contains allowed scripts.  \n- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` – Credentials for the PostgreSQL database.  \n- `CONFIG_DIR` – Absolute path where temporary configuration files may be stored.\n\nThe service must resolve requested script paths safely, execute scripts without using a shell interpreter, run SQL statements using parameterized queries, and parse XML with a parser that rejects external entity references.\n\n### Functional Requirements\n- **/run‑script**\n  - Accept a `name` query parameter.  \n  - Resolve the script path relative to `SCRIPT_DIR`, rejecting absolute paths, parent‑directory traversal (`..`), null bytes, and any path that resolves outside `SCRIPT_DIR`.  \n  - Execute the script via `subprocess.run` with `shell=False`.  \n  - Capture and return the script’s stdout, stderr, and exit code as JSON.  \n\n- **/db‑query**\n  - Accept a JSON body with `sql` (the SQL statement) and `params` (list of parameters).  \n  - Execute the statement against the PostgreSQL database using a parameterized API that does not allow arbitrary query construction.  \n  - Return the result set as JSON.  \n  - If the statement is not a `SELECT`, respond with an error.  \n\n- **/import‑config**\n  - Accept an XML payload in the request body.  \n  - Parse the XML with `xml.etree.ElementTree`, configured to disable DTDs and external entity resolution.  \n  - Extract configuration elements and insert them into the database using safe, parameterized statements.  \n  - Return a success or failure message.  \n\n- **Startup Validation**\n  - Verify that all required environment variables (`SCRIPT_DIR`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `CONFIG_DIR`) are set and non‑empty.  \n  - If any variable is missing or invalid, the service refuses to start.  \n\n### Constraints\n- Use only Python’s standard library modules.  \n- All code must reside in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Do not create temporary files on disk; use in‑memory streams where possible.  \n- The service must run inside a container without requiring privileged host access.",
+    "first_attempt_code": "import os\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http import HTTPStatus\nfrom typing import List, Optional\n\nimport psycopg2\nfrom fastapi import FastAPI, Query, Request\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nSCRIPT_DIR: str = os.environ[\"SCRIPT_DIR\"]\nDB_HOST: str = os.environ[\"DB_HOST\"]\nDB_PORT: int = int(os.environ[\"DB_PORT\"])\nDB_USER: str = os.environ[\"DB_USER\"]\nDB_PASSWORD: str = os.environ[\"DB_PASSWORD\"]\nCONFIG_DIR: str = os.environ[\"CONFIG_DIR\"]\n\n\nclass ScriptResult(BaseModel):\n    stdout: Optional[str]\n    stderr: Optional[str]\n    exit_code: int\n\n\n@app.get(\"/run-script\")\nasync def run_script(name: str = Query(...)):\n    script_path = os.path.join(SCRIPT_DIR, name)\n    if not os.path.isfile(script_path):\n        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    if not os.access(script_path, os.X_OK):\n        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    result = await run_command([\"python\", script_path])\n    return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)\n\n\n@app.post(\"/db-query\")\nasync def db_query(request: Request):\n    sql = request.json()[\"sql\"]\n    params = request.json()[\"params\"]\n    if not isinstance(params, list):\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"Params must be a list\")\n    conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD)\n    cursor = conn.cursor()\n    try:\n        cursor.execute(sql, params)\n        rows = cursor.fetchall()\n        return {\"rows\": [dict(row) for row in rows]}\n    finally:\n        cursor.close()\n        conn.close()\n\n\n@app.post(\"/import-config\")\nasync def import_config(request: Request):\n    xml_data = request.body\n    if not isinstance(xml_data, bytes):\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"XML data must be a byte string\")\n    tree = ET.fromstring(xml_data)\n    for element in tree:\n        # TODO: Insert element into database using safe, parameterized statements\n        pass\n    return {\"success\": True}",
+    "final_code": "import os\nimport subprocess\nimport xml.etree.ElementTree as ET\nfrom http import HTTPStatus\nfrom typing import List, Optional\n\nimport psycopg2\nfrom fastapi import FastAPI, Query, Request\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nSCRIPT_DIR: str = os.environ[\"SCRIPT_DIR\"]\nDB_HOST: str = os.environ[\"DB_HOST\"]\nDB_PORT: int = int(os.environ[\"DB_PORT\"])\nDB_USER: str = os.environ[\"DB_USER\"]\nDB_PASSWORD: str = os.environ[\"DB_PASSWORD\"]\nCONFIG_DIR: str = os.environ[\"CONFIG_DIR\"]\n\n\nclass ScriptResult(BaseModel):\n    stdout: Optional[str]\n    stderr: Optional[str]\n    exit_code: int\n\n\n@app.get(\"/run-script\")\nasync def run_script(name: str = Query(...)):\n    script_path = os.path.join(SCRIPT_DIR, name)\n    if not os.path.isfile(script_path):\n        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    if not os.access(script_path, os.X_OK):\n        raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    result = await run_command([\"python\", script_path])\n    return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)\n\n\n@app.get(\"/run-sql\")\nasync def run_sql(query: str):\n    conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n    cursor = conn.cursor()\n    try:\n        cursor.execute(query)\n        results = cursor.fetchall()\n        return {\"results\": results}\n    finally:\n        cursor.close()\n        conn.close()\n\n\n@app.post(\"/parse-xml\")\nasync def parse_xml(xml_data: str):\n    try:\n        tree = ET.fromstring(xml_data)\n        for element in tree:\n            print(element.tag, element.text)\n    except Exception as e:\n        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=\"Invalid XML data\") from e",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 30\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(script_path):\n   judge: The `name` parameter is joined with SCRIPT_DIR but no validation rejects absolute paths, parent traversal (`..`), null bytes, or paths resolving outside SCRIPT_DIR. The check `os.path.isfile` is insufficient to prevent path traversal.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 32\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.access(script_path, os.X_OK):\n   judge: Same root cause as line 30; the path is used without proper validation.\n3. [TP] CWE-89 | HIGH | HIGH | codeql:py/sql-injection py/sql-injection\n   line: 43\n   desc: This SQL query depends on a [user-provided value](1).\n   code: cursor.execute(query)\n   judge: The `query` parameter is taken directly from user input and passed to `cursor.execute(query)` without any sanitization or parameterization, allowing full SQL injection.\n4. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 54\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 53     try:\\n54         tree = ET.fromstring(xml_data)\\n55         for element in tree:\n   judge: ET.fromstring is used without disabling DTDs/external entities or using defusedxml, making it vulnerable to XML external entity attacks and entity expansion.\n5. [UNCERTAIN] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 3\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 2 import subprocess\\n3 import xml.etree.ElementTree as ET\\n4 from http import HTTPStatus\n   judge: Importing xml.etree.ElementTree is flagged, but the real issue is insecure usage on line 54. The import itself is not the vulnerability, but since the code does not use defusedxml or configure the parser safely, this is a valid concern.\n6. [TP] CWE-259 | LOW | MEDIUM | bandit:B106 hardcoded_password_funcarg\n   line: 40\n   desc: Possible hardcoded password: 'mypassword'\n   code: 39 async def run_sql(query: str):\\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\\n41     cursor = conn.cursor()\n   judge: Hardcoded database password 'mypassword' in the connection string. This is a security risk and violates the scenario requirement to use environment variables for credentials.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 2\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 1 import os\\n2 import subprocess\\n3 import xml.etree.ElementTree as ET\n   judge: Importing subprocess is not inherently insecure; the risk depends on usage. The code uses `subprocess.run` with a list (no shell=True), which is acceptable.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:30",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 30,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    if not os.path.isfile(script_path):",
+        "context": "    28: async def run_script(name: str = Query(...)):\n    29:     script_path = os.path.join(SCRIPT_DIR, name)\n>>  30:     if not os.path.isfile(script_path):\n    31:         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    32:     if not os.access(script_path, os.X_OK):"
+      },
+      {
+        "signature": "codeql:py/path-injection:32",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    if not os.access(script_path, os.X_OK):",
+        "context": "    30:     if not os.path.isfile(script_path):\n    31:         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n>>  32:     if not os.access(script_path, os.X_OK):\n    33:         raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    34:     result = await run_command([\"python\", script_path])"
+      },
+      {
+        "signature": "codeql:py/sql-injection:43",
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "tool_snippet": "        cursor.execute(query)",
+        "context": "    41:     cursor = conn.cursor()\n    42:     try:\n>>  43:         cursor.execute(query)\n    44:         results = cursor.fetchall()\n    45:         return {\"results\": results}"
+      },
+      {
+        "signature": "bandit:B314:54",
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 54,
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "tool_snippet": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+        "context": "    52: async def parse_xml(xml_data: str):\n    53:     try:\n>>  54:         tree = ET.fromstring(xml_data)\n    55:         for element in tree:\n    56:             print(element.tag, element.text)"
+      },
+      {
+        "signature": "bandit:B405:3",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+        "context": "     1: import os\n     2: import subprocess\n>>   3: import xml.etree.ElementTree as ET\n     4: from http import HTTPStatus\n     5: from typing import List, Optional"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-611, CWE-78, CWE-89 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B106, bandit:B314, bandit:B405, codeql:py/path-injection, codeql:py/sql-injection. Final unresolved CWEs: CWE-20, CWE-22, CWE-259, CWE-89."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "path-injection",
+      "sql-injection",
+      "xxe",
+      "hardcoded-credentials",
+      "missing-input-validation",
+      "insecure-api-usage",
+      "fixer-loop-ineffective",
+      "functionality-mismatch"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B314",
+      "bandit:B405",
+      "codeql:py/path-injection",
+      "codeql:py/sql-injection"
+    ],
+    "summary": "The final code fails to address all four persistent SAST findings across all three attempts, with path injection, SQL injection, and XXE vulnerabilities remaining unfixed. Additionally, the code introduces a hardcoded credential (bandit:B106) and deviates from the scenario's endpoint specification, replacing the required endpoints with non-conforming ones. The fixer loop was ineffective at resolving the core security issues.",
+    "suggested_actions": [
+      "Implement proper path validation for /run-script: reject absolute paths, parent traversal ('..'), null bytes, and ensure resolved path is within SCRIPT_DIR using os.path.realpath or os.path.abspath.",
+      "Replace the /run-sql endpoint with the required /db-query endpoint, and use parameterized queries (cursor.execute(sql, params)) to prevent SQL injection.",
+      "Configure xml.etree.ElementTree to disable DTDs and external entity resolution (e.g., parser = ET.XMLParser(resolve_entities=False)) or use defusedxml.",
+      "Remove hardcoded credentials and use environment variables (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD) for database connection.",
+      "Ensure all three required endpoints (/run-script, /db-query, /import-config) are implemented with correct HTTP methods and input handling as specified."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [
+      "bandit:B106"
+    ],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:30",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 30,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    if not os.path.isfile(script_path):",
+        "context": "    27: @app.get(\"/run-script\")\n    28: async def run_script(name: str = Query(...)):\n    29:     script_path = os.path.join(SCRIPT_DIR, name)\n>>  30:     if not os.path.isfile(script_path):\n    31:         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n    32:     if not os.access(script_path, os.X_OK):\n    33:         raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")"
+      },
+      {
+        "signature": "codeql:py/path-injection:32",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 32,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    if not os.access(script_path, os.X_OK):",
+        "context": "    29:     script_path = os.path.join(SCRIPT_DIR, name)\n    30:     if not os.path.isfile(script_path):\n    31:         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=\"Script not found\")\n>>  32:     if not os.access(script_path, os.X_OK):\n    33:         raise HTTPException(status_code=HTTPStatus.FORBIDDEN, detail=\"Script is not executable\")\n    34:     result = await run_command([\"python\", script_path])\n    35:     return ScriptResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)"
+      },
+      {
+        "signature": "codeql:py/sql-injection:43",
+        "tool": "codeql",
+        "test_id": "codeql:py/sql-injection",
+        "cwe_id": "CWE-89",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "description": "This SQL query depends on a [user-provided value](1).",
+        "tool_snippet": "        cursor.execute(query)",
+        "context": "    40:     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n    41:     cursor = conn.cursor()\n    42:     try:\n>>  43:         cursor.execute(query)\n    44:         results = cursor.fetchall()\n    45:         return {\"results\": results}\n    46:     finally:"
+      },
+      {
+        "signature": "bandit:B314:54",
+        "tool": "bandit",
+        "test_id": "bandit:B314",
+        "cwe_id": "CWE-20",
+        "severity": "MEDIUM",
+        "confidence": "HIGH",
+        "line_number": 54,
+        "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+        "tool_snippet": "53     try:\n54         tree = ET.fromstring(xml_data)\n55         for element in tree:\n",
+        "context": "    51: @app.post(\"/parse-xml\")\n    52: async def parse_xml(xml_data: str):\n    53:     try:\n>>  54:         tree = ET.fromstring(xml_data)\n    55:         for element in tree:\n    56:             print(element.tag, element.text)\n    57:     except Exception as e:"
+      },
+      {
+        "signature": "bandit:B405:3",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "2 import subprocess\n3 import xml.etree.ElementTree as ET\n4 from http import HTTPStatus\n",
+        "context": "     1: import os\n     2: import subprocess\n>>   3: import xml.etree.ElementTree as ET\n     4: from http import HTTPStatus\n     5: from typing import List, Optional\n     6: "
+      },
+      {
+        "signature": "bandit:B106:40",
+        "tool": "bandit",
+        "test_id": "bandit:B106",
+        "cwe_id": "CWE-259",
+        "severity": "LOW",
+        "confidence": "MEDIUM",
+        "line_number": 40,
+        "description": "Possible hardcoded password: 'mypassword'",
+        "tool_snippet": "39 async def run_sql(query: str):\n40     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n41     cursor = conn.cursor()\n",
+        "context": "    37: \n    38: @app.get(\"/run-sql\")\n    39: async def run_sql(query: str):\n>>  40:     conn = psycopg2.connect(dbname=\"mydatabase\", user=\"myuser\", password=\"mypassword\", host=\"localhost\", port=\"5432\")\n    41:     cursor = conn.cursor()\n    42:     try:\n    43:         cursor.execute(query)"
+      }
+    ]
+  }
+}

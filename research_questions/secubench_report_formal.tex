@@ -1,0 +1,659 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage{placeins}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    citecolor=blue!50!black,
+    urlcolor=blue!50!black
+}
+
+\newcommand{\toolname}{SecuBench}
+\newcommand{\pp}{percentage points}
+\newcommand{\plotbox}[2]{%
+\IfFileExists{#2}{%
+    \includegraphics[width=\linewidth]{#2}%
+}{%
+    \fbox{\parbox{0.92\linewidth}{\centering
+    \vspace{1em}
+    \textbf{Plot placeholder:} #1\\[0.5em]
+    Insert plot file here: \texttt{\detokenize{#2}}\\
+    Replace this box with the final figure before submission.
+    \vspace{1em}
+    }}%
+}%
+}
+
+\title{\toolname: Dynamic and Adaptive Secure-Coding Benchmarking for Coding Agents}
+
+\author{
+Yvan Carré\\
+Department of Computer Science and Information Engineering\\
+Polytechnique Montréal\\
+\texttt{<your.email@domain>}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+AI-assisted programming systems increasingly produce functional code, but functional correctness does not guarantee security. Existing code-generation benchmarks have improved the evaluation of vulnerable outputs, yet many still rely on fixed scenario sets, aggregate pass/fail scoring, or limited diagnosis of how security failures change after repair. This article introduces \toolname{}, a dynamic and adaptive secure-coding benchmark for coding agents. \toolname{} combines vulnerability-aware scenario generation, an agentic solve-and-repair pipeline, a layered security oracle based on static analysis and LLM triage, and an exploration engine that searches for security failure boundaries across CWE categories and attack surfaces. In Phase-1 experiments with CodeLlama 13B, GPT-OSS 20B, and DeepSeek Coder V2, GPT-OSS 20B obtains the strongest one-shot secure-code success rate at 53.0\%, followed by CodeLlama 13B at 46.6\% and DeepSeek Coder V2 at 38.7\%. The results also show that direct generation and repair-assisted generation are distinct: CodeLlama 13B is strongest in zero-shot generation, whereas GPT-OSS 20B benefits most from iterative feedback, gaining 35.8 \pp{} after the fixer loop. Across models, path traversal and path-injection weaknesses remain persistent after repair. These findings suggest that adaptive secure-code benchmarking can provide more actionable diagnostics than global accuracy alone, because it identifies where agents fail, which failures persist, and how repair changes each model's security profile.
+\end{abstract}
+
+
+\section{Introduction}
+
+Large language models and coding agents are no longer only autocomplete tools. They now participate in multi-step software-engineering workflows: they synthesize functions, modify existing programs, explain code, generate tests, and repair failures after feedback. This shift makes code-generation evaluation increasingly important, but it also exposes a gap in what many benchmarks measure. Standard code benchmarks such as HumanEval and MBPP primarily reward functional correctness: the generated program must satisfy the given specification and pass tests \cite{chen2021codex,austin2021programsynthesis}. For secure software engineering, however, functional correctness is necessary but not sufficient.
+
+A generated program can be syntactically valid, functionally useful, and still unsafe. It may pass visible tests while containing command injection, path traversal, cross-site scripting, SQL injection, unsafe deserialization, or broken authentication logic. These vulnerabilities often arise precisely at the boundary between a functional requirement and an adversarial context: a filename that must be accepted but must not escape a directory, a query that must be parameterized, a rendered message that must not become executable HTML, or a role check that must enforce authorization. Secure-code generation therefore requires benchmarks that evaluate not only whether code works, but whether it remains safe under attacker-controlled inputs and realistic trust boundaries.
+
+Prior work has established that code-generating models can produce insecure code. Pearce et al. showed that GitHub Copilot could emit vulnerable code across high-risk CWE scenarios \cite{pearce2022asleep}. SecurityEval introduced a CWE-mapped dataset for evaluating security weaknesses in generated code \cite{siddiq2022securityeval}. CyberSecEval broadened cybersecurity evaluation for LLMs and included insecure-code generation as a core risk dimension \cite{bhatt2023cyberseceval}. More recent benchmarks, including SafeGenBench, CWEval, and SECODEPLT, improve vulnerability-oriented evaluation through SAST evidence, LLM-based judgment, dynamic test oracles, and larger CWE coverage \cite{li2025safegenbench,peng2025cweval,nie2025secodeplt}. These efforts show that security-aware code evaluation is essential. They also reveal a remaining methodological need: a benchmark should diagnose where an agent fails, how failures change after feedback, and which weakness families persist after repair.
+
+\toolname{} addresses this need by treating secure-code evaluation as adaptive capability mapping. Instead of evaluating every agent on only a fixed prompt set, \toolname{} dynamically explores a security search space defined by CWE categories, attack surfaces, scenario constraints, and CWE-composition size. It separates the raw zero-shot answer from the one-shot answer obtained after a controlled repair loop, so that direct secure-generation capability and feedback-driven mitigation capability are measured separately. It also records residual vulnerability families after repair, allowing the benchmark to identify model-specific failure signatures rather than relying solely on an aggregate score.
+
+This article makes four contributions.
+\begin{enumerate}
+\item We introduce \toolname{}, a dynamic secure-coding benchmark architecture for evaluating coding agents across generation, repair, and residual vulnerability analysis.
+\item We define a two-axis scenario model that combines CWE weakness families with attack surfaces, allowing the same vulnerability class to be evaluated across different operational contexts.
+\item We adapt Monte Carlo Tree Search to secure-code benchmarking through an exploration engine that balances difficult regions, under-covered surfaces, and uncertain security outcomes.
+\item We report Phase-1 results for CodeLlama 13B, GPT-OSS 20B, and DeepSeek Coder V2, showing that zero-shot secure generation, one-shot correction capability, and persistent vulnerability signatures are distinct properties.
+\end{enumerate}
+
+
+\section{Related Work}
+
+\subsection{Functional Code-Generation Benchmarks}
+
+The first generation of code benchmarks mainly measured whether a model could synthesize executable programs from natural-language specifications. HumanEval evaluates Python function synthesis from docstrings and popularized pass@k as a functional-correctness metric for code models \cite{chen2021codex}. MBPP similarly evaluates short Python programs intended to be solvable by entry-level programmers \cite{austin2021programsynthesis}. These benchmarks were essential for measuring code-writing ability, but their primary oracle is functional behavior. They do not directly test whether a function that passes tests also enforces security constraints against adversarial inputs.
+
+\subsection{Security of Generated Code}
+
+Security-oriented studies showed that functional code generation can hide substantial security risk. Pearce et al. evaluated Copilot on scenarios derived from high-risk CWE classes and found that many generated programs were vulnerable \cite{pearce2022asleep}. SecurityEval then provided a dataset of vulnerability examples mapped to CWE categories, making it possible to compare code-generation models on explicit security weaknesses \cite{siddiq2022securityeval}. These studies established the core premise of secure-code benchmarking: generated code must be evaluated as software that may be deployed, not merely as text that resembles software.
+
+\subsection{Secure-Code Benchmarks and Oracles}
+
+Recent secure-code benchmarks have expanded both scale and evaluation rigor. CyberSecEval evaluates LLM cybersecurity risk, including insecure code generation and cyberattack compliance \cite{bhatt2023cyberseceval}. SafeGenBench combines static application security testing with LLM-based judgment to assess vulnerabilities in generated code \cite{li2025safegenbench}. CWEval argues for outcome-driven evaluation that considers functionality and security together, using high-quality specifications and test oracles \cite{peng2025cweval}. SECODEPLT further broadens evaluation across languages, CWE-based risks, dynamic artifacts, and security capabilities such as insecure-code generation, vulnerability detection, and patching \cite{nie2025secodeplt}.
+
+\toolname{} builds on this line of work but targets a different evaluation regime. Rather than primarily maximizing benchmark scale or fixing a single static scenario distribution, \toolname{} focuses on adaptive stress testing. It uses prior outcomes to decide which CWE--surface regions should be explored next, and it reports not only final success but also zero-shot performance, correction gain, and residual vulnerability families.
+
+\subsection{Static Analysis, LLM Triage, and Repair}
+
+Security evaluation requires an oracle that is different from ordinary unit testing. Static application security testing tools can provide grounded evidence, but they can also produce noisy or duplicated findings. Bandit scans Python code through AST-based security plugins \cite{bandit}. Semgrep performs pattern-based static analysis for first-party code \cite{semgrep}. CodeQL represents code as queryable data and supports semantic vulnerability queries \cite{codeql}. Several secure-code benchmarks therefore combine automated analysis with judgment or dynamic checks rather than trusting a single tool. \toolname{} follows this layered-oracle approach: SAST findings are treated as evidence, while an LLM judge performs benchmark-level triage over target-CWE findings, off-target findings, and reliability failures.
+
+\subsection{Dynamic and Adaptive Benchmarking}
+
+Static datasets are reproducible and easy to compare, but they can become saturated or hide capability boundaries. Prism formulates code-generation benchmarking as a search problem and uses Monte Carlo Tree Search to discover informative tasks \cite{majdinasab2025prism}. \toolname{} adapts this dynamic benchmarking philosophy to secure code generation. Its search space is security-specific: nodes represent attack surfaces, CWE compositions, and empirical security outcomes. This design supports both agent ranking and the identification of regions in which agents remain unreliable.
+
+\section{Methodology}
+
+\toolname{} is designed as an adaptive secure-code evaluation system rather than a static prompt collection. Its goal is to map where a coding agent can produce secure code, where it needs feedback to recover, and which vulnerability families remain after repair. The benchmark therefore treats secure-code evaluation as a closed loop: it constructs a vulnerability scenario, asks the evaluated agent to solve it, evaluates the generated code with a security oracle, optionally gives feedback to a fixer, extracts residual vulnerability patterns, and uses the observed outcome to decide what part of the security space should be explored next.
+
+This section describes the benchmark methodology in four parts: the benchmark components, the attack-surface and CWE axes, the scenario-generation protocol, and the adaptive exploration engine. This separation is important methodologically. CWE labels define weakness mechanisms, attack surfaces define the operational context in which those weaknesses appear, and the exploration engine decides which CWE--surface combinations are informative for the model under test.
+
+\subsection{Benchmark Components}
+
+Table~\ref{tab:secubench-components} presents the four main components of \toolname{}. The agent stack defines the roles that participate in the evaluation. The scenario generator creates vulnerability-specific programming tasks by combining CWE targets with attack surfaces. The security evaluation oracle determines whether the generated code satisfies both functional and security requirements. The exploration engine closes the loop by selecting new scenarios that are expected to reveal capability boundaries.
+
+\begin{table}[t]
+\centering
+\caption{Main components of \toolname{}.}
+\label{tab:secubench-components}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{p{0.23\textwidth}p{0.39\textwidth}p{0.30\textwidth}}
+\toprule
+Component & Role in the benchmark & Main output \\
+\midrule
+Agent stack & Coordinates the agents responsible for challenge design, code generation, security repair, judging, and pattern analysis. & Generated scenarios, candidate solutions, repaired solutions, triage decisions, and failure summaries. \\
+Scenario and problem generation & Produces structured secure-coding tasks for a target CWE, attack surface, attacker-controlled input, and security requirement. & A problem statement containing the scenario, functional requirements, security requirements, and constraints. \\
+Security evaluation oracle & Combines static application security testing with LLM-based triage to decide whether the code still contains target or off-target vulnerabilities. & A secure or insecure outcome, residual issue labels, and failure reasons. \\
+Exploration engine & Uses adaptive search to decide which CWE--surface combinations should be explored next based on previous outcomes. & Updated search state, new scenario choices, and capability-boundary evidence. \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The agent stack is the operational layer of \toolname{}. It separates the responsibilities that are often mixed together in simpler benchmarks. The challenge designer generates benchmark scenarios for a selected CWE and attack surface. The problem solver is the coding agent under evaluation and produces the initial implementation. The security fixer receives feedback and attempts to repair insecure code. The LLM judge reviews the code and the static-analysis output in order to triage findings. The pattern analyzer summarizes recurring failures so that the benchmark can report model-specific vulnerability signatures rather than only reporting pass/fail outcomes. Table~\ref{tab:agent-stack} makes these roles explicit.
+
+\begin{table}[t]
+\centering
+\caption{Agent roles used by the \toolname{} pipeline.}
+\label{tab:agent-stack}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{p{0.24\textwidth}p{0.66\textwidth}}
+\toprule
+Agent role & Responsibility \\
+\midrule
+Challenge designer & Generates vulnerability scenarios for a target CWE and attack surface. \\
+Problem solver & Produces the code solution and is the main agent under evaluation. \\
+Security fixer & Repairs insecure code based on SAST findings and judge feedback. \\
+LLM judge & Reviews generated code and security-tool output, then triages findings into benchmark-level decisions. \\
+Pattern analyzer & Extracts recurring vulnerability families and summarizes persistent failure patterns. \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Attack-Surface and CWE Axes}
+
+\subsubsection{CWE Axis}
+
+\toolname{} uses two complementary security axes. The first axis is the Common Weakness Enumeration (CWE), which identifies the weakness family that the benchmark wants to evaluate, such as CWE-22 path traversal, CWE-78 OS command injection, CWE-79 cross-site scripting, CWE-89 SQL injection, or CWE-502 unsafe deserialization. The second axis is the attack surface, which identifies the software boundary through which the weakness is expressed. This distinction is central to the benchmark: a CWE is a vulnerability mechanism, while an attack surface is the context, trust boundary, or data-flow location where the mechanism becomes exploitable.
+
+Table~\ref{tab:cwe-targets} lists the active CWE targets used in the reported Phase-1 benchmark configuration. The selected set covers input validation, injection, output rendering, storage/path safety, deserialization, and authentication. This gives the benchmark compact but security-relevant coverage of common application-security failure modes.
+
+\begin{table}[t]
+\centering
+\caption{Active CWE targets used by \toolname{} in the reported experiments.}
+\label{tab:cwe-targets}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{p{0.12\textwidth}p{0.27\textwidth}p{0.31\textwidth}p{0.22\textwidth}}
+\toprule
+CWE & Weakness family & Capability probed & Typical benchmark contexts \\
+\midrule
+CWE-20 & Improper input validation & Ability to constrain, validate, and reject attacker-controlled data before it reaches sensitive logic. & User inputs, APIs, cookies, uploaded data. \\
+CWE-22 & Path traversal & Ability to confine paths to intended directories and prevent escape through crafted filenames or archives. & File upload/download, export, archive, storage workflows. \\
+CWE-78 & OS command injection & Ability to avoid unsafe shell construction and separate commands from attacker-controlled arguments. & Runtime utilities, infrastructure tasks, admin operations. \\
+CWE-79 & Cross-site scripting & Ability to prevent attacker-controlled content from becoming executable browser output. & HTML rendering, templates, reflected or stored messages. \\
+CWE-89 & SQL injection & Ability to preserve query functionality while preventing attacker-controlled query structure. & Search, login, reporting, database-backed APIs. \\
+CWE-287 & Improper authentication & Ability to implement identity checks, token/session handling, and login flows correctly. & Authentication, access control, account recovery. \\
+CWE-502 & Deserialization of untrusted data & Ability to avoid unsafe object loading and validate serialized data boundaries. & Import/export, queues, cache restore, external payloads. \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsubsection{Attack-Surface Axis}
+
+The six attack surfaces used by \toolname{} are operational abstractions derived from attack-surface analysis and threat-modeling practice \cite{manadhataWingAttackSurface,owaspAttackSurface,owaspThreatModeling}. They are not proposed as a new universal taxonomy. Instead, they provide a benchmark-oriented decomposition of common entry points, output channels, storage boundaries, identity boundaries, service boundaries, and runtime boundaries. Table~\ref{tab:attack-surfaces} summarizes the surfaces and their role in scenario construction.
+
+\begin{table}[t]
+\centering
+\caption{Attack-surface taxonomy used by \toolname{}.}
+\label{tab:attack-surfaces}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{p{0.25\textwidth}p{0.33\textwidth}p{0.32\textwidth}}
+\toprule
+Attack surface & Benchmark meaning & Typical scenario elements \\
+\midrule
+User Inputs \& Data & The main security boundary is attacker-controlled input entering the program. & Forms, query parameters, cookies, API payloads, uploaded files. \\
+Web Outputs \& Rendering & The main security boundary is content returned to a browser or web client. & Dynamic HTML, redirects, templates, headers, user-visible errors. \\
+Storage \& Filesystem & The main security boundary is server-side storage or path control. & Upload/download workflows, archive extraction, export paths, configuration files. \\
+Authentication \& Access Control & The main security boundary is identity, session state, or authorization. & Login flows, tokens, roles, password reset, permission checks. \\
+Data Exchange \& External Services & The main security boundary is serialization or service-to-service communication. & JSON/XML APIs, webhooks, message queues, external service calls. \\
+Execution Environment \& Infrastructure & The main security boundary is the runtime, operating system, or deployment environment. & Shell commands, environment variables, containers, cloud/runtime configuration. \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsubsection{CWE--Surface Composition}
+
+The two-axis design also explains why some CWE--surface pairs are not one-to-one. A weakness such as CWE-78 can appear naturally in an execution-environment scenario, but it can also appear in an authentication workflow if, for example, an administrative password-reset utility invokes a shell command using attacker-controlled account data. Similarly, CWE-22 is not limited to the Storage and Filesystem surface; it can also appear in web rendering, export, import, or service-integration contexts. \toolname{} therefore treats CWE and attack surface as orthogonal but constrained dimensions: the CWE specifies what kind of weakness must be tested, and the surface specifies the security context in which the weakness must be made meaningful.
+
+\subsection{Scenario and Problem Generation}
+
+\subsubsection{Scenario Representation}
+
+For each selected node in the search tree, the benchmark constructs a scenario from a tuple
+\[
+    x = (S, C, A, F, Q),
+\]
+where \(S\) is the attack surface, \(C=\{c_1,\ldots,c_k\}\) is the target CWE composition, \(A\) is the attacker-controlled input or capability, \(F\) is the required functional behavior, and \(Q\) is the security constraint that the implementation must satisfy. The challenge designer receives this structured specification and produces a programming task containing a title, realistic context, functional requirements, security requirements, implementation constraints, and the expected code-output format.
+
+\subsubsection{Generation Constraints}
+
+Scenario generation follows four rules.
+
+\begin{enumerate}
+\item The generated task must make the attack surface explicit. The scenario must state where untrusted data enters, what asset or behavior is at risk, and which system boundary is being crossed.
+\item The target CWE or CWE composition must be instantiated as a realistic implementation risk rather than merely named. For example, a CWE-22 scenario should require path handling in a context where an attacker-controlled path could escape an intended directory.
+\item The task must preserve functional plausibility. The evaluated agent is asked to implement useful behavior, not to answer an abstract security quiz.
+\item The solver-facing prompt must not contain a vulnerable reference implementation or a step-by-step mitigation recipe. Hidden negative examples or vulnerability templates can be used internally to guide scenario construction, but they are not exposed to the model under evaluation. This prevents the benchmark from measuring prompt-level mitigation hints instead of secure-code capability.
+\end{enumerate}
+
+\subsubsection{Solver-Facing Prompt}
+
+This protocol is intended to evaluate secure programming behavior under realistic constraints. The generated problem tells the model what the software should do and what security property must hold, but it does not simply provide the vulnerable pattern to avoid. As a result, a secure solution requires the agent to connect the functional context, the attacker-controlled input, and the relevant weakness family.
+
+\subsection{Security Evaluation and Repair Loop}
+
+\subsubsection{Initial Generation}
+
+After a scenario is generated, the problem solver produces an initial implementation. This initial answer is used to measure zero-shot secure-code generation.
+
+\subsubsection{Security Oracle}
+
+The code is then evaluated by a security oracle that combines static-analysis evidence with LLM-based triage. Static analysis provides concrete findings, while the LLM judge reviews the code, problem statement, target CWE list, and tool output to decide whether a finding is relevant to the benchmark objective. The oracle distinguishes target-CWE failures, off-target vulnerabilities, syntax errors, missing-code failures, and secure outcomes.
+
+\subsubsection{Repair and Final Outcome}
+
+If the initial implementation is insecure and the configuration allows repair, the security fixer receives feedback and attempts to produce a corrected implementation. The final answer after the allowed repair attempts is used to measure one-shot secure-code capability. This distinction lets \toolname{} separate two different properties: the ability to generate secure code on the first attempt and the ability to use feedback to repair insecure code.
+
+\subsection{Adaptive Exploration Engine}
+
+\subsubsection{Search State and Reward}
+
+The exploration engine is inspired by Monte Carlo Tree Search \cite{kocsis2006mcts,majdinasab2025prism}, but it is adapted for secure-code stress testing. A node represents a region of the benchmark space: an attack surface, a CWE composition, and the empirical outcomes observed for generated scenarios in that region. A simulation consists of generating a scenario for the node, running the solve-and-repair pipeline, computing a normalized reward, and backpropagating that reward through the tree.
+
+The reward is high when the generated program is functional and secure, and low when the final code contains target vulnerabilities, off-target vulnerabilities, syntax failures, missing code, or repeated failed attempts. Thus, low-value nodes are not discarded; they are diagnostically important because they identify regions where the model is unreliable.
+
+\subsubsection{Surface Scheduling}
+
+\toolname{} uses a surface scheduler to avoid the artificial bias of a fixed linear ordering over attack surfaces. At each iteration, the scheduler computes a priority score for each attack surface:
+\[
+    \pi(S) =
+    \alpha \left(1-\bar{r}_{S}\right)
+    + \beta \frac{1}{1+n_{S}}
+    + \gamma \frac{1}{\sqrt{1+n_{S}}},
+    \label{eq:surface-priority}
+\]
+where \(\bar{r}_{S}\) is the observed mean reward for surface \(S\), \(n_{S}\) is the number of observations for that surface, and \(\alpha,\beta,\gamma\) control the relative importance of difficulty, coverage, and uncertainty. In the reported Phase-1 configuration, these weights are \(\alpha=0.55\), \(\beta=0.30\), and \(\gamma=0.15\). The first term favors surfaces where the model has performed poorly, the second term favors under-covered surfaces, and the third term favors uncertain surfaces with few observations.
+
+\subsubsection{Fixed-Surface CWE Expansion}
+
+After a target surface is selected, expansion is performed inside that same surface. This fixed-surface expansion is a deliberate methodological choice. It prevents the search from drifting through an arbitrary surface chain, and it allows the benchmark to grow CWE complexity locally within a stable security context. When a node is expanded, the engine adds a CWE that is under-covered for the selected surface. If a same-surface partner node contains a useful novel CWE, the engine may combine the two nodes; otherwise, it selects the least observed available CWE for that surface. The composition size is bounded by the configured maximum.
+
+\subsubsection{Exploration and Exploitation}
+
+Exploration and exploitation occur at two levels. Exploration keeps under-sampled surfaces and under-covered CWE combinations active. Exploitation concentrates evaluation budget on empirically informative regions, especially surfaces and nodes where previous attempts revealed low secure success or persistent vulnerabilities. During tree traversal, the engine also uses an exploration probability to occasionally choose a random child, while otherwise using an upper-confidence criterion to select promising descendants. In the Phase-1 configuration, this probability is 0.25.
+
+\subsubsection{Dynamic Capability Mapping}
+
+This makes the benchmark dynamic in a specific sense: the next scenario is not chosen independently of previous results. It is chosen because prior runs suggest that a surface is difficult, under-covered, uncertain, or locally capable of producing a more informative CWE composition. The output of the benchmark is therefore not only a score, but a capability map showing where each agent succeeds, where feedback helps, and where vulnerabilities persist.
+
+Figure~\ref{fig:secubench-overview} summarizes the closed-loop architecture of \toolname{}. The pipeline starts with challenge design, proceeds through solution generation and security evaluation, optionally invokes repair, and feeds the observed outcome back into the adaptive exploration engine.
+
+\begin{figure}[t]
+\centering
+\plotbox{SecuBench component architecture: agent stack, scenario and problem generation, security evaluation oracle, and adaptive exploration engine.}{figures/secubench_architecture.pdf}
+\caption{Overview of the \toolname{} component architecture. The pipeline combines scenario generation, agentic code generation and repair, security-tool evidence, LLM-based triage, pattern analysis, and adaptive exploration.}
+\label{fig:secubench-overview}
+\end{figure}
+
+\FloatBarrier
+\section{Study Design}
+
+\subsection{Research Questions}
+
+The study is organized around three research questions. RQ1 asks what secure-code generation capability the coding agent demonstrates when it is asked to solve vulnerability-aware programming scenarios. RQ2 asks how effectively the agent can correct initially insecure code when given iterative feedback and repair opportunities. RQ3 asks which recurrent vulnerability patterns appear in the generated code, both overall and by attack surface, and which patterns persist after correction.
+
+These questions intentionally separate three properties that are often collapsed into a single benchmark score. RQ1 measures direct secure-code generation. RQ2 measures feedback-driven mitigation capability. RQ3 measures the structure of the remaining failures. A model can be strong on one of these dimensions and weak on another; for example, it can produce relatively safe first answers but benefit little from feedback, or it can start insecurely but repair effectively.
+
+\subsection{Agents and Roles}
+
+The evaluated agents are CodeLlama 13B, GPT-OSS 20B, and DeepSeek Coder V2. GPT-OSS 20B is used as the challenge designer for scenario generation. The three evaluated models are used as problem solvers and security fixers. DeepSeek-Chat is used as the LLM judge for security review. This design separates the role of generating benchmark problems from the role of solving them, while allowing each model to be evaluated both on initial code generation and on repair behavior.
+
+This role separation is important for interpretation. The benchmark does not treat the challenge designer as the model being evaluated. The evaluated model is the solver/fixer agent whose generated code is measured. The challenge designer is part of the benchmark infrastructure, analogous to a dynamic task generator, and the judge is part of the evaluation oracle.
+
+\subsection{Experimental Protocol}
+
+Each run follows the same high-level protocol. First, the exploration engine selects an attack surface and target CWE composition. Second, the challenge designer generates a scenario and problem statement for that selection. Third, the evaluated model produces an initial code solution. Fourth, the security oracle analyzes the solution and records whether it is secure, insecure because of the target CWE, insecure because of an off-target vulnerability, syntactically invalid, or missing code. Fifth, if repair is allowed and the implementation is insecure, the fixer receives feedback and attempts to correct the solution. Finally, the benchmark records the final outcome and updates the exploration tree.
+
+The main RQ1 metric is one-shot secure success rate. A run counts as a one-shot secure success if the generated program is judged secure after the initial generation, static analysis, LLM-based triage, and any allowed security-fixer attempts. The zero-shot secure success rate is computed before the fixer loop and is used to isolate direct secure-generation capability. The main RQ2 metric is the difference between zero-shot success and one-shot success, reported in percentage points. This difference measures the gain from iterative repair. RQ3 uses CWE-level vulnerability labels rather than tool-specific rule identifiers so that the analysis reports persistent weakness families instead of scanner-specific artifacts.
+
+Because the exploration engine is adaptive, the three agents do not necessarily receive identical scenario distributions. This is a feature of the dynamic benchmark, not a balanced factorial design. The goal is not to estimate performance on a fixed population of prompts; it is to map capability boundaries under a fixed evaluation budget. The results should therefore be interpreted primarily through rates, confidence-aware comparisons, surface-level profiles, and recurrent failure patterns. Raw counts remain useful for sample-size transparency and for describing the prevalence of residual weaknesses, but they are not treated as if all agents received the same static test set.
+
+Figure~\ref{fig:surface-coverage} reports exploration coverage by attack surface. This context is important because adaptive exploration produces different numbers of runs per surface and per agent.
+
+\begin{figure}[t]
+\centering
+\plotbox{Exploration coverage by attack surface for CodeLlama 13B, GPT-OSS 20B, and DeepSeek Coder V2.}{figures/phase1_three_agent/exploration_surface_coverage.pdf}
+\caption{Exploration coverage by attack surface. Adaptive exploration produces different numbers of runs per surface and per agent, so coverage is shown before the outcome analysis.}
+\label{fig:surface-coverage}
+\end{figure}
+
+\FloatBarrier
+\section{Results}
+
+\subsection{RQ1: Secure Code Generation Capability}
+
+Table~\ref{tab:overall} reports the overall Phase-1 outcomes. GPT-OSS 20B obtains the strongest one-shot secure success rate at 53.0\%. CodeLlama 13B follows at 46.6\%, and DeepSeek Coder V2 reaches 38.7\%. These values show that none of the evaluated agents produces secure code reliably across the explored vulnerability scenarios. Even the strongest model leaves residual issues in nearly half of the runs.
+
+\begin{table}[t]
+\centering
+\caption{Overall Phase-1 secure-code results across three agents.}
+\label{tab:overall}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrr}
+\toprule
+Metric & CodeLlama 13B & GPT-OSS 20B & DeepSeek Coder V2 \\
+\midrule
+Phase-1 runs & 189 & 296 & 124 \\
+One-shot secure success rate & 46.6\% & 53.0\% & 38.7\% \\
+One-shot failure rate & 53.4\% & 47.0\% & 61.3\% \\
+Zero-shot secure success rate & 26.5\% & 17.2\% & 12.9\% \\
+Residual issue rate & 51.3\% & 47.0\% & 61.3\% \\
+Target-CWE issue rate & 34.9\% & 35.1\% & 36.3\% \\
+Off-target issue rate & 19.6\% & 23.0\% & 33.1\% \\
+Average residual issues per run & 1.09 & 1.08 & 1.52 \\
+Average raw vulnerability findings per run & 1.40 & 2.80 & 1.97 \\
+Average risk score & 0.124 & 0.165 & 0.153 \\
+Average attempts & 2.28 & 2.42 & 2.56 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The ranking changes when zero-shot generation is separated from one-shot repair. CodeLlama 13B has the strongest zero-shot secure success rate at 26.5\%, while GPT-OSS 20B starts at only 17.2\%. However, GPT-OSS 20B obtains the best final one-shot result because it benefits more from the repair loop. This distinction is central to \toolname{}: zero-shot secure generation and agentic secure-code capability after feedback are not the same property.
+
+Figure~\ref{fig:generation-correction} visualizes the separation between zero-shot generation and one-shot performance after repair, which is the central distinction between RQ1 and RQ2.
+
+\begin{figure}[t]
+\centering
+\plotbox{Generation versus correction capability: zero-shot success, one-shot success, and correction gain for each model.}{figures/phase1_three_agent/fig1_generation_vs_correction.pdf}
+\caption{Generation versus correction capability. CodeLlama 13B is strongest initially, while GPT-OSS 20B is strongest after iterative repair.}
+\label{fig:generation-correction}
+\end{figure}
+
+Table~\ref{tab:surface-success} reports one-shot success by attack surface. GPT-OSS 20B is strongest on Authentication and Access Control, where it reaches 74.3\%, and on Execution Environment and Infrastructure, where it reaches 59.7\%. CodeLlama 13B performs best on Data Exchange and External Services at 57.6\% and User Inputs and Data at 55.6\%, but it is weakest on Execution Environment and Infrastructure at 25.8\%. DeepSeek Coder V2 remains comparatively weak across most surfaces, with its lowest success on Storage and Filesystem at 30.8\%.
+
+\begin{table}[t]
+\centering
+\caption{One-shot secure success rates by attack surface.}
+\label{tab:surface-success}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+\multirow{2}{*}{Attack surface} &
+\multicolumn{2}{c}{CodeLlama 13B} &
+\multicolumn{2}{c}{GPT-OSS 20B} &
+\multicolumn{2}{c}{DeepSeek Coder V2} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+& Runs & Success & Runs & Success & Runs & Success \\
+\midrule
+Authentication \& Access Control & 31 & 54.8\% & 35 & 74.3\% & 22 & 36.4\% \\
+Data Exchange \& External Services & 33 & 57.6\% & 49 & 44.9\% & 19 & 36.8\% \\
+Execution Environment \& Infrastructure & 31 & 25.8\% & 62 & 59.7\% & 14 & 35.7\% \\
+Storage \& Filesystem & 31 & 41.9\% & 56 & 51.8\% & 13 & 30.8\% \\
+User Inputs \& Data & 36 & 55.6\% & 40 & 40.0\% & 33 & 42.4\% \\
+Web Outputs \& Rendering & 27 & 40.7\% & 54 & 50.0\% & 23 & 43.5\% \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+Figure~\ref{fig:surface-heatmap} highlights the attack-surface capability map. The heatmap makes clear that the benchmark is not only a leaderboard; it also identifies where each model is comparatively strong or weak.
+
+\begin{figure}[t]
+\centering
+\plotbox{Attack-surface heatmap showing one-shot secure success rates for each agent and surface.}{figures/phase1_three_agent/fig2_attack_surface_heatmap.pdf}
+\caption{Capability profile by attack surface. The heatmap makes surface-specific capability boundaries visible.}
+\label{fig:surface-heatmap}
+\end{figure}
+
+The benchmark also exposes compositional difficulty. Table~\ref{tab:cwe-combo} reports secure success by target CWE-combination size. CodeLlama 13B decreases from 69.4\% success at one CWE to 34.0\% at five CWEs. DeepSeek Coder V2 decreases from 42.9\% to 21.4\%. GPT-OSS 20B is unusually strong on two- and three-CWE combinations but still drops to 42.9\% at five CWEs. This pattern suggests that combining weaknesses within one task creates additional reasoning pressure beyond recognizing a single vulnerability class.
+
+\begin{table}[t]
+\centering
+\caption{One-shot secure success by target CWE-combination size.}
+\label{tab:cwe-combo}
+\begin{tabular}{rrrr}
+\toprule
+CWE combination size & CodeLlama 13B & GPT-OSS 20B & DeepSeek Coder V2 \\
+\midrule
+1 & 69.4\% & 63.6\% & 42.9\% \\
+2 & 48.6\% & 73.5\% & 64.0\% \\
+3 & 45.5\% & 66.7\% & 34.8\% \\
+4 & 40.6\% & 57.6\% & 30.0\% \\
+5 & 34.0\% & 42.9\% & 21.4\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:cwe-combo} shows how secure success changes as the number of target CWE requirements increases.
+
+\begin{figure}[t]
+\centering
+\plotbox{Line plot of one-shot secure success as target CWE-combination size grows from one to five.}{figures/phase1_three_agent/fig3_cwe_combo_complexity.pdf}
+\caption{Secure success by CWE-combination size. The curve shows how agents degrade as scenarios combine more vulnerability requirements.}
+\label{fig:cwe-combo}
+\end{figure}
+
+\FloatBarrier
+\subsection{RQ2: Correction Capability Under Iterative Feedback}
+
+Table~\ref{tab:correction} separates initial secure generation from final performance after repair. GPT-OSS 20B has the largest absolute correction gain at 35.8 \pp{}, followed by DeepSeek Coder V2 at 25.8 \pp{} and CodeLlama 13B at 20.1 \pp{}. GPT-OSS 20B also has the highest conditional recovery after initial failure, recovering 43.3\% of initially insecure runs. This result indicates that GPT-OSS 20B is not the best initial secure-code generator, but it is the strongest model in this study when iterative feedback and repair are allowed.
+
+\begin{table}[t]
+\centering
+\caption{Correction capability under iterative feedback.}
+\label{tab:correction}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrr}
+\toprule
+Metric & CodeLlama 13B & GPT-OSS 20B & DeepSeek Coder V2 \\
+\midrule
+Zero-shot success & 26.5\% & 17.2\% & 12.9\% \\
+One-shot success & 46.6\% & 53.0\% & 38.7\% \\
+Absolute correction gain & +20.1 pp & +35.8 pp & +25.8 pp \\
+Conditional recovery after initial failure & 27.3\% & 43.3\% & 29.6\% \\
+Runs with at least one fixer attempt & 72.0\% & 82.8\% & 87.1\% \\
+Average attempts & 2.28 & 2.42 & 2.56 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The gain from repair is not uniform across attack surfaces. GPT-OSS 20B gains 45.7 \pp{} on Authentication and Access Control and 43.5 \pp{} on Execution Environment and Infrastructure. CodeLlama 13B gains most on User Inputs and Data, where it improves by 30.6 \pp{}. DeepSeek Coder V2 gains most on Web Outputs and Rendering, where it improves by 34.8 \pp{}, and on Authentication and Access Control, where it improves by 31.8 \pp{}. These results show that a fixer loop can change the capability profile of an agent, but the effect depends strongly on the security context.
+
+Figure~\ref{fig:correction-gain} reports correction gain by attack surface, showing where the aggregate improvements in Table~\ref{tab:correction} come from.
+
+\begin{figure}[t]
+\centering
+\plotbox{Bar chart of correction gain by attack surface for each model.}{figures/phase1_three_agent/correction_gain_by_attack_surface.pdf}
+\caption{Correction gain by attack surface. Feedback helps different models on different surfaces.}
+\label{fig:correction-gain}
+\end{figure}
+
+The fixer resolves many known vulnerability families, but resolution does not mean elimination. For CodeLlama 13B, the most frequently resolved vulnerability family is CWE-78 command execution or subprocess misuse, followed by CWE-502 unsafe deserialization. For GPT-OSS 20B, the most frequently resolved categories are CWE-78 command execution, CWE-502 unsafe deserialization, and CWE-605 network exposure. For DeepSeek Coder V2, the most frequently resolved category is CWE-215 debug-mode exposure, followed by CWE-78 command execution. These resolved categories overlap with persistent failure categories, showing that the fixer reduces repeated weaknesses without fully removing them.
+
+Figure~\ref{fig:fixer-resolves} summarizes which vulnerability families are most often resolved during the fixer loop. These resolved categories should be interpreted together with the persistent failures reported in RQ3.
+
+\begin{figure}[t]
+\centering
+\plotbox{Heatmap showing resolved vulnerability families after repair for each model.}{figures/phase1_three_agent/fixer_resolves_heatmap.pdf}
+\caption{Vulnerability families resolved by the fixer. The heatmap shows which weakness classes are most often corrected during iterative repair.}
+\label{fig:fixer-resolves}
+\end{figure}
+
+\FloatBarrier
+\subsection{RQ3: Recurrent Vulnerability Patterns and Persistent Failures}
+
+The RQ3 analysis shows that the agents do not fail randomly. They produce structured vulnerability signatures that differ by model. For CodeLlama 13B, the persistent profile is dominated by CWE-78 OS command injection and CWE-502 unsafe deserialization. For GPT-OSS 20B, the persistent profile is dominated by CWE-22 path traversal, followed by CWE-78 command injection and CWE-117 log injection. For DeepSeek Coder V2, the persistent profile mixes CWE-22 path traversal, CWE-502 unsafe deserialization, CWE-78 command injection, and CWE-209 error-message information exposure.
+
+\begin{table}[t]
+\centering
+\caption{Top persistent known vulnerability families after correction.}
+\label{tab:persistent}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{r l r l r l r}
+\toprule
+Rank & CodeLlama 13B & Count & GPT-OSS 20B & Count & DeepSeek Coder V2 & Count \\
+\midrule
+1 & CWE-78 OS command injection & 54 & CWE-22 path traversal & 85 & CWE-22 path traversal & 24 \\
+2 & CWE-502 unsafe deserialization & 21 & CWE-78 OS command injection & 52 & CWE-502 unsafe deserialization & 19 \\
+3 & CWE-22 path traversal & 16 & CWE-117 log injection & 21 & CWE-78 OS command injection & 18 \\
+4 & CWE-259 hard-coded password/secret & 9 & CWE-89 SQL injection & 12 & CWE-209 information exposure & 11 \\
+5 & CWE-215 sensitive information in debug code & 6 & CWE-113 HTTP response splitting & 11 & CWE-259 hard-coded password/secret & 8 \\
+6 & CWE-327 broken or risky cryptography & 5 & CWE-502 unsafe deserialization & 9 & CWE-601 open redirect & 6 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The clearest cross-agent bottleneck is path-related unsafe code. CWE-22 is the top persistent vulnerability family for GPT-OSS 20B and DeepSeek Coder V2, and it remains among the main residual weaknesses for CodeLlama 13B. This suggests that path-safe filesystem reasoning is a core weakness for current coding agents. The problem is not limited to remembering that ``../'' is dangerous; it involves consistently constraining untrusted paths to intended directories, validating filenames, handling archive or export workflows, and preserving functionality while rejecting unsafe inputs.
+
+Figure~\ref{fig:persistent-profile} visualizes the persistent CWE profile after repair, normalized by run count so that comparisons are not dominated by different sample sizes.
+
+\begin{figure}[t]
+\centering
+\plotbox{Persistent CWE profile after correction, normalized by run count.}{figures/phase1_three_agent/fig5_persistent_cwe_profiles.pdf}
+\caption{Persistent vulnerability signatures after repair. The plot shows which CWE families remain after the fixer loop.}
+\label{fig:persistent-profile}
+\end{figure}
+
+The failure-reason breakdown adds another diagnostic layer. Most final failures are unresolved target-CWE findings, which means the benchmark is primarily measuring failure on the intended vulnerability concept rather than unrelated implementation errors. However, off-target findings are also important because a repair can remove one vulnerability while introducing another. DeepSeek Coder V2 has a higher off-target issue rate and also shows a noticeable syntax-reliability problem, with 14 syntax-error failures.
+
+Figure~\ref{fig:failure-breakdown} explains why final one-shot runs still fail after repair by separating target-CWE failures, off-target findings, syntax errors, and no-code failures.
+
+\begin{figure}[t]
+\centering
+\plotbox{Final outcome breakdown showing target-CWE findings, off-target findings, syntax errors, and no-code failures.}{figures/phase1_three_agent/fig4_failure_reason_breakdown.pdf}
+\caption{Failure reasons after correction. The breakdown separates target vulnerability failures from off-target and reliability failures.}
+\label{fig:failure-breakdown}
+\end{figure}
+
+\FloatBarrier
+\section{Discussion}
+
+The results support four main interpretations. First, \toolname{} separates agents by one-shot secure-code capability. In these Phase-1 runs, GPT-OSS 20B performs best, followed by CodeLlama 13B and DeepSeek Coder V2. This ranking is useful, but it is not the central outcome of the benchmark. The central result is that no model reaches a high secure success rate across the explored vulnerability scenarios.
+
+Second, \toolname{} separates zero-shot secure generation from correction capability. CodeLlama 13B is the strongest initial generator, but GPT-OSS 20B becomes the strongest model after iterative repair. Therefore, evaluating only the first response of a coding agent can misrepresent its repair-assisted security capability. Conversely, evaluating only the final answer can hide important differences in how much repair was required.
+
+Third, the benchmark reveals model-specific vulnerability signatures. CodeLlama 13B is mainly associated with command execution and unsafe deserialization. GPT-OSS 20B is mainly associated with path traversal, command execution, and log injection. DeepSeek Coder V2 combines path traversal, unsafe deserialization, command execution, and stack-trace exposure. These signatures are more actionable than a single accuracy score because they suggest where model developers, tool builders, and benchmark designers should focus.
+
+Fourth, path traversal and path injection are persistent cross-agent weaknesses. This pattern appears across attack surfaces and remains after repair. The finding suggests that coding agents may need stronger internal patterns for safe path construction, canonicalization, root-directory confinement, archive handling, and filename validation. It also suggests that secure-code benchmarks should include multiple path-related contexts rather than treating path traversal as a single narrow task.
+
+The results further demonstrate the value of adaptive exploration. A static benchmark can report whether a model passed a known set of tasks, but an adaptive benchmark can search for the regions where the model becomes unreliable. This consideration is particularly relevant for secure code generation because new models may quickly solve easy vulnerability prompts while still failing on composed, contextual, or repair-resistant scenarios.
+
+\FloatBarrier
+\section{Threats to Validity}
+
+The study has several threats to validity. The results are Phase-1 outcomes, so they characterize adaptive capability mapping rather than a final full-scale validation. The three agents have different sample sizes, with 189 runs for CodeLlama 13B, 296 runs for GPT-OSS 20B, and 124 runs for DeepSeek Coder V2. Because the exploration process is adaptive, each model may encounter different scenario distributions. This limits direct raw-count comparisons and makes rates and qualitative patterns more appropriate.
+
+The evaluation also depends on the quality of static analysis and LLM-based triage. Bandit, Semgrep, and CodeQL can miss vulnerabilities or report noisy findings, and an LLM judge can make classification mistakes. The stacked oracle reduces this risk by combining evidence sources, but it does not eliminate it. Future versions should include manual audit samples, inter-judge agreement analysis, and additional dynamic tests for selected vulnerability classes.
+
+Another limitation is that the current analysis emphasizes Python-oriented, single-file tasks with limited external dependencies. This design improves controllability and reproducibility, but it may not capture security failures that arise in larger multi-file systems, framework-heavy applications, deployment configurations, or real-world dependency ecosystems. Future work should scale the scenario generator to richer project structures while preserving clear security oracles.
+
+Finally, a publication-ready claim about the exploration engine itself requires stronger baselines. Adaptive MCTS exploration should be compared against random sampling, round-robin sampling, stratified CWE-surface sampling, and fixed benchmark selection under the same compute budget. Such comparisons would show whether adaptive exploration finds more informative failures per unit of evaluation cost.
+
+\FloatBarrier
+\section{Conclusion}
+
+This article presented \toolname{}, a dynamic and adaptive secure-coding benchmark for coding agents. The benchmark combines vulnerability-aware scenario generation, an agentic solve-and-repair pipeline, a security evaluation oracle, and adaptive exploration over CWE categories and attack surfaces. In Phase-1 experiments on CodeLlama 13B, GPT-OSS 20B, and DeepSeek Coder V2, \toolname{} shows that secure-code generation capability, correction capability, and persistent vulnerability patterns are distinct properties. GPT-OSS 20B achieves the strongest one-shot success, CodeLlama 13B is strongest in zero-shot generation, and DeepSeek Coder V2 remains the most difficult profile overall. Across agents, path traversal and path injection emerge as persistent weaknesses after repair. These findings support the need for secure-code benchmarks that move beyond pass/fail scoring toward vulnerability-aware capability mapping.
+
+\begin{thebibliography}{99}
+
+
+\bibitem{carre2026analysis}
+Yvan Carré.
+\newblock \emph{Phase-1 Vulnerability Benchmark Analysis Across Three Agents}.
+\newblock Internal analysis report, 2026.
+
+\bibitem{chen2021codex}
+Mark Chen et al.
+\newblock Evaluating Large Language Models Trained on Code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+\newblock \url{https://arxiv.org/abs/2107.03374}.
+
+\bibitem{austin2021programsynthesis}
+Jacob Austin et al.
+\newblock Program Synthesis with Large Language Models.
+\newblock \emph{arXiv preprint arXiv:2108.07732}, 2021.
+\newblock \url{https://arxiv.org/abs/2108.07732}.
+
+\bibitem{pearce2022asleep}
+Hammond Pearce, Baleegh Ahmad, Benjamin Tan, Brendan Dolan-Gavitt, and Ramesh Karri.
+\newblock Asleep at the Keyboard? Assessing the Security of GitHub Copilot's Code Contributions.
+\newblock In \emph{IEEE Symposium on Security and Privacy}, 2022.
+\newblock \url{https://arxiv.org/abs/2108.09293}.
+
+\bibitem{siddiq2022securityeval}
+Mohammed Latif Siddiq and Joanna C. S. Santos.
+\newblock SecurityEval Dataset: Mining Vulnerability Examples to Evaluate Machine Learning-Based Code Generation Techniques.
+\newblock In \emph{Proceedings of the 1st International Workshop on Mining Software Repositories Applications for Privacy and Security}, 2022.
+\newblock \url{https://doi.org/10.1145/3549035.3561184}.
+
+\bibitem{bhatt2023cyberseceval}
+Manish Bhatt et al.
+\newblock Purple Llama CyberSecEval: A Secure Coding Benchmark for Language Models.
+\newblock \emph{arXiv preprint arXiv:2312.04724}, 2023.
+\newblock \url{https://arxiv.org/abs/2312.04724}.
+
+\bibitem{li2025safegenbench}
+Xinghang Li, Jingzhe Ding, Chao Peng, Bing Zhao, Xiang Gao, Hongwan Gao, and Xinchen Gu.
+\newblock SafeGenBench: A Benchmark Framework for Security Vulnerability Detection in LLM-Generated Code.
+\newblock \emph{arXiv preprint arXiv:2506.05692}, 2025.
+\newblock \url{https://arxiv.org/abs/2506.05692}.
+
+\bibitem{peng2025cweval}
+Chao Peng et al.
+\newblock CWEval: Outcome-Driven Evaluation on Functionality and Security of LLM Code Generation.
+\newblock \emph{arXiv preprint arXiv:2501.08200}, 2025.
+\newblock \url{https://arxiv.org/abs/2501.08200}.
+
+\bibitem{nie2025secodeplt}
+Yuzhou Nie, Zhun Wang, Yu Yang, Ruizhe Jiang, Yuheng Tang, Xander Davies, Yarin Gal, Bo Li, Wenbo Guo, and Dawn Song.
+\newblock SECODEPLT: A Unified Benchmark for Evaluating the Security Risks and Capabilities of Code Agents.
+\newblock \emph{arXiv preprint arXiv:2410.11096}, 2024.
+\newblock \url{https://arxiv.org/abs/2410.11096}.
+
+\bibitem{majdinasab2025prism}
+Vahid Majdinasab, Amin Nikanjam, and Foutse Khomh.
+\newblock Prism: Dynamic and Flexible Benchmarking of LLMs Code Generation with Monte Carlo Tree Search.
+\newblock \emph{arXiv preprint arXiv:2504.05500}, 2025.
+
+\bibitem{kocsis2006mcts}
+Levente Kocsis and Csaba Szepesvári.
+\newblock Bandit Based Monte-Carlo Planning.
+\newblock In \emph{European Conference on Machine Learning}, 2006.
+
+\bibitem{manadhataWingAttackSurface}
+Pratyusa K. Manadhata and Jeannette M. Wing.
+\newblock An Attack Surface Metric.
+\newblock Technical report, Carnegie Mellon University, 2006.
+\newblock \url{https://www.cs.cmu.edu/~wing/publications/ManadhataWing06.pdf}.
+
+\bibitem{owaspAttackSurface}
+OWASP Foundation.
+\newblock Attack Surface Analysis Cheat Sheet.
+\newblock \url{https://cheatsheetseries.owasp.org/cheatsheets/Attack_Surface_Analysis_Cheat_Sheet.html}.
+
+\bibitem{owaspThreatModeling}
+OWASP Foundation.
+\newblock Threat Modeling Process.
+\newblock \url{https://owasp.org/www-community/Threat_Modeling_Process}.
+
+\bibitem{mitreCWE}
+MITRE.
+\newblock Common Weakness Enumeration.
+\newblock \url{https://cwe.mitre.org/}. Accessed 8 May 2026.
+
+\bibitem{bandit}
+PyCQA.
+\newblock Bandit documentation.
+\newblock \url{https://bandit.readthedocs.io/}. Accessed 8 May 2026.
+
+\bibitem{semgrep}
+Semgrep.
+\newblock Semgrep documentation.
+\newblock \url{https://semgrep.dev/docs/}. Accessed 8 May 2026.
+
+\bibitem{codeql}
+GitHub.
+\newblock CodeQL documentation.
+\newblock \url{https://codeql.github.com/docs/}. Accessed 8 May 2026.
+
+\end{thebibliography}
+
+\end{document}

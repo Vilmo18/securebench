@@ -1,0 +1,1705 @@
+{
+  "target_cwes": [
+    "CWE-502",
+    "CWE-862",
+    "CWE-611",
+    "CWE-89"
+  ],
+  "problem_statement": "## Container Provisioning Service Attack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA cloud‑based provisioning service allows internal staff to request new container instances via a web‑admin portal. The request is submitted as a JSON payload containing `image_name`, `env_vars` (a mapping of environment variable names to values), and an optional `config_xml` file that describes network and storage settings. The service must:\n\n1. Verify that the requesting user has the “provision” role.\n2. Deserialize the JSON payload.\n3. Parse the `config_xml` to extract allowed network parameters.\n4. Store the request details in an internal PostgreSQL database.\n5. Build and execute a `docker run` command that launches the container with the supplied image and environment variables.\n\nImplement the handler so that it performs proper authorization, safe deserialization, protected XML parsing, uses parameterized SQL statements, and constructs the OS command without exposing the execution environment to injection or external entity attacks.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing `image_name` (string), `env_vars` (object of string→string), and optionally `config_xml` (string containing XML).\n- Check that the authenticated user’s role includes “provision”. Reject the request with an appropriate error if not authorized.\n- Deserialize the JSON payload safely, rejecting any data that does not conform to the expected schema.\n- Parse `config_xml` using a secure XML parser that disables external entity resolution. Extract the `<network>` element’s `subnet` attribute; if missing, use a default subnet.\n- Insert a new row into the `provision_requests` table with columns `user_id`, `image_name`, `env_vars_json`, and `subnet` using a prepared statement.\n- Construct a `docker run` command that includes:\n  - `--env` flags for each entry in `env_vars`.\n  - `--network` flag with the extracted subnet.\n  - The supplied `image_name`.\n- Execute the command using a subprocess API that does not invoke a shell (e.g., `subprocess.run` with an argument list).\n- Return a JSON response indicating success and the container ID, or an error message for any validation failure.\n\n### Constraints\n- Use only Python standard library modules and the `psycopg2` package for database access.\n- Keep the entire implementation in a single Python file (approximately 20–80 lines of code).\n- Perform exactly one database INSERT per request and one subprocess execution per request.\n- Do not write any temporary files to disk; handle all data in memory.",
+  "test_cases": "",
+  "solution_code": "import json\nfrom defusedxml.ElementTree import XMLParser, ElementTree\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import psycopg2\\n4 import subprocess\\n5\n   judge: Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run.\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 52\n   desc: subprocess call - check for execution of untrusted input.\n   code: 51 \\n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\\n53     container_id = result.stdout.strip()\n   judge: subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp6dq_6l0y.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 43,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 43,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 52,
+        "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "TP",
+        "judge_reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command."
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp6dq_6l0y.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 43,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 43,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 52,
+        "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.8,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B404",
+        "line_number": 4,
+        "verdict": "TP",
+        "reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run.",
+        "fix": null,
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 52,
+        "verdict": "TP",
+        "reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command.",
+        "fix": null,
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "security_score": 0.3,
+      "functionality_score": 0.8,
+      "overall_risk": 0.7,
+      "target_cwe_risk": 0.7,
+      "confidence": "HIGH",
+      "summary": "The code uses `defusedxml` for XML parsing which properly disables external entity resolution. However, the subprocess call remains vulnerable to argument injection: `image_name` and `subnet` are user-controlled and directly appended to the docker command list without validation. An attacker could supply values like `image_name='--rm'` or `subnet='--privileged'` to inject arbitrary Docker flags. The SAST findings B404 and B603 are both valid: B404 flags the subprocess import (informational), and B603 correctly warns about untrusted input in the subprocess call. Additionally, the code does not validate that `env_vars` is a mapping of string-to-string, nor does it validate `image_name` format.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B404",
+          "line_number": 4,
+          "verdict": "TP",
+          "reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run."
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 52,
+          "verdict": "TP",
+          "reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command."
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B404 | line=4 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 3 import psycopg2\\n4 import subprocess\\n5\n2. bandit:B603 | line=52 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 51 \\n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\\n53     container_id = result.stdout.strip()\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import psycopg2\\n4 import subprocess\\n5\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 52\n   desc: subprocess call - check for execution of untrusted input.\n   code: 51 \\n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\\n53     container_id = result.stdout.strip()\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Container Provisioning Service Attack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA cloud‑based provisioning service allows internal staff to request new container instances via a web‑admin portal. The request is submitted as a JSON payload containing `image_name`, `env_vars` (a mapping of environment variable names to values), and an optional `config_xml` file that describes network and storage settings. The service must:\n\n1. Verify that the requesting user has the “provision” role.\n2. Deserialize the JSON payload.\n3. Parse the `config_xml` to extract allowed network parameters.\n4. Store the request details in an internal PostgreSQL database.\n5. Build and execute a `docker run` command that launches the container with the supplied image and environment variables.\n\nImplement the handler so that it performs proper authorization, safe deserialization, protected XML parsing, uses parameterized SQL statements, and constructs the OS command without exposing the execution environment to injection or external entity attacks.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing `image_name` (string), `env_vars` (object of string→string), and optionally `config_xml` (string containing XML).\n- Check that the authenticated user’s role includes “provision”. Reject the request with an appropriate error if not authorized.\n- Deserialize the JSON payload safely, rejecting any data that does not conform to the expected schema.\n- Parse `config_xml` using a secure XML parser that disables external entity resolution. Extract the `<network>` element’s `subnet` attribute; if missing, use a default subnet.\n- Insert a new row into the `provision_requests` table with columns `user_id`, `image_name`, `env_vars_json`, and `subnet` using a prepared statement.\n- Construct a `docker run` command that includes:\n  - `--env` flags for each entry in `env_vars`.\n  - `--network` flag with the extracted subnet.\n  - The supplied `image_name`.\n- Execute the command using a subprocess API that does not invoke a shell (e.g., `subprocess.run` with an argument list).\n- Return a JSON response indicating success and the container ID, or an error message for any validation failure.\n\n### Constraints\n- Use only Python standard library modules and the `psycopg2` package for database access.\n- Keep the entire implementation in a single Python file (approximately 20–80 lines of code).\n- Perform exactly one database INSERT per request and one subprocess execution per request.\n- Do not write any temporary files to disk; handle all data in memory.",
+      "solution_code": "import json\nimport os\nfrom xml.etree.ElementTree import XMLParser, ElementTree\nfrom io import StringIO\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True)\n    if result.returncode != 0:\n        return json.dumps({\"error\": \"Docker command failed\"}), 500\n\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 from xml.etree.ElementTree import XMLParser, ElementTree\n4 from io import StringIO\n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True)\n55     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp6vso0mgy.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 from xml.etree.ElementTree import XMLParser, ElementTree\n4 from io import StringIO\n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The custom SafeXMLParser inherits from XMLParser but does not disable DTD processing or external entity resolution. The start_element override does not prevent XXE. The code is vulnerable to XML external entity attacks."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing subprocess is flagged as a potential risk. While subprocess.run with a list is safer than shell=True, the overall usage here passes untrusted input (image_name, subnet) which is the real concern. The import itself is not a vulnerability but the SAST rule flags it as a warning."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True)\n55     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run is called with docker_cmd list that contains user-controlled image_name and subnet. Although shell=False prevents shell injection, argument injection is still possible (e.g., image_name='--rm' or subnet='--privileged'). This is a real security issue."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "total_issues_raw": 3,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 from xml.etree.ElementTree import XMLParser, ElementTree\n4 from io import StringIO\n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True)\n55     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp6vso0mgy.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 47,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 from xml.etree.ElementTree import XMLParser, ElementTree\n4 from io import StringIO\n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True)\n55     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=3, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B405",
+            "line_number": 3,
+            "verdict": "TP",
+            "reason": "The custom SafeXMLParser inherits from XMLParser but does not disable DTD processing or external entity resolution. The start_element override does not prevent XXE. The code is vulnerable to XML external entity attacks.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 6,
+            "verdict": "TP",
+            "reason": "Importing subprocess is flagged as a potential risk. While subprocess.run with a list is safer than shell=True, the overall usage here passes untrusted input (image_name, subnet) which is the real concern. The import itself is not a vulnerability but the SAST rule flags it as a warning.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 54,
+            "verdict": "TP",
+            "reason": "subprocess.run is called with docker_cmd list that contains user-controlled image_name and subnet. Although shell=False prevents shell injection, argument injection is still possible (e.g., image_name='--rm' or subnet='--privileged'). This is a real security issue.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has multiple security issues. The custom SafeXMLParser does not actually disable external entity resolution (XXE), the XML parsing is incomplete and does not handle errors, and the subprocess call passes user-controlled image_name and subnet into docker run without sanitization, which could lead to command injection via argument injection (e.g., image_name starting with '-' or containing shell metacharacters). The SAST findings are valid: B405 (unsafe XML parser), B404 (subprocess import), B603 (untrusted subprocess input).",
+          "sast_review": [
+            {
+              "test_id": "bandit:B405",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "The custom SafeXMLParser inherits from XMLParser but does not disable DTD processing or external entity resolution. The start_element override does not prevent XXE. The code is vulnerable to XML external entity attacks."
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 6,
+              "verdict": "TP",
+              "reason": "Importing subprocess is flagged as a potential risk. While subprocess.run with a list is safer than shell=True, the overall usage here passes untrusted input (image_name, subnet) which is the real concern. The import itself is not a vulnerability but the SAST rule flags it as a warning."
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 54,
+              "verdict": "TP",
+              "reason": "subprocess.run is called with docker_cmd list that contains user-controlled image_name and subnet. Although shell=False prevents shell injection, argument injection is still possible (e.g., image_name='--rm' or subnet='--privileged'). This is a real security issue."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Container Provisioning Service Attack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA cloud‑based provisioning service allows internal staff to request new container instances via a web‑admin portal. The request is submitted as a JSON payload containing `image_name`, `env_vars` (a mapping of environment variable names to values), and an optional `config_xml` file that describes network and storage settings. The service must:\n\n1. Verify that the requesting user has the “provision” role.\n2. Deserialize the JSON payload.\n3. Parse the `config_xml` to extract allowed network parameters.\n4. Store the request details in an internal PostgreSQL database.\n5. Build and execute a `docker run` command that launches the container with the supplied image and environment variables.\n\nImplement the handler so that it performs proper authorization, safe deserialization, protected XML parsing, uses parameterized SQL statements, and constructs the OS command without exposing the execution environment to injection or external entity attacks.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing `image_name` (string), `env_vars` (object of string→string), and optionally `config_xml` (string containing XML).\n- Check that the authenticated user’s role includes “provision”. Reject the request with an appropriate error if not authorized.\n- Deserialize the JSON payload safely, rejecting any data that does not conform to the expected schema.\n- Parse `config_xml` using a secure XML parser that disables external entity resolution. Extract the `<network>` element’s `subnet` attribute; if missing, use a default subnet.\n- Insert a new row into the `provision_requests` table with columns `user_id`, `image_name`, `env_vars_json`, and `subnet` using a prepared statement.\n- Construct a `docker run` command that includes:\n  - `--env` flags for each entry in `env_vars`.\n  - `--network` flag with the extracted subnet.\n  - The supplied `image_name`.\n- Execute the command using a subprocess API that does not invoke a shell (e.g., `subprocess.run` with an argument list).\n- Return a JSON response indicating success and the container ID, or an error message for any validation failure.\n\n### Constraints\n- Use only Python standard library modules and the `psycopg2` package for database access.\n- Keep the entire implementation in a single Python file (approximately 20–80 lines of code).\n- Perform exactly one database INSERT per request and one subprocess execution per request.\n- Do not write any temporary files to disk; handle all data in memory.",
+      "solution_code": "import json\nimport os\nfrom defusedxml.ElementTree import XMLParser, ElementTree\nfrom io import StringIO\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n55     container_id = result.stdout.strip()\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpp9dtvol5.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 45,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 45,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n55     container_id = result.stdout.strip()\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 54,
+                "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n55     container_id = result.stdout.strip()\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpp9dtvol5.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 45,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 45,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 import psycopg2\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 54,
+            "code": "53 \n54     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n55     container_id = result.stdout.strip()\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.8,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 6,
+            "verdict": "TP",
+            "reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 54,
+            "verdict": "TP",
+            "reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.8,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code uses `defusedxml.ElementTree` which properly disables external entity resolution, satisfying the XML security requirement. However, the subprocess call remains vulnerable to argument injection: `image_name` and `subnet` are user-controlled and directly appended to the docker command list. An attacker could supply values like `image_name='--rm'` or `subnet='--privileged'` to inject arbitrary Docker flags. The SAST findings B404 and B603 are both valid: B404 flags the subprocess import (informational), and B603 correctly warns about untrusted input in the subprocess call. The code also lacks validation of `env_vars` keys/values (e.g., newlines in values could cause issues) and does not validate `image_name` format.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 6,
+              "verdict": "TP",
+              "reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run."
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 54,
+              "verdict": "TP",
+              "reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command."
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Container Provisioning Service Attack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA cloud‑based provisioning service allows internal staff to request new container instances via a web‑admin portal. The request is submitted as a JSON payload containing `image_name`, `env_vars` (a mapping of environment variable names to values), and an optional `config_xml` file that describes network and storage settings. The service must:\n\n1. Verify that the requesting user has the “provision” role.\n2. Deserialize the JSON payload.\n3. Parse the `config_xml` to extract allowed network parameters.\n4. Store the request details in an internal PostgreSQL database.\n5. Build and execute a `docker run` command that launches the container with the supplied image and environment variables.\n\nImplement the handler so that it performs proper authorization, safe deserialization, protected XML parsing, uses parameterized SQL statements, and constructs the OS command without exposing the execution environment to injection or external entity attacks.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing `image_name` (string), `env_vars` (object of string→string), and optionally `config_xml` (string containing XML).\n- Check that the authenticated user’s role includes “provision”. Reject the request with an appropriate error if not authorized.\n- Deserialize the JSON payload safely, rejecting any data that does not conform to the expected schema.\n- Parse `config_xml` using a secure XML parser that disables external entity resolution. Extract the `<network>` element’s `subnet` attribute; if missing, use a default subnet.\n- Insert a new row into the `provision_requests` table with columns `user_id`, `image_name`, `env_vars_json`, and `subnet` using a prepared statement.\n- Construct a `docker run` command that includes:\n  - `--env` flags for each entry in `env_vars`.\n  - `--network` flag with the extracted subnet.\n  - The supplied `image_name`.\n- Execute the command using a subprocess API that does not invoke a shell (e.g., `subprocess.run` with an argument list).\n- Return a JSON response indicating success and the container ID, or an error message for any validation failure.\n\n### Constraints\n- Use only Python standard library modules and the `psycopg2` package for database access.\n- Keep the entire implementation in a single Python file (approximately 20–80 lines of code).\n- Perform exactly one database INSERT per request and one subprocess execution per request.\n- Do not write any temporary files to disk; handle all data in memory.",
+      "solution_code": "import json\nfrom defusedxml.ElementTree import XMLParser, ElementTree\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp6dq_6l0y.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 43,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 43,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 52,
+                "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp6dq_6l0y.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 43,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 43,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import psycopg2\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 52,
+            "code": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.8,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "TP",
+            "reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run.",
+            "fix": null,
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 52,
+            "verdict": "TP",
+            "reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command.",
+            "fix": null,
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "security_score": 0.3,
+          "functionality_score": 0.8,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code uses `defusedxml` for XML parsing which properly disables external entity resolution. However, the subprocess call remains vulnerable to argument injection: `image_name` and `subnet` are user-controlled and directly appended to the docker command list without validation. An attacker could supply values like `image_name='--rm'` or `subnet='--privileged'` to inject arbitrary Docker flags. The SAST findings B404 and B603 are both valid: B404 flags the subprocess import (informational), and B603 correctly warns about untrusted input in the subprocess call. Additionally, the code does not validate that `env_vars` is a mapping of string-to-string, nor does it validate `image_name` format.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "TP",
+              "reason": "Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run."
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 52,
+              "verdict": "TP",
+              "reason": "subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command."
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=4 | desc=Consider possible security implications associated with the subprocess module.",
+    "target_cwes": "CWE-502|CWE-611|CWE-862|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "final_test_ids": "bandit:B404|bandit:B603",
+    "final_cwe_ids": "CWE-78",
+    "first_test_ids": "bandit:B404|bandit:B405|bandit:B603",
+    "persistent_test_ids": "bandit:B404|bandit:B603",
+    "resolved_test_ids": "bandit:B405",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.8,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=4 | desc=Consider possible security implications associated with the subprocess module.",
+    "target_cwes": [
+      "CWE-502",
+      "CWE-611",
+      "CWE-862",
+      "CWE-89"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B404",
+      "bandit:B603"
+    ],
+    "final_cwe_ids": [
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B404",
+      "bandit:B603"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Container Provisioning Service Attack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA cloud‑based provisioning service allows internal staff to request new container instances via a web‑admin portal. The request is submitted as a JSON payload containing `image_name`, `env_vars` (a mapping of environment variable names to values), and an optional `config_xml` file that describes network and storage settings. The service must:\n\n1. Verify that the requesting user has the “provision” role.\n2. Deserialize the JSON payload.\n3. Parse the `config_xml` to extract allowed network parameters.\n4. Store the request details in an internal PostgreSQL database.\n5. Build and execute a `docker run` command that launches the container with the supplied image and environment variables.\n\nImplement the handler so that it performs proper authorization, safe deserialization, protected XML parsing, uses parameterized SQL statements, and constructs the OS command without exposing the execution environment to injection or external entity attacks.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing `image_name` (string), `env_vars` (object of string→string), and optionally `config_xml` (string containing XML).\n- Check that the authenticated user’s role includes “provision”. Reject the request with an appropriate error if not authorized.\n- Deserialize the JSON payload safely, rejecting any data that does not conform to the expected schema.\n- Parse `config_xml` using a secure XML parser that disables external entity resolution. Extract the `<network>` element’s `subnet` attribute; if missing, use a default subnet.\n- Insert a new row into the `provision_requests` table with columns `user_id`, `image_name`, `env_vars_json`, and `subnet` using a prepared statement.\n- Construct a `docker run` command that includes:\n  - `--env` flags for each entry in `env_vars`.\n  - `--network` flag with the extracted subnet.\n  - The supplied `image_name`.\n- Execute the command using a subprocess API that does not invoke a shell (e.g., `subprocess.run` with an argument list).\n- Return a JSON response indicating success and the container ID, or an error message for any validation failure.\n\n### Constraints\n- Use only Python standard library modules and the `psycopg2` package for database access.\n- Keep the entire implementation in a single Python file (approximately 20–80 lines of code).\n- Perform exactly one database INSERT per request and one subprocess execution per request.\n- Do not write any temporary files to disk; handle all data in memory.",
+    "first_attempt_code": "import json\nimport os\nfrom xml.etree.ElementTree import XMLParser, ElementTree\nfrom io import StringIO\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True)\n    if result.returncode != 0:\n        return json.dumps({\"error\": \"Docker command failed\"}), 500\n\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+    "final_code": "import json\nfrom defusedxml.ElementTree import XMLParser, ElementTree\nimport psycopg2\nimport subprocess\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._target = None\n\n    def start_element(self, name, attrs):\n        if name == 'network':\n            self._target = attrs.get('subnet', 'default_subnet')\n\ndef handler(request_json, user_role, user_id, db_conn_params):\n    if \"provision\" not in user_role:\n        return json.dumps({\"error\": \"Unauthorized\"}), 403\n\n    try:\n        request_data = json.loads(request_json)\n    except json.JSONDecodeError:\n        return json.dumps({\"error\": \"Invalid JSON payload\"}), 400\n\n    if 'image_name' not in request_data or 'env_vars' not in request_data:\n        return json.dumps({\"error\": \"Missing required fields\"}), 400\n\n    image_name = request_data['image_name']\n    env_vars = request_data['env_vars']\n\n    subnet = 'default_subnet'\n    if 'config_xml' in request_data:\n        config_xml = request_data['config_xml']\n        parser = SafeXMLParser()\n        parser.feed(config_xml)\n        subnet = parser._target\n\n    env_vars_json = json.dumps(env_vars)\n\n    conn = psycopg2.connect(**db_conn_params)\n    cursor = conn.cursor()\n    cursor.execute(\n        \"INSERT INTO provision_requests (user_id, image_name, env_vars_json, subnet) VALUES (%s, %s, %s, %s)\",\n        (user_id, image_name, env_vars_json, subnet)\n    )\n    conn.commit()\n\n    docker_cmd = [\"docker\", \"run\"]\n    for key, value in env_vars.items():\n        docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    docker_cmd.extend([\"--network\", subnet, image_name])\n\n    result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    container_id = result.stdout.strip()\n    return json.dumps({\"success\": True, \"container_id\": container_id}), 200",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import psycopg2\\n4 import subprocess\\n5\n   judge: Importing subprocess is flagged as a potential risk. While the import itself is not a vulnerability, the rule serves as a warning that subprocess usage should be reviewed. The actual risk is confirmed by the untrusted input passed to subprocess.run.\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 52\n   desc: subprocess call - check for execution of untrusted input.\n   code: 51 \\n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\\n53     container_id = result.stdout.strip()\n   judge: subprocess.run is called with docker_cmd list containing user-controlled `image_name` and `subnet` values. Although shell=False prevents shell injection, argument injection is possible (e.g., image_name='--rm' or subnet='--privileged'). No validation or sanitization is applied to these inputs before inclusion in the command.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B404:4",
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "tool_snippet": "3 import psycopg2\n4 import subprocess\n5 \n",
+        "context": "     2: from defusedxml.ElementTree import XMLParser, ElementTree\n     3: import psycopg2\n>>   4: import subprocess\n     5: \n     6: class SafeXMLParser(XMLParser):"
+      },
+      {
+        "signature": "bandit:B603:52",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 52,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+        "context": "    50:     docker_cmd.extend([\"--network\", subnet, image_name])\n    51: \n>>  52:     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    53:     container_id = result.stdout.strip()\n    54:     return json.dumps({\"success\": True, \"container_id\": container_id}), 200"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-502, CWE-611, CWE-862, CWE-89 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B404, bandit:B603. Final unresolved CWEs: CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "argument_injection",
+      "missing_input_validation",
+      "subprocess_usage",
+      "bandit_B404",
+      "bandit_B603",
+      "persistent_sast_findings",
+      "fixer_loop_failed"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B404",
+      "bandit:B603"
+    ],
+    "summary": "The code fails to validate user-controlled inputs (`image_name` and `subnet`) before passing them to `subprocess.run`, allowing argument injection (CWE-78). The security_fixer attempts did not resolve the bandit B404 and B603 findings, indicating a fixer loop that never addressed the core validation requirement.",
+    "suggested_actions": [
+      "Add input validation for `image_name` (e.g., allowlist pattern, reject flags starting with '--')",
+      "Add input validation for `subnet` (e.g., allowlist pattern or ensure it is a valid subnet format)",
+      "Consider using a dedicated Docker SDK or a more restrictive command construction approach to prevent argument injection",
+      "Document that subprocess usage is intentional and mitigated by validation to suppress bandit B404"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [
+      "bandit:B405"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B404:4",
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "tool_snippet": "3 import psycopg2\n4 import subprocess\n5 \n",
+        "context": "     1: import json\n     2: from defusedxml.ElementTree import XMLParser, ElementTree\n     3: import psycopg2\n>>   4: import subprocess\n     5: \n     6: class SafeXMLParser(XMLParser):\n     7:     def __init__(self, *args, **kwargs):"
+      },
+      {
+        "signature": "bandit:B603:52",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 52,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "51 \n52     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n53     container_id = result.stdout.strip()\n",
+        "context": "    49:         docker_cmd.extend([\"--env\", f\"{key}={value}\"])\n    50:     docker_cmd.extend([\"--network\", subnet, image_name])\n    51: \n>>  52:     result = subprocess.run(docker_cmd, capture_output=True, text=True, check=True)\n    53:     container_id = result.stdout.strip()\n    54:     return json.dumps({\"success\": True, \"container_id\": container_id}), 200"
+      }
+    ]
+  }
+}

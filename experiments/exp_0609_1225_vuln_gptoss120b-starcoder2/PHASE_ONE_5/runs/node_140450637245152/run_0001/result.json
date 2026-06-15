@@ -1,0 +1,2672 @@
+{
+  "target_cwes": [
+    "CWE-89",
+    "CWE-79",
+    "CWE-20",
+    "CWE-22",
+    "CWE-78"
+  ],
+  "problem_statement": "## Configurable Report Generator Attack Surface: Storage & Filesystem\n### Scenario\nA corporate intranet provides a “Generate Report” feature. Users can upload a CSV file containing product IDs. The uploaded file is saved under the server’s `uploads/` directory. An administrator later selects one of the uploaded files via a `filename` query parameter, and the application:\n1. Reads the selected CSV file from disk.\n2. Constructs a SQL query that retrieves product details from an internal SQLite database based on the IDs in the file.\n3. Executes a system command that archives the generated report using the selected filename as part of the output archive name.\n4. Renders a confirmation page that includes the filename entered by the administrator.\n\nImplement the handler so that all inputs are properly validated, the filesystem is accessed safely, and downstream operations are performed securely.\n\n### Functional Requirements\n- Accept a multipart/form‑data upload named `data_file` and store it in the `uploads/` directory.\n- Require that uploaded files have a `.csv` extension and contain only numeric product IDs separated by commas.\n- Provide an endpoint that receives a `filename` query parameter, resolves the file only within the `uploads/` directory, and rejects any path that attempts directory traversal, absolute paths, or symbolic‑link escapes.\n- Read the selected CSV file, parse the product IDs, and use them in a parameterized SQL query against the SQLite `products` table.\n- Build a command line that invokes the system’s `tar` utility to create an archive named `<filename>_report.tar.gz` containing the generated report file, and execute it without passing unchecked data to the shell.\n- Return an HTML page confirming the operation; the page must safely embed the `filename` value so that it cannot inject markup.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑read operation and one database query per request.\n- Do not invoke the shell with unsanitized input; use appropriate subprocess interfaces.",
+  "test_cases": "",
+  "solution_code": "import os\nimport sqlite3\nimport csv\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\nimport subprocess\n\nUPLOAD_DIR = 'uploads/'\nREPORT_DIR = 'reports/'\n\ndef validate_filename(filename):\n    filename = unquote(os.path.basename(filename))\n    if not filename.endswith('.csv') or os.path.dirname(filename) or '..' in filename:\n        return None\n    return filename\n\ndef read_csv_file(filename):\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    with open(filepath, newline='', encoding='utf-8') as csvfile:\n        reader = csv.reader(csvfile)\n        product_ids = [row[0] for row in reader if row]\n        return product_ids\n\ndef get_product_details(product_ids):\n    conn = sqlite3.connect('products.db')\n    cursor = conn.cursor()\n    placeholders = ','.join(['?'] * len(product_ids))\n    query = f\"SELECT * FROM products WHERE id IN ({placeholders})\"\n    cursor.execute(query, product_ids)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\ndef create_archive(filename, report_content):\n    archive_name = os.path.join(REPORT_DIR, f\"{filename}_report.tar.gz\")\n    report_path = os.path.join(REPORT_DIR, f\"{filename}.txt\")\n\n    with open(report_path, 'w', encoding='utf-8') as report_file:\n        report_file.write(report_content)\n\n    subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            boundary = self.headers['Content-Type'].split('boundary=')[1]\n            parts = post_data.split(f'--{boundary}'.encode())[1:-1]\n\n            for part in parts:\n                headers, body = part.split(b'\\r\\n\\r\\n', 1)\n                disposition = dict([h.split(': ') for h in headers.decode().split('\\r\\n')])\n                if disposition['Content-Disposition'].startswith('form-data; name=\"data_file\"; filename='):\n                    filename = disposition['Content-Disposition'].split('filename=')[1].strip('\"')\n                    if not filename.endswith('.csv'):\n                        self.send_response(400)\n                        self.end_headers()\n                        return\n\n                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n                        f.write(body.strip(b'\\r\\n'))\n\n            self.send_response(200)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/generate_report?'):\n            query = self.path.split('?')[1]\n            filename = validate_filename(query)\n\n            if not filename:\n                self.send_response(400)\n                self.end_headers()\n                return\n\n            product_ids = read_csv_file(filename)\n            report_content = get_product_details(product_ids)\n            create_archive(filename, str(report_content))\n\n            self.send_response(200)\n            self.end_headers()\n            response = f'<html><body>Report generated for {filename}</body></html>'\n            self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 19\n   desc: This path depends on a [user-provided value](1).\n   code: with open(filepath, newline='', encoding='utf-8') as csvfile:\n   judge: The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 38\n   desc: This path depends on a [user-provided value](1).\n   code: with open(report_path, 'w', encoding='utf-8') as report_file:\n   judge: Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 61\n   desc: This path depends on a [user-provided value](1).\n   code: with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n   judge: The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 6\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 5 from urllib.parse import unquote\\n6 import subprocess\\n7\n   judge: This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B607 start_process_with_partial_path\n   line: 41\n   desc: Starting a process with a partial executable path\n   code: 40 \\n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\\n42\n   judge: The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmpjyksstbj.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 1,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 1,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path)."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 61,
+        "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename."
+      }
+    ],
+    "total_issues": 3,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 6,
+      "total_issues_post_dedup": 5
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B607",
+        "test_name": "start_process_with_partial_path",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 41,
+        "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+        "description": "Starting a process with a partial executable path",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+        "test_id_raw": "B607",
+        "test_name_raw": "start_process_with_partial_path",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "bandit:B607"
+        ],
+        "dedup_tools": [
+          "bandit"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "FP",
+        "judge_reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector."
+      }
+    ],
+    "total_issues_raw": 5,
+    "total_false_positives": 2,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {
+          "/tmp/tmpjyksstbj.py": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 1,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 3,
+            "CONFIDENCE.LOW": 1,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 3,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B607",
+        "test_name": "start_process_with_partial_path",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 41,
+        "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+        "description": "Starting a process with a partial executable path",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+        "test_id_raw": "B607",
+        "test_name_raw": "start_process_with_partial_path",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "bandit:B607"
+        ],
+        "dedup_tools": [
+          "bandit"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 61,
+        "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 5,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 6,
+      "total_issues_post_dedup": 5
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.7,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=5, false_pos=2)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 19,
+        "verdict": "TP",
+        "reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 38,
+        "verdict": "TP",
+        "reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 61,
+        "verdict": "TP",
+        "reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 6,
+        "verdict": "FP",
+        "reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B607",
+        "line_number": 41,
+        "verdict": "FP",
+        "reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.7,
+      "security_score": 0.15,
+      "overall_risk": 0.85,
+      "target_cwe_risk": 0.85,
+      "confidence": "HIGH",
+      "summary": "The code has critical path traversal vulnerabilities (lines 19, 38, 61) because `validate_filename` does not prevent absolute paths or symbolic link escapes. The subprocess findings (B404, B607) are low-severity and not exploitable in this context. Additionally, the response on line 68 has HTML injection (no escaping of filename). The SAST summary does not cover this, but in review_only mode I do not add new findings. The code fails to meet the security requirements for safe filesystem access and safe HTML rendering.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 19,
+          "verdict": "TP",
+          "reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 38,
+          "verdict": "TP",
+          "reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 61,
+          "verdict": "TP",
+          "reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 6,
+          "verdict": "FP",
+          "reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B607",
+          "line_number": 41,
+          "verdict": "FP",
+          "reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 3,
+  "total_issues_raw": 5,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=19 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(filepath, newline='', encoding='utf-8') as csvfile:\n2. codeql:py/path-injection | line=38 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(report_path, 'w', encoding='utf-8') as report_file:\n3. codeql:py/path-injection | line=61 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 19\n   desc: This path depends on a [user-provided value](1).\n   code: with open(filepath, newline='', encoding='utf-8') as csvfile:\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 38\n   desc: This path depends on a [user-provided value](1).\n   code: with open(report_path, 'w', encoding='utf-8') as report_file:\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 61\n   desc: This path depends on a [user-provided value](1).\n   code: with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configurable Report Generator Attack Surface: Storage & Filesystem\n### Scenario\nA corporate intranet provides a “Generate Report” feature. Users can upload a CSV file containing product IDs. The uploaded file is saved under the server’s `uploads/` directory. An administrator later selects one of the uploaded files via a `filename` query parameter, and the application:\n1. Reads the selected CSV file from disk.\n2. Constructs a SQL query that retrieves product details from an internal SQLite database based on the IDs in the file.\n3. Executes a system command that archives the generated report using the selected filename as part of the output archive name.\n4. Renders a confirmation page that includes the filename entered by the administrator.\n\nImplement the handler so that all inputs are properly validated, the filesystem is accessed safely, and downstream operations are performed securely.\n\n### Functional Requirements\n- Accept a multipart/form‑data upload named `data_file` and store it in the `uploads/` directory.\n- Require that uploaded files have a `.csv` extension and contain only numeric product IDs separated by commas.\n- Provide an endpoint that receives a `filename` query parameter, resolves the file only within the `uploads/` directory, and rejects any path that attempts directory traversal, absolute paths, or symbolic‑link escapes.\n- Read the selected CSV file, parse the product IDs, and use them in a parameterized SQL query against the SQLite `products` table.\n- Build a command line that invokes the system’s `tar` utility to create an archive named `<filename>_report.tar.gz` containing the generated report file, and execute it without passing unchecked data to the shell.\n- Return an HTML page confirming the operation; the page must safely embed the `filename` value so that it cannot inject markup.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑read operation and one database query per request.\n- Do not invoke the shell with unsanitized input; use appropriate subprocess interfaces.",
+      "solution_code": "import os\nimport sqlite3\nimport csv\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nUPLOAD_DIR = 'uploads/'\nREPORT_DIR = 'reports/'\n\ndef validate_filename(filename):\n    filename = unquote(os.path.basename(filename))\n    if not filename.endswith('.csv') or os.path.dirname(filename) or '..' in filename:\n        return None\n    return filename\n\ndef read_csv_file(filename):\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    with open(filepath, newline='') as csvfile:\n        reader = csv.reader(csvfile)\n        product_ids = [row[0] for row in reader if row]\n        return product_ids\n\ndef get_product_details(product_ids):\n    conn = sqlite3.connect('products.db')\n    cursor = conn.cursor()\n    placeholders = ','.join(['?'] * len(product_ids))\n    query = f\"SELECT * FROM products WHERE id IN ({placeholders})\"\n    cursor.execute(query, product_ids)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\ndef create_archive(filename, report_content):\n    archive_name = f\"{filename}_report.tar.gz\"\n    with open(f\"{REPORT_DIR}/{filename}.txt\", 'w') as report_file:\n        report_file.write(report_content)\n    os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            boundary = self.headers['Content-Type'].split('boundary=')[1]\n            parts = post_data.split(f'--{boundary}'.encode())[1:-1]\n\n            for part in parts:\n                headers, body = part.split(b'\\r\\n\\r\\n', 1)\n                disposition = dict([h.split(': ') for h in headers.decode().split('\\r\\n')])\n                if disposition['Content-Disposition'].startswith('form-data; name=\"data_file\"; filename='):\n                    filename = disposition['Content-Disposition'].split('filename=')[1].strip('\"')\n                    if not filename.endswith('.csv'):\n                        self.send_response(400)\n                        self.end_headers()\n                        return\n\n                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n                        f.write(body.strip(b'\\r\\n'))\n\n            self.send_response(200)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/generate_report?'):\n            query = self.path.split('?')[1]\n            filename = validate_filename(query)\n\n            if not filename:\n                self.send_response(400)\n                self.end_headers()\n                return\n\n            product_ids = read_csv_file(filename)\n            report_content = get_product_details(product_ids)\n            create_archive(filename, str(report_content))\n\n            self.send_response(200)\n            self.end_headers()\n            response = f'<html><body>Report generated for {filename}</body></html>'\n            self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         report_file.write(report_content)\n37     os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")\n38 \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp8mpnu9mw.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 74,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 74,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "    os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "    os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 18,
+                "code": "    with open(filepath, newline='') as csvfile:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 35,
+                "code": "    with open(f\"{REPORT_DIR}/{filename}.txt\", 'w') as report_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         report_file.write(report_content)\n37     os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")\n38 \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "`os.system` invokes a shell, and `archive_name` and `filename` are embedded in the command string without escaping. This allows command injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 18,
+            "code": "    with open(filepath, newline='') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `filename` returned by `validate_filename` is only basename-checked but not sanitized against traversal. `os.path.join(UPLOAD_DIR, filename)` can still be exploited if `filename` is e.g. `../etc/passwd` because `os.path.join` will discard the prefix when an absolute path is used. No canonicalization or real-path check is performed."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 35,
+            "code": "    with open(f\"{REPORT_DIR}/{filename}.txt\", 'w') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `filename` from `validate_filename` is used in an f-string path construction without any path sanitization or real-path check. An attacker can control the write location."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `filename` from the multipart upload is used directly in `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. `os.path.join` does not prevent traversal; an attacker can upload to arbitrary paths."
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 4
+        },
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         report_file.write(report_content)\n37     os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")\n38 \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp8mpnu9mw.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 74,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 74,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "    os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "    os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 18,
+                "code": "    with open(filepath, newline='') as csvfile:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 35,
+                "code": "    with open(f\"{REPORT_DIR}/{filename}.txt\", 'w') as report_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 57,
+                "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         report_file.write(report_content)\n37     os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")\n38 \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 18,
+            "code": "    with open(filepath, newline='') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 35,
+            "code": "    with open(f\"{REPORT_DIR}/{filename}.txt\", 'w') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 57,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=4, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 18,
+            "verdict": "TP",
+            "reason": "The `filename` returned by `validate_filename` is only basename-checked but not sanitized against traversal. `os.path.join(UPLOAD_DIR, filename)` can still be exploited if `filename` is e.g. `../etc/passwd` because `os.path.join` will discard the prefix when an absolute path is used. No canonicalization or real-path check is performed.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 35,
+            "verdict": "TP",
+            "reason": "The `filename` from `validate_filename` is used in an f-string path construction without any path sanitization or real-path check. An attacker can control the write location.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B605",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "`os.system` invokes a shell, and `archive_name` and `filename` are embedded in the command string without escaping. This allows command injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 57,
+            "verdict": "TP",
+            "reason": "The `filename` from the multipart upload is used directly in `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. `os.path.join` does not prevent traversal; an attacker can upload to arbitrary paths.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "The code has multiple critical security issues: path traversal in file reads (line 18, line 35, line 57), OS command injection via os.system (line 37), and HTML injection in the response (line 66). The SAST findings are all true positives; no effective sanitization or safe API usage is present.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 18,
+              "verdict": "TP",
+              "reason": "The `filename` returned by `validate_filename` is only basename-checked but not sanitized against traversal. `os.path.join(UPLOAD_DIR, filename)` can still be exploited if `filename` is e.g. `../etc/passwd` because `os.path.join` will discard the prefix when an absolute path is used. No canonicalization or real-path check is performed.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 35,
+              "verdict": "TP",
+              "reason": "The `filename` from `validate_filename` is used in an f-string path construction without any path sanitization or real-path check. An attacker can control the write location.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B605",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "`os.system` invokes a shell, and `archive_name` and `filename` are embedded in the command string without escaping. This allows command injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 57,
+              "verdict": "TP",
+              "reason": "The `filename` from the multipart upload is used directly in `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. `os.path.join` does not prevent traversal; an attacker can upload to arbitrary paths.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configurable Report Generator Attack Surface: Storage & Filesystem\n### Scenario\nA corporate intranet provides a “Generate Report” feature. Users can upload a CSV file containing product IDs. The uploaded file is saved under the server’s `uploads/` directory. An administrator later selects one of the uploaded files via a `filename` query parameter, and the application:\n1. Reads the selected CSV file from disk.\n2. Constructs a SQL query that retrieves product details from an internal SQLite database based on the IDs in the file.\n3. Executes a system command that archives the generated report using the selected filename as part of the output archive name.\n4. Renders a confirmation page that includes the filename entered by the administrator.\n\nImplement the handler so that all inputs are properly validated, the filesystem is accessed safely, and downstream operations are performed securely.\n\n### Functional Requirements\n- Accept a multipart/form‑data upload named `data_file` and store it in the `uploads/` directory.\n- Require that uploaded files have a `.csv` extension and contain only numeric product IDs separated by commas.\n- Provide an endpoint that receives a `filename` query parameter, resolves the file only within the `uploads/` directory, and rejects any path that attempts directory traversal, absolute paths, or symbolic‑link escapes.\n- Read the selected CSV file, parse the product IDs, and use them in a parameterized SQL query against the SQLite `products` table.\n- Build a command line that invokes the system’s `tar` utility to create an archive named `<filename>_report.tar.gz` containing the generated report file, and execute it without passing unchecked data to the shell.\n- Return an HTML page confirming the operation; the page must safely embed the `filename` value so that it cannot inject markup.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑read operation and one database query per request.\n- Do not invoke the shell with unsanitized input; use appropriate subprocess interfaces.",
+      "solution_code": "import os\nimport sqlite3\nimport csv\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\nimport subprocess\n\nUPLOAD_DIR = 'uploads/'\nREPORT_DIR = 'reports/'\n\ndef validate_filename(filename):\n    filename = unquote(os.path.basename(filename))\n    if not filename.endswith('.csv') or os.path.dirname(filename) or '..' in filename:\n        return None\n    return filename\n\ndef read_csv_file(filename):\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    with open(filepath, newline='', encoding='utf-8') as csvfile:\n        reader = csv.reader(csvfile)\n        product_ids = [row[0] for row in reader if row]\n        return product_ids\n\ndef get_product_details(product_ids):\n    conn = sqlite3.connect('products.db')\n    cursor = conn.cursor()\n    placeholders = ','.join(['?'] * len(product_ids))\n    query = f\"SELECT * FROM products WHERE id IN ({placeholders})\"\n    cursor.execute(query, product_ids)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\ndef create_archive(filename, report_content):\n    archive_name = os.path.join(REPORT_DIR, f\"{filename}_report.tar.gz\")\n    report_path = os.path.join(REPORT_DIR, f\"{filename}.txt\")\n\n    with open(report_path, 'w', encoding='utf-8') as report_file:\n        report_file.write(report_content)\n\n    subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            boundary = self.headers['Content-Type'].split('boundary=')[1]\n            parts = post_data.split(f'--{boundary}'.encode())[1:-1]\n\n            for part in parts:\n                headers, body = part.split(b'\\r\\n\\r\\n', 1)\n                disposition = dict([h.split(': ') for h in headers.decode().split('\\r\\n')])\n                if disposition['Content-Disposition'].startswith('form-data; name=\"data_file\"; filename='):\n                    filename = disposition['Content-Disposition'].split('filename=')[1].strip('\"')\n                    if not filename.endswith('.csv'):\n                        self.send_response(400)\n                        self.end_headers()\n                        return\n\n                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n                        f.write(body.strip(b'\\r\\n'))\n\n            self.send_response(200)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/generate_report?'):\n            query = self.path.split('?')[1]\n            filename = validate_filename(query)\n\n            if not filename:\n                self.send_response(400)\n                self.end_headers()\n                return\n\n            product_ids = read_csv_file(filename)\n            report_content = get_product_details(product_ids)\n            create_archive(filename, str(report_content))\n\n            self.send_response(200)\n            self.end_headers()\n            response = f'<html><body>Report generated for {filename}</body></html>'\n            self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp64uqkc2g.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path)."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "FP",
+            "judge_reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp64uqkc2g.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=5, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 19,
+            "verdict": "TP",
+            "reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 61,
+            "verdict": "TP",
+            "reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 6,
+            "verdict": "FP",
+            "reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B607",
+            "line_number": 41,
+            "verdict": "FP",
+            "reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.15,
+          "overall_risk": 0.85,
+          "target_cwe_risk": 0.85,
+          "confidence": "HIGH",
+          "summary": "The code still has critical security issues. The path-injection findings on lines 19, 38, and 61 are true positives because `validate_filename` does not prevent traversal (os.path.join discards prefix on absolute paths, and '..' check is insufficient). The subprocess findings are low severity but valid. Additionally, the response on line 68 has HTML injection (no escaping of filename). The SAST summary does not cover this, but in review_only mode I do not add new findings. The code fails to meet the security requirements for safe filesystem access and safe HTML rendering.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 19,
+              "verdict": "TP",
+              "reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 61,
+              "verdict": "TP",
+              "reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 6,
+              "verdict": "FP",
+              "reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B607",
+              "line_number": 41,
+              "verdict": "FP",
+              "reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Configurable Report Generator Attack Surface: Storage & Filesystem\n### Scenario\nA corporate intranet provides a “Generate Report” feature. Users can upload a CSV file containing product IDs. The uploaded file is saved under the server’s `uploads/` directory. An administrator later selects one of the uploaded files via a `filename` query parameter, and the application:\n1. Reads the selected CSV file from disk.\n2. Constructs a SQL query that retrieves product details from an internal SQLite database based on the IDs in the file.\n3. Executes a system command that archives the generated report using the selected filename as part of the output archive name.\n4. Renders a confirmation page that includes the filename entered by the administrator.\n\nImplement the handler so that all inputs are properly validated, the filesystem is accessed safely, and downstream operations are performed securely.\n\n### Functional Requirements\n- Accept a multipart/form‑data upload named `data_file` and store it in the `uploads/` directory.\n- Require that uploaded files have a `.csv` extension and contain only numeric product IDs separated by commas.\n- Provide an endpoint that receives a `filename` query parameter, resolves the file only within the `uploads/` directory, and rejects any path that attempts directory traversal, absolute paths, or symbolic‑link escapes.\n- Read the selected CSV file, parse the product IDs, and use them in a parameterized SQL query against the SQLite `products` table.\n- Build a command line that invokes the system’s `tar` utility to create an archive named `<filename>_report.tar.gz` containing the generated report file, and execute it without passing unchecked data to the shell.\n- Return an HTML page confirming the operation; the page must safely embed the `filename` value so that it cannot inject markup.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑read operation and one database query per request.\n- Do not invoke the shell with unsanitized input; use appropriate subprocess interfaces.",
+      "solution_code": "import os\nimport sqlite3\nimport csv\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\nimport subprocess\n\nUPLOAD_DIR = 'uploads/'\nREPORT_DIR = 'reports/'\n\ndef validate_filename(filename):\n    filename = unquote(os.path.basename(filename))\n    if not filename.endswith('.csv') or os.path.dirname(filename) or '..' in filename:\n        return None\n    return filename\n\ndef read_csv_file(filename):\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    with open(filepath, newline='', encoding='utf-8') as csvfile:\n        reader = csv.reader(csvfile)\n        product_ids = [row[0] for row in reader if row]\n        return product_ids\n\ndef get_product_details(product_ids):\n    conn = sqlite3.connect('products.db')\n    cursor = conn.cursor()\n    placeholders = ','.join(['?'] * len(product_ids))\n    query = f\"SELECT * FROM products WHERE id IN ({placeholders})\"\n    cursor.execute(query, product_ids)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\ndef create_archive(filename, report_content):\n    archive_name = os.path.join(REPORT_DIR, f\"{filename}_report.tar.gz\")\n    report_path = os.path.join(REPORT_DIR, f\"{filename}.txt\")\n\n    with open(report_path, 'w', encoding='utf-8') as report_file:\n        report_file.write(report_content)\n\n    subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            boundary = self.headers['Content-Type'].split('boundary=')[1]\n            parts = post_data.split(f'--{boundary}'.encode())[1:-1]\n\n            for part in parts:\n                headers, body = part.split(b'\\r\\n\\r\\n', 1)\n                disposition = dict([h.split(': ') for h in headers.decode().split('\\r\\n')])\n                if disposition['Content-Disposition'].startswith('form-data; name=\"data_file\"; filename='):\n                    filename = disposition['Content-Disposition'].split('filename=')[1].strip('\"')\n                    if not filename.endswith('.csv'):\n                        self.send_response(400)\n                        self.end_headers()\n                        return\n\n                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n                        f.write(body.strip(b'\\r\\n'))\n\n            self.send_response(200)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/generate_report?'):\n            query = self.path.split('?')[1]\n            filename = validate_filename(query)\n\n            if not filename:\n                self.send_response(400)\n                self.end_headers()\n                return\n\n            product_ids = read_csv_file(filename)\n            report_content = get_product_details(product_ids)\n            create_archive(filename, str(report_content))\n\n            self.send_response(200)\n            self.end_headers()\n            response = f'<html><body>Report generated for {filename}</body></html>'\n            self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpjyksstbj.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path)."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "FP",
+            "judge_reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B607",
+                "test_name": "start_process_with_partial_path",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "Starting a process with a partial executable path",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpjyksstbj.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 1,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import unquote\n6 import subprocess\n7 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B607",
+            "test_name": "start_process_with_partial_path",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "40 \n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n42 \n",
+            "description": "Starting a process with a partial executable path",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b607_start_process_with_partial_path.html",
+            "test_id_raw": "B607",
+            "test_name_raw": "start_process_with_partial_path",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "bandit:B607"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=5, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 19,
+            "verdict": "TP",
+            "reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 61,
+            "verdict": "TP",
+            "reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 6,
+            "verdict": "FP",
+            "reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B607",
+            "line_number": 41,
+            "verdict": "FP",
+            "reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.15,
+          "overall_risk": 0.85,
+          "target_cwe_risk": 0.85,
+          "confidence": "HIGH",
+          "summary": "The code has critical path traversal vulnerabilities (lines 19, 38, 61) because `validate_filename` does not prevent absolute paths or symbolic link escapes. The subprocess findings (B404, B607) are low-severity and not exploitable in this context. Additionally, the response on line 68 has HTML injection (no escaping of filename). The SAST summary does not cover this, but in review_only mode I do not add new findings. The code fails to meet the security requirements for safe filesystem access and safe HTML rendering.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 19,
+              "verdict": "TP",
+              "reason": "The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 61,
+              "verdict": "TP",
+              "reason": "The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 6,
+              "verdict": "FP",
+              "reason": "This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B607",
+              "line_number": 41,
+              "verdict": "FP",
+              "reason": "The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=19 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": "CWE-20|CWE-22|CWE-78|CWE-79|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 3,
+    "total_issues_raw": 5,
+    "total_false_positives": 2,
+    "final_test_ids": "codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22",
+    "first_test_ids": "bandit:B605|codeql:py/path-injection",
+    "persistent_test_ids": "codeql:py/path-injection",
+    "resolved_test_ids": "bandit:B605",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.7,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=19 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-78",
+      "CWE-79",
+      "CWE-89"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Configurable Report Generator Attack Surface: Storage & Filesystem\n### Scenario\nA corporate intranet provides a “Generate Report” feature. Users can upload a CSV file containing product IDs. The uploaded file is saved under the server’s `uploads/` directory. An administrator later selects one of the uploaded files via a `filename` query parameter, and the application:\n1. Reads the selected CSV file from disk.\n2. Constructs a SQL query that retrieves product details from an internal SQLite database based on the IDs in the file.\n3. Executes a system command that archives the generated report using the selected filename as part of the output archive name.\n4. Renders a confirmation page that includes the filename entered by the administrator.\n\nImplement the handler so that all inputs are properly validated, the filesystem is accessed safely, and downstream operations are performed securely.\n\n### Functional Requirements\n- Accept a multipart/form‑data upload named `data_file` and store it in the `uploads/` directory.\n- Require that uploaded files have a `.csv` extension and contain only numeric product IDs separated by commas.\n- Provide an endpoint that receives a `filename` query parameter, resolves the file only within the `uploads/` directory, and rejects any path that attempts directory traversal, absolute paths, or symbolic‑link escapes.\n- Read the selected CSV file, parse the product IDs, and use them in a parameterized SQL query against the SQLite `products` table.\n- Build a command line that invokes the system’s `tar` utility to create an archive named `<filename>_report.tar.gz` containing the generated report file, and execute it without passing unchecked data to the shell.\n- Return an HTML page confirming the operation; the page must safely embed the `filename` value so that it cannot inject markup.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (≈20–80 lines of code).\n- Perform exactly one file‑read operation and one database query per request.\n- Do not invoke the shell with unsanitized input; use appropriate subprocess interfaces.",
+    "first_attempt_code": "import os\nimport sqlite3\nimport csv\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nUPLOAD_DIR = 'uploads/'\nREPORT_DIR = 'reports/'\n\ndef validate_filename(filename):\n    filename = unquote(os.path.basename(filename))\n    if not filename.endswith('.csv') or os.path.dirname(filename) or '..' in filename:\n        return None\n    return filename\n\ndef read_csv_file(filename):\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    with open(filepath, newline='') as csvfile:\n        reader = csv.reader(csvfile)\n        product_ids = [row[0] for row in reader if row]\n        return product_ids\n\ndef get_product_details(product_ids):\n    conn = sqlite3.connect('products.db')\n    cursor = conn.cursor()\n    placeholders = ','.join(['?'] * len(product_ids))\n    query = f\"SELECT * FROM products WHERE id IN ({placeholders})\"\n    cursor.execute(query, product_ids)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\ndef create_archive(filename, report_content):\n    archive_name = f\"{filename}_report.tar.gz\"\n    with open(f\"{REPORT_DIR}/{filename}.txt\", 'w') as report_file:\n        report_file.write(report_content)\n    os.system(f\"tar -czf {archive_name} {REPORT_DIR}/{filename}.txt\")\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            boundary = self.headers['Content-Type'].split('boundary=')[1]\n            parts = post_data.split(f'--{boundary}'.encode())[1:-1]\n\n            for part in parts:\n                headers, body = part.split(b'\\r\\n\\r\\n', 1)\n                disposition = dict([h.split(': ') for h in headers.decode().split('\\r\\n')])\n                if disposition['Content-Disposition'].startswith('form-data; name=\"data_file\"; filename='):\n                    filename = disposition['Content-Disposition'].split('filename=')[1].strip('\"')\n                    if not filename.endswith('.csv'):\n                        self.send_response(400)\n                        self.end_headers()\n                        return\n\n                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n                        f.write(body.strip(b'\\r\\n'))\n\n            self.send_response(200)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/generate_report?'):\n            query = self.path.split('?')[1]\n            filename = validate_filename(query)\n\n            if not filename:\n                self.send_response(400)\n                self.end_headers()\n                return\n\n            product_ids = read_csv_file(filename)\n            report_content = get_product_details(product_ids)\n            create_archive(filename, str(report_content))\n\n            self.send_response(200)\n            self.end_headers()\n            response = f'<html><body>Report generated for {filename}</body></html>'\n            self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport sqlite3\nimport csv\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\nimport subprocess\n\nUPLOAD_DIR = 'uploads/'\nREPORT_DIR = 'reports/'\n\ndef validate_filename(filename):\n    filename = unquote(os.path.basename(filename))\n    if not filename.endswith('.csv') or os.path.dirname(filename) or '..' in filename:\n        return None\n    return filename\n\ndef read_csv_file(filename):\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    with open(filepath, newline='', encoding='utf-8') as csvfile:\n        reader = csv.reader(csvfile)\n        product_ids = [row[0] for row in reader if row]\n        return product_ids\n\ndef get_product_details(product_ids):\n    conn = sqlite3.connect('products.db')\n    cursor = conn.cursor()\n    placeholders = ','.join(['?'] * len(product_ids))\n    query = f\"SELECT * FROM products WHERE id IN ({placeholders})\"\n    cursor.execute(query, product_ids)\n    results = cursor.fetchall()\n    conn.close()\n    return results\n\ndef create_archive(filename, report_content):\n    archive_name = os.path.join(REPORT_DIR, f\"{filename}_report.tar.gz\")\n    report_path = os.path.join(REPORT_DIR, f\"{filename}.txt\")\n\n    with open(report_path, 'w', encoding='utf-8') as report_file:\n        report_file.write(report_content)\n\n    subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            boundary = self.headers['Content-Type'].split('boundary=')[1]\n            parts = post_data.split(f'--{boundary}'.encode())[1:-1]\n\n            for part in parts:\n                headers, body = part.split(b'\\r\\n\\r\\n', 1)\n                disposition = dict([h.split(': ') for h in headers.decode().split('\\r\\n')])\n                if disposition['Content-Disposition'].startswith('form-data; name=\"data_file\"; filename='):\n                    filename = disposition['Content-Disposition'].split('filename=')[1].strip('\"')\n                    if not filename.endswith('.csv'):\n                        self.send_response(400)\n                        self.end_headers()\n                        return\n\n                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n                        f.write(body.strip(b'\\r\\n'))\n\n            self.send_response(200)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/generate_report?'):\n            query = self.path.split('?')[1]\n            filename = validate_filename(query)\n\n            if not filename:\n                self.send_response(400)\n                self.end_headers()\n                return\n\n            product_ids = read_csv_file(filename)\n            report_content = get_product_details(product_ids)\n            create_archive(filename, str(report_content))\n\n            self.send_response(200)\n            self.end_headers()\n            response = f'<html><body>Report generated for {filename}</body></html>'\n            self.wfile.write(response.encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 19\n   desc: This path depends on a [user-provided value](1).\n   code: with open(filepath, newline='', encoding='utf-8') as csvfile:\n   judge: The `validate_filename` function uses `os.path.basename` and a '..' check, but does not canonicalize the path or reject absolute paths. An attacker can supply a filename like '/etc/passwd' which bypasses the dirname check (basename returns the whole string), and `os.path.join(UPLOAD_DIR, filename)` will return '/etc/passwd' because os.path.join discards earlier components when an absolute path is encountered. This allows reading arbitrary files.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 38\n   desc: This path depends on a [user-provided value](1).\n   code: with open(report_path, 'w', encoding='utf-8') as report_file:\n   judge: Same root cause as line 19. The `filename` is used to construct `report_path` via `os.path.join(REPORT_DIR, f\"{filename}.txt\")`. An attacker can control `filename` to write outside REPORT_DIR (e.g., filename='../malicious' or absolute path).\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 61\n   desc: This path depends on a [user-provided value](1).\n   code: with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n   judge: The upload handler uses `os.path.join(UPLOAD_DIR, filename)` without any validation beyond the extension check. An attacker can upload a file to an arbitrary path by including traversal sequences or absolute paths in the filename.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 6\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 5 from urllib.parse import unquote\\n6 import subprocess\\n7\n   judge: This is an import-level warning about using subprocess in general. The actual usage on line 41 is safe (list-based invocation, no shell). The import itself does not introduce a vulnerability.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B607 start_process_with_partial_path\n   line: 41\n   desc: Starting a process with a partial executable path\n   code: 40 \\n41     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)\\n42\n   judge: The executable path 'tar' is a relative path, but this is a low-severity informational finding. The scenario does not require an absolute path for tar, and the command is not user-controlled. In the context of this intranet scenario, this is not a realistic attack vector.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:19",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+        "context": "    17: def read_csv_file(filename):\n    18:     filepath = os.path.join(UPLOAD_DIR, filename)\n>>  19:     with open(filepath, newline='', encoding='utf-8') as csvfile:\n    20:         reader = csv.reader(csvfile)\n    21:         product_ids = [row[0] for row in reader if row]"
+      },
+      {
+        "signature": "codeql:py/path-injection:38",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+        "context": "    36:     report_path = os.path.join(REPORT_DIR, f\"{filename}.txt\")\n    37: \n>>  38:     with open(report_path, 'w', encoding='utf-8') as report_file:\n    39:         report_file.write(report_content)\n    40: "
+      },
+      {
+        "signature": "codeql:py/path-injection:61",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 61,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+        "context": "    59:                         return\n    60: \n>>  61:                     with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n    62:                         f.write(body.strip(b'\\r\\n'))\n    63: "
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-22, CWE-78, CWE-79, CWE-89 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: codeql:py/path-injection. Final unresolved CWEs: CWE-22."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "path_injection",
+      "cwe-22",
+      "incomplete_validation",
+      "absolute_path_bypass",
+      "persistent_codeql_finding",
+      "upload_path_traversal"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/path-injection"
+    ],
+    "summary": "The implementation fails to properly validate user-supplied filenames, allowing absolute paths and directory traversal to bypass the intended directory restriction. The validate_filename function uses os.path.basename but does not canonicalize paths or reject absolute paths, and the upload handler lacks any path validation beyond extension checks. These issues persist across all three attempts, with CodeQL consistently flagging path-injection vulnerabilities at lines 19, 38, and 61.",
+    "suggested_actions": [
+      "Use os.path.realpath or os.path.abspath to canonicalize the resolved path and verify it starts with the intended base directory (UPLOAD_DIR or REPORT_DIR).",
+      "In validate_filename, reject filenames that contain path separators, absolute paths, or traversal sequences after basename extraction.",
+      "In the upload handler, validate that the resolved path stays within UPLOAD_DIR by canonicalizing both the base directory and the final path before opening the file.",
+      "Consider using a whitelist approach for allowed filenames or generating safe filenames server-side instead of trusting user-provided names."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [
+      "bandit:B605"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:19",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    with open(filepath, newline='', encoding='utf-8') as csvfile:",
+        "context": "    16: \n    17: def read_csv_file(filename):\n    18:     filepath = os.path.join(UPLOAD_DIR, filename)\n>>  19:     with open(filepath, newline='', encoding='utf-8') as csvfile:\n    20:         reader = csv.reader(csvfile)\n    21:         product_ids = [row[0] for row in reader if row]\n    22:         return product_ids"
+      },
+      {
+        "signature": "codeql:py/path-injection:38",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "    with open(report_path, 'w', encoding='utf-8') as report_file:",
+        "context": "    35:     archive_name = os.path.join(REPORT_DIR, f\"{filename}_report.tar.gz\")\n    36:     report_path = os.path.join(REPORT_DIR, f\"{filename}.txt\")\n    37: \n>>  38:     with open(report_path, 'w', encoding='utf-8') as report_file:\n    39:         report_file.write(report_content)\n    40: \n    41:     subprocess.run(['tar', '-czf', archive_name, report_path], check=True)"
+      },
+      {
+        "signature": "codeql:py/path-injection:61",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 61,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                    with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:",
+        "context": "    58:                         self.end_headers()\n    59:                         return\n    60: \n>>  61:                     with open(os.path.join(UPLOAD_DIR, filename), 'wb') as f:\n    62:                         f.write(body.strip(b'\\r\\n'))\n    63: \n    64:             self.send_response(200)"
+      }
+    ]
+  }
+}

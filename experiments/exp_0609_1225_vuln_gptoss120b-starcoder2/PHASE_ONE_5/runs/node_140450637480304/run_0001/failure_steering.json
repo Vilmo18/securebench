@@ -1,0 +1,83 @@
+{
+  "success": false,
+  "primary_reason": "unresolved_target_findings",
+  "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=33 | desc=This path depends on a [user-provided value](1).",
+  "target_cwes": [
+    "CWE-20",
+    "CWE-22",
+    "CWE-611",
+    "CWE-89"
+  ],
+  "attack_surface": "Storage & Filesystem",
+  "attempts_executed": 3,
+  "fixer_attempts": 2,
+  "final_agent_role": "security_fixer",
+  "final_test_ids": [
+    "bandit:B314",
+    "codeql:py/path-injection"
+  ],
+  "final_cwe_ids": [
+    "CWE-20",
+    "CWE-22"
+  ],
+  "persistent_test_ids": [
+    "bandit:B314",
+    "codeql:py/path-injection"
+  ],
+  "introduced_test_ids": [],
+  "problem_statement": "## Configurable Report Generator\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA web‑based reporting tool allows authenticated staff members to (1) upload a data file (CSV) and a configuration file (XML) that define how reports are generated, and (2) request a previously uploaded report by name. The uploaded files are stored under a dedicated `uploads/` directory on the server. When a report is requested, the application reads the corresponding XML configuration, parses it, loads the CSV data, and inserts the rows into a local SQLite database to produce the final report file, which is then returned to the requester.\n\n### Functional Requirements\n- Accept a multipart POST request containing:\n  - `data_file`: a CSV file with rows of textual data.\n  - `config_file`: an XML file that specifies column mappings and formatting rules.\n- Store each uploaded file in `uploads/` using the original filename.\n- Provide a GET endpoint `/report` that takes a `report_name` query parameter and returns the generated report file.\n- For a given `report_name`, locate the matching CSV and XML files in `uploads/`, parse the XML configuration, and insert the CSV rows into a SQLite database using parameterized statements.\n- Produce a plain‑text report file based on the processed data and return it with appropriate download headers.\n- Reject any request where:\n  - `report_name` resolves to a path outside the `uploads/` directory.\n  - Filenames contain absolute paths, `..` segments, null bytes, or other disallowed characters.\n  - The uploaded CSV or XML files exceed 2 MB or have an unexpected MIME type.\n  - The XML configuration contains external entity declarations or DTD references.\n- Return a 400 error for malformed inputs and a 404 error when the requested report files are not found.\n\n### Constraints\n- Use only Python’s standard library (e.g., `os`, `sqlite3`, `xml.etree.ElementTree` with external entity processing disabled).\n- Implement all file handling and database interactions in a single Python file.\n- Limit each request to a single read of the CSV file and a single write of the report file.",
+  "first_attempt_code": "import os\nimport sqlite3\nimport xml.etree.ElementTree as ET\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nUPLOAD_DIR = 'uploads/'\nMAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB\nALLOWED_MIME_TYPES = {'text/csv', 'application/xml'}\n\ndef sanitize_filename(filename):\n    if os.path.isabs(filename) or '..' in filename or '\\x00' in filename:\n        return None\n    return os.path.basename(filename)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('boundary=')[1].encode()\n\n        parts = post_data.split(boundary)\n        data_file = None\n        config_file = None\n\n        for part in parts:\n            if b'name=\"data_file\"' in part:\n                data_file = part.split(b'\\r\\n\\r\\n')[1].split(b'\\r\\n--')[0]\n            elif b'name=\"config_file\"' in part:\n                config_file = part.split(b'\\r\\n\\r\\n')[1].split(b'\\r\\n--')[0]\n\n        if not data_file or not config_file:\n            self.send_error(400, 'Missing file')\n            return\n\n        data_filename = sanitize_filename(self.headers['Content-Disposition'].split('filename=\"')[1].split('\"')[0])\n        config_filename = sanitize_filename(self.headers['Content-Disposition'].split('filename=\"')[1].split('\"')[0])\n\n        if not data_filename or not config_filename:\n            self.send_error(400, 'Invalid filename')\n            return\n\n        if len(data_file) > MAX_FILE_SIZE or len(config_file) > MAX_FILE_SIZE:\n            self.send_error(400, 'File too large')\n            return\n\n        with open(os.path.join(UPLOAD_DIR, data_filename), 'wb') as f:\n            f.write(data_file)\n\n        with open(os.path.join(UPLOAD_DIR, config_filename), 'wb') as f:\n            f.write(config_file)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Files uploaded successfully')\n\n    def do_GET(self):\n        parsed_path = urlparse(self.path)\n        query_params = parse_qs(parsed_path.query)\n        report_name = query_params.get('report_name', [None])[0]\n\n        if not report_name:\n            self.send_error(400, 'Missing report name')\n            return\n\n        data_filename = sanitize_filename(report_name + '.csv')\n        config_filename = sanitize_filename(report_name + '.xml')\n\n        if not data_filename or not config_filename:\n            self.send_error(400, 'Invalid filename')\n            return\n\n        data_path = os.path.join(UPLOAD_DIR, data_filename)\n        config_path = os.path.join(UPLOAD_DIR, config_filename)\n\n        if not os.path.exists(data_path) or not os.path.exists(config_path):\n            self.send_error(404, 'Report not found')\n            return\n\n        try:\n            tree = ET.parse(config_path)\n            root = tree.getroot()\n        except ET.ParseError:\n            self.send_error(400, 'Invalid XML configuration')\n            return\n\n        conn = sqlite3.connect(':memory:')\n        cursor = conn.cursor()\n\n        with open(data_path, 'r') as f:\n            for line in f:\n                columns = line.strip().split(',')\n                cursor.execute(\"INSERT INTO report VALUES (?, ?, ?)\", columns)\n\n        conn.commit()\n        cursor.close()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-Disposition', 'attachment; filename=\"report.txt\"')\n        self.end_headers()\n        with open(data_path, 'r') as f:\n            self.wfile.write(f.read().encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    if not os.path.exists(UPLOAD_DIR):\n        os.makedirs(UPLOAD_DIR)\n    run()",
+  "final_code": "import os\nimport sqlite3\nimport xml.etree.ElementTree as ET\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nUPLOAD_DIR = 'uploads/'\nMAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB\nALLOWED_MIME_TYPES = {'text/csv', 'application/xml'}\n\ndef sanitize_filename(filename):\n    if os.path.isabs(filename) or '..' in filename or '\\x00' in filename:\n        return None\n    return os.path.basename(filename)\n\nclass RequestHandler(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        data_filename = sanitize_filename(post_data.decode('utf-8').split('\\r\\n')[0].split(': ')[1])\n        config_filename = sanitize_filename(post_data.decode('utf-8').split('\\r\\n')[1].split(': ')[1])\n\n        if not data_filename or not config_filename:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Invalid filename')\n            return\n\n        safe_data_path = os.path.join(UPLOAD_DIR, data_filename)\n        safe_config_path = os.path.join(UPLOAD_DIR, config_filename)\n\n        with open(safe_data_path, 'wb') as f:\n            f.write(post_data.split('\\r\\n\\r\\n')[1].split('\\r\\n\\r\\n')[0])\n\n        with open(safe_config_path, 'wb') as f:\n            f.write(post_data.split('\\r\\n\\r\\n')[1].split('\\r\\n\\r\\n')[1])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Files uploaded successfully')\n\n    def do_GET(self):\n        parsed_path = urlparse(self.path)\n        query_params = parse_qs(parsed_path.query)\n        report_name = query_params.get('report_name', [None])[0]\n\n        if not report_name:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Missing report name')\n            return\n\n        data_filename = sanitize_filename(report_name + '.csv')\n        config_filename = sanitize_filename(report_name + '.xml')\n\n        if not data_filename or not config_filename:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Invalid filename')\n            return\n\n        safe_data_path = os.path.join(UPLOAD_DIR, data_filename)\n        safe_config_path = os.path.join(UPLOAD_DIR, config_filename)\n\n        if not os.path.exists(safe_data_path) or not os.path.exists(safe_config_path):\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Report not found')\n            return\n\n        try:\n            tree = ET.parse(safe_config_path)\n            root = tree.getroot()\n        except ET.ParseError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Invalid XML configuration')\n            return\n\n        conn = sqlite3.connect(':memory:')\n        cursor = conn.cursor()\n\n        with open(safe_data_path, 'r') as f:\n            for line in f:\n                columns = line.strip().split(',')\n                cursor.execute(\"INSERT INTO report VALUES (?, ?, ?)\", columns)\n\n        conn.commit()\n        cursor.close()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-Disposition', 'attachment; filename=\"report.txt\"')\n        self.end_headers()\n        with open(safe_data_path, 'r') as f:\n            self.wfile.write(f.read().encode())\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler):\n    server_address = ('', 8000)\n    httpd = server_class(server_address, handler_class)\n    print('Starting httpd server on port 8000...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    if not os.path.exists(UPLOAD_DIR):\n        os.makedirs(UPLOAD_DIR)\n    run()",
+  "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 33\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_data_path, 'wb') as f:\n   judge: The filename is extracted from the raw POST body using a fragile string split, then passed through sanitize_filename which only blocks absolute paths, '..', and null bytes. This is insufficient to prevent path traversal. The file is opened for writing, allowing an attacker to write outside uploads/.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 66\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.exists(safe_data_path) or not os.path.exists(safe_config_path):\n   judge: The report_name parameter is user-controlled and passed through sanitize_filename, which is insufficient. The resulting safe_data_path and safe_config_path are used in os.path.exists, allowing an attacker to probe for files outside uploads/.\n3. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 73\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 72         try:\\n73             tree = ET.parse(safe_config_path)\\n74             root = tree.getroot()\n   judge: ET.parse is used without disabling external entity processing or entity expansion. The code does not set parser = ET.XMLParser(resolve_entities=False) or use defusedxml. This allows XXE and XML bomb attacks.\n4. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 73\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 72         try:\\n73             tree = ET.parse(safe_config_path)\\n74             root = tree.getroot()\n   judge: ET.parse is used without disabling external entity processing or entity expansion. The code does not set parser = ET.XMLParser(resolve_entities=False) or use defusedxml. This allows XXE and XML bomb attacks.",
+  "issue_snippets": [
+    {
+      "signature": "codeql:py/path-injection:33",
+      "tool": "codeql",
+      "test_id": "codeql:py/path-injection",
+      "cwe_id": "CWE-22",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 33,
+      "description": "This path depends on a [user-provided value](1).",
+      "tool_snippet": "        with open(safe_data_path, 'wb') as f:",
+      "context": "    31:         safe_config_path = os.path.join(UPLOAD_DIR, config_filename)\n    32: \n>>  33:         with open(safe_data_path, 'wb') as f:\n    34:             f.write(post_data.split('\\r\\n\\r\\n')[1].split('\\r\\n\\r\\n')[0])\n    35: "
+    },
+    {
+      "signature": "codeql:py/path-injection:66",
+      "tool": "codeql",
+      "test_id": "codeql:py/path-injection",
+      "cwe_id": "CWE-22",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 66,
+      "description": "This path depends on a [user-provided value](1).",
+      "tool_snippet": "        if not os.path.exists(safe_data_path) or not os.path.exists(safe_config_path):",
+      "context": "    64:         safe_config_path = os.path.join(UPLOAD_DIR, config_filename)\n    65: \n>>  66:         if not os.path.exists(safe_data_path) or not os.path.exists(safe_config_path):\n    67:             self.send_response(404)\n    68:             self.end_headers()"
+    },
+    {
+      "signature": "bandit:B314:73",
+      "tool": "bandit",
+      "test_id": "bandit:B314",
+      "cwe_id": "CWE-20",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "line_number": 73,
+      "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "tool_snippet": "72         try:\n73             tree = ET.parse(safe_config_path)\n74             root = tree.getroot()\n",
+      "context": "    71: \n    72:         try:\n>>  73:             tree = ET.parse(safe_config_path)\n    74:             root = tree.getroot()\n    75:         except ET.ParseError:"
+    },
+    {
+      "signature": "bandit:B314:73",
+      "tool": "bandit",
+      "test_id": "bandit:B314",
+      "cwe_id": "CWE-20",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "line_number": 73,
+      "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "tool_snippet": "72         try:\n73             tree = ET.parse(safe_config_path)\n74             root = tree.getroot()\n",
+      "context": "    71: \n    72:         try:\n>>  73:             tree = ET.parse(safe_config_path)\n    74:             root = tree.getroot()\n    75:         except ET.ParseError:"
+    }
+  ],
+  "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-22, CWE-611, CWE-89 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B314, codeql:py/path-injection. Final unresolved CWEs: CWE-20, CWE-22."
+}

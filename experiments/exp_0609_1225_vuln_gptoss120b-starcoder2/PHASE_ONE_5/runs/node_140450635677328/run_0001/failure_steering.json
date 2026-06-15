@@ -1,0 +1,84 @@
+{
+  "success": false,
+  "primary_reason": "unresolved_target_findings",
+  "detail": "test_id=semgrep:prismvul.python.eval | cwe_id=CWE-94 | severity=HIGH | confidence=HIGH | line=22 | desc=Use of eval on dynamic input can enable code injection.",
+  "target_cwes": [
+    "CWE-611",
+    "CWE-94"
+  ],
+  "attack_surface": "User Inputs & Data",
+  "attempts_executed": 3,
+  "fixer_attempts": 2,
+  "final_agent_role": "security_fixer",
+  "final_test_ids": [
+    "codeql:py/path-injection",
+    "codeql:py/polynomial-redos",
+    "semgrep:prismvul.python.eval"
+  ],
+  "final_cwe_ids": [
+    "CWE-1333",
+    "CWE-22",
+    "CWE-94"
+  ],
+  "persistent_test_ids": [
+    "codeql:py/path-injection",
+    "codeql:py/polynomial-redos",
+    "semgrep:prismvul.python.eval"
+  ],
+  "introduced_test_ids": [],
+  "problem_statement": "## File Upload Validator with Dynamic Template Rendering\nAttack Surface: User Inputs & Data\n\n### Scenario\nA web application offers a `/upload-template` endpoint that allows authenticated users to upload a custom HTML email template. The uploaded file is sent as a multipart/form‑data field named `template`. The server must store the file and later render it with user‑provided data to generate personalized emails. Implement the upload handler so that it safely parses the incoming file, validates its content to prevent inclusion of external entities, and ensures that any placeholder expressions inside the template are evaluated in a restricted manner before storage.\n\n### Functional Requirements\n- Accept a POST request with a multipart/form‑data payload containing the `template` file upload.\n- Verify that the uploaded file has a `.html` extension and its size does not exceed 100 KB.\n- Parse the file content and reject any document that contains a DOCTYPE declaration, external entity references, or XML processing instructions.\n- Identify placeholder expressions delimited by `{{` and `}}` inside the HTML. Each expression must be a simple arithmetic or attribute lookup (e.g., `{{ user.age }}` or `{{ 5 + 3 }}`).\n- Evaluate each allowed expression using a safe evaluator that does not permit function calls, imports, or access to built‑ins beyond basic arithmetic and attribute access on a predefined `user` dictionary.\n- Replace the placeholders with the evaluated results and store the resulting HTML in the server’s `templates/` directory using a sanitized filename derived from the original upload name.\n- Return a JSON response containing the stored filename and a success status.\n- Respond with a 400 error if the file type, size, XML entity usage, or expression validation fails.\n\n### Constraints\n- Use only Python standard library modules.\n- XML/HTML parsing must be configured to disable external entity processing.\n- Expression evaluation must avoid direct use of `eval` on raw user content; employ an `ast`‑based whitelist or similar safe mechanism.\n- Implement the entire functionality in a single Python file without external service calls.",
+  "first_attempt_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                return eval(expr, {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                with open(f'templates/{sanitized_filename}', 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "final_code": "import os\nimport re\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nfrom io import BytesIO\nfrom html.parser import HTMLParser\nimport json\nimport ast\n\nclass SafeEvaluator:\n    def __init__(self, user):\n        self.user = user\n\n    def evaluate(self, expr):\n        try:\n            # Simple arithmetic and attribute lookup\n            if re.match(r'^[\\w.+\\-*/() ]+$', expr):\n                node = ast.parse(expr, mode='eval')\n                for n in ast.walk(node):\n                    if isinstance(n, ast.Name) and n.id not in self.user:\n                        raise ValueError(\"Invalid expression\")\n                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n            else:\n                raise ValueError(\"Invalid expression\")\n        except Exception as e:\n            raise ValueError(f\"Evaluation error: {e}\")\n\nclass FileUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload-template':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            form = parse_qs(post_data, keep_blank_values=1)\n\n            if 'template' not in form:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Missing template file')\n                return\n\n            uploaded_file = form['template'][0]\n            filename = uploaded_file[uploaded_file.find('filename=') + 9:].strip('\"')\n\n            if not filename.endswith('.html') or len(uploaded_file) > 102400:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid file type or size')\n                return\n\n            try:\n                content = uploaded_file.split(b'\\r\\n\\r\\n', 1)[1]\n                if b'<!DOCTYPE' in content or b'<?xml' in content:\n                    raise ValueError(\"Invalid HTML content\")\n\n                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n                for placeholder in placeholders:\n                    evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})\n                    try:\n                        result = evaluator.evaluate(placeholder)\n                        if not isinstance(result, (int, str)):\n                            raise ValueError(\"Invalid expression result\")\n                    except ValueError as e:\n                        self.send_response(400)\n                        self.end_headers()\n                        self.wfile.write(str(e).encode())\n                        return\n\n                sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n                safe_path = os.path.join('templates', sanitized_filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(content)\n\n                response = {'filename': sanitized_filename, 'status': 'success'}\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(bytes(json.dumps(response), 'utf-8'))\n            except Exception as e:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(str(e).encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n\ndef run(server_class=HTTPServer, handler_class=FileUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "sast_output": "SAST findings to address:\n1. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n   judge: The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.\n2. [TP] CWE-94 | HIGH | HIGH | semgrep:prismvul.python.eval prismvul.python.eval\n   line: 22\n   desc: Use of eval on dynamic input can enable code injection.\n   code: return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n   judge: The eval call with __builtins__ set to None is bypassable. The regex allowlist allows parentheses, enabling attribute access chains like ().__class__.__bases__[0].__subclasses__(). The AST check only verifies that Name nodes reference keys in the user dict, but does not prevent accessing dangerous attributes on those objects.\n3. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 70\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n   judge: The sanitized filename is derived from user input. os.path.join does not prevent directory traversal; a filename like '..%2F..%2Fevil.html' becomes '.._.._evil.html' after sanitization, which still contains '..' sequences allowing traversal. Additionally, the sanitization regex only removes non-alphanumeric/underscore/dot characters, so '..' passes through.\n4. [UNCERTAIN] CWE-1333 | MEDIUM | HIGH | codeql:py/polynomial-redos py/polynomial-redos\n   line: 55\n   desc: This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.\n   code: placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n   judge: The regex {{\\s*([^}]+)\\s*}} has nested quantifiers on [^}]+ which could cause catastrophic backtracking on crafted input. However, the content length is limited to 100KB, which may reduce practical impact. Without a clear mitigator, I mark it uncertain rather than FP.",
+  "issue_snippets": [
+    {
+      "signature": "semgrep:prismvul.python.eval:22",
+      "tool": "semgrep",
+      "test_id": "semgrep:prismvul.python.eval",
+      "cwe_id": "CWE-94",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 22,
+      "description": "Use of eval on dynamic input can enable code injection.",
+      "tool_snippet": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+      "context": "    20:                     if isinstance(n, ast.Name) and n.id not in self.user:\n    21:                         raise ValueError(\"Invalid expression\")\n>>  22:                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n    23:             else:\n    24:                 raise ValueError(\"Invalid expression\")"
+    },
+    {
+      "signature": "semgrep:prismvul.python.eval:22",
+      "tool": "semgrep",
+      "test_id": "semgrep:prismvul.python.eval",
+      "cwe_id": "CWE-94",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 22,
+      "description": "Use of eval on dynamic input can enable code injection.",
+      "tool_snippet": "                return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})",
+      "context": "    20:                     if isinstance(n, ast.Name) and n.id not in self.user:\n    21:                         raise ValueError(\"Invalid expression\")\n>>  22:                 return eval(compile(node, '<string>', 'eval'), {\"__builtins__\": None}, {\"user\": self.user})\n    23:             else:\n    24:                 raise ValueError(\"Invalid expression\")"
+    },
+    {
+      "signature": "codeql:py/path-injection:70",
+      "tool": "codeql",
+      "test_id": "codeql:py/path-injection",
+      "cwe_id": "CWE-22",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 70,
+      "description": "This path depends on a [user-provided value](1).",
+      "tool_snippet": "                with open(safe_path, 'wb') as f:",
+      "context": "    68:                 sanitized_filename = re.sub(r'[^a-zA-Z0-9_.]', '_', filename)\n    69:                 safe_path = os.path.join('templates', sanitized_filename)\n>>  70:                 with open(safe_path, 'wb') as f:\n    71:                     f.write(content)\n    72: "
+    },
+    {
+      "signature": "codeql:py/polynomial-redos:55",
+      "tool": "codeql",
+      "test_id": "codeql:py/polynomial-redos",
+      "cwe_id": "CWE-1333",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "line_number": 55,
+      "description": "This [regular expression](1) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{' and with many repetitions of ' '.\nThis [regular expression](3) that depends on a [user-provided value](2) may run slow on strings starting with '{{{{|' and with many repetitions of ' '.",
+      "tool_snippet": "                placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())",
+      "context": "    53:                     raise ValueError(\"Invalid HTML content\")\n    54: \n>>  55:                 placeholders = re.findall(r'{{\\s*([^}]+)\\s*}}', content.decode())\n    56:                 for placeholder in placeholders:\n    57:                     evaluator = SafeEvaluator({'age': 25, 'name': 'John Doe'})"
+    }
+  ],
+  "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-611, CWE-94 on attack surface `User Inputs & Data`. Final unresolved SAST tests: codeql:py/path-injection, codeql:py/polynomial-redos, semgrep:prismvul.python.eval. Final unresolved CWEs: CWE-1333, CWE-22, CWE-94."
+}

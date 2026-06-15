@@ -1,0 +1,1765 @@
+{
+  "target_cwes": [
+    "CWE-862",
+    "CWE-20",
+    "CWE-22",
+    "CWE-611",
+    "CWE-502"
+  ],
+  "problem_statement": "## Containerized Job Launcher Attack Surface: Execution Environment & Infrastructure\n### Scenario\nAn internal web service allows authenticated users to submit data-processing jobs that run inside pre‑configured Docker containers. A client sends a JSON payload specifying the job name, input parameters, and optional environment variables. The service must deserialize the payload, load an XML job descriptor, validate all inputs, enforce access control, and launch the job by executing an OS command inside the container. The launched command must be constrained to a specific directory, use only allowed environment variables, and never allow traversal or execution of arbitrary files.\n\n### Functional Requirements\n- Accept a POST request containing a JSON payload with the following fields:\n  - `job_name` – string, name of the job to run.\n  - `params` – dictionary of job‑specific parameters.\n  - `env` – optional dictionary of environment variable key/value pairs to set for the job.\n- Ensure the request is made by a user who has explicit permission to execute the specified `job_name`.\n- Deserialize the JSON payload safely, guarding against malicious data structures that could trigger arbitrary code execution.\n- Resolve the job’s executable script by combining a trusted base directory with `job_name`, rejecting absolute paths, parent‑directory traversal, and any path components that could escape the base directory.\n- Load an XML configuration file located within the job’s directory. The XML must be parsed safely, preventing external entity resolution or other XML-based attacks.\n- Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables. The command must not allow the job to access host filesystem paths outside the container boundary.\n- Execute the constructed command as a subprocess, capturing its output and exit status.\n- Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions.\n\n### Constraints\n- Use only Python standard library modules; no third‑party packages are allowed.\n- The implementation must reside in a single Python file.\n- The service must not perform more than one subprocess call per request.\n- All file system operations must be relative to a predefined, writable base directory that is not exposed outside the container.\n- Environment variable names and values supplied by the client must be validated to contain only alphanumeric characters, underscores, and hyphens.",
+  "test_cases": "",
+  "solution_code": "import json\nimport os\nimport subprocess\nfrom defusedxml import ElementTree as DET\n\nBASE_DIR = \"/var/jobs\"\n\ndef launch_job(request):\n    # Deserialize the JSON payload safely\n    try:\n        data = json.loads(request.body)\n    except ValueError:\n        return \"Invalid request body\", 400\n\n    # Ensure the request is made by a user who has explicit permission to execute the specified job_name\n    if not request.user.has_perm(\"execute_job\", data[\"job_name\"]):\n        return \"Forbidden\", 403\n\n    # Resolve the job’s executable script by combining a trusted base directory with job_name, rejecting absolute paths, parent-directory traversal, and any path components that could escape the base directory\n    job_path = os.path.join(BASE_DIR, data[\"job_name\"])\n    if not os.path.isfile(job_path):\n        return \"Invalid job name\", 400\n\n    # Load an XML configuration file located within the job’s directory\n    xml_path = os.path.join(BASE_DIR, data[\"job_name\"], \"config.xml\")\n    if not os.path.isfile(xml_path):\n        return \"Invalid job name\", 400\n\n    # Parse the XML configuration file safely, preventing external entity resolution or other XML-based attacks\n    try:\n        tree = DET.parse(xml_path)\n    except DET.ParseError:\n        return \"Invalid XML configuration\", 400\n\n    # Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables\n    cmd = [\"docker\", \"run\", \"-v\", f\"{BASE_DIR}:/var/jobs\", data[\"job_name\"]]\n    for param in data[\"params\"]:\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", param):\n            return \"Invalid parameter name\", 400\n        cmd.extend([\"-e\", f\"{param}={data['params'][param]}\"])\n    for env, value in data[\"env\"].items():\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", env):\n            return \"Invalid environment variable name\", 400\n        cmd.extend([\"-e\", f\"{env}={value}\"])\n    cmd.append(\"python\")\n    cmd.append(job_path)\n\n    # Execute the constructed command as a subprocess, capturing its output and exit status\n    try:\n        process = subprocess.run(cmd, capture_output=True, text=True)\n    except subprocess.CalledProcessError:\n        return \"Failed to execute job\", 500\n\n    # Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions\n    if process.returncode == 0:\n        return json.dumps({\"status\": \"success\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 200\n    else:\n        return json.dumps({\"status\": \"failure\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 500",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 50\n   desc: subprocess call - check for execution of untrusted input.\n   code: 49     try:\\n50         process = subprocess.run(cmd, capture_output=True, text=True)\\n51     except subprocess.CalledProcessError:\n   judge: subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import os\\n3 import subprocess\\n4 from defusedxml import ElementTree as DET\n   judge: Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpv8jr2lrb.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 41,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 41,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 50,
+        "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "TP",
+        "judge_reason": "subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603."
+      }
+    ],
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpv8jr2lrb.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 41,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 41,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 50,
+        "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 1.0,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 50,
+        "verdict": "TP",
+        "reason": "subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "security_score": 0.2,
+      "overall_risk": 0.8,
+      "target_cwe_risk": 0.8,
+      "confidence": "HIGH",
+      "summary": "Multiple critical security issues remain: missing `import re` causes NameError at runtime; no path traversal validation on job_name; env values are not validated (only names); params values are not validated; job_name is used as Docker image name without validation; no protection against directory traversal in job_path resolution.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 50,
+          "verdict": "TP",
+          "reason": "subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n2. bandit:B603 | line=50 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 49     try:\\n50         process = subprocess.run(cmd, capture_output=True, text=True)\\n51     except subprocess.CalledProcessError:\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 50\n   desc: subprocess call - check for execution of untrusted input.\n   code: 49     try:\\n50         process = subprocess.run(cmd, capture_output=True, text=True)\\n51     except subprocess.CalledProcessError:\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Containerized Job Launcher Attack Surface: Execution Environment & Infrastructure\n### Scenario\nAn internal web service allows authenticated users to submit data-processing jobs that run inside pre‑configured Docker containers. A client sends a JSON payload specifying the job name, input parameters, and optional environment variables. The service must deserialize the payload, load an XML job descriptor, validate all inputs, enforce access control, and launch the job by executing an OS command inside the container. The launched command must be constrained to a specific directory, use only allowed environment variables, and never allow traversal or execution of arbitrary files.\n\n### Functional Requirements\n- Accept a POST request containing a JSON payload with the following fields:\n  - `job_name` – string, name of the job to run.\n  - `params` – dictionary of job‑specific parameters.\n  - `env` – optional dictionary of environment variable key/value pairs to set for the job.\n- Ensure the request is made by a user who has explicit permission to execute the specified `job_name`.\n- Deserialize the JSON payload safely, guarding against malicious data structures that could trigger arbitrary code execution.\n- Resolve the job’s executable script by combining a trusted base directory with `job_name`, rejecting absolute paths, parent‑directory traversal, and any path components that could escape the base directory.\n- Load an XML configuration file located within the job’s directory. The XML must be parsed safely, preventing external entity resolution or other XML-based attacks.\n- Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables. The command must not allow the job to access host filesystem paths outside the container boundary.\n- Execute the constructed command as a subprocess, capturing its output and exit status.\n- Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions.\n\n### Constraints\n- Use only Python standard library modules; no third‑party packages are allowed.\n- The implementation must reside in a single Python file.\n- The service must not perform more than one subprocess call per request.\n- All file system operations must be relative to a predefined, writable base directory that is not exposed outside the container.\n- Environment variable names and values supplied by the client must be validated to contain only alphanumeric characters, underscores, and hyphens.",
+      "solution_code": "import json\nimport os\nimport subprocess\nfrom xml.etree import ElementTree as ET\n\nBASE_DIR = \"/var/jobs\"\n\ndef launch_job(request):\n    # Deserialize the JSON payload safely\n    try:\n        data = json.loads(request.body)\n    except ValueError:\n        return \"Invalid request body\", 400\n\n    # Ensure the request is made by a user who has explicit permission to execute the specified job_name\n    if not request.user.has_perm(\"execute_job\", data[\"job_name\"]):\n        return \"Forbidden\", 403\n\n    # Resolve the job’s executable script by combining a trusted base directory with job_name, rejecting absolute paths, parent-directory traversal, and any path components that could escape the base directory\n    job_path = os.path.join(BASE_DIR, data[\"job_name\"])\n    if not os.path.isfile(job_path):\n        return \"Invalid job name\", 400\n\n    # Load an XML configuration file located within the job’s directory\n    xml_path = os.path.join(BASE_DIR, data[\"job_name\"], \"config.xml\")\n    if not os.path.isfile(xml_path):\n        return \"Invalid job name\", 400\n\n    # Parse the XML configuration file safely, preventing external entity resolution or other XML-based attacks\n    try:\n        tree = ET.parse(xml_path)\n    except ET.ParseError:\n        return \"Invalid XML configuration\", 400\n\n    # Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables\n    cmd = [\"docker\", \"run\", \"-v\", f\"{BASE_DIR}:/var/jobs\", data[\"job_name\"]]\n    for param in data[\"params\"]:\n        cmd.extend([\"-e\", f\"{param}={data['params'][param]}\"])\n    for env, value in data[\"env\"].items():\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", env):\n            return \"Invalid environment variable name\", 400\n        cmd.extend([\"-e\", f\"{env}={value}\"])\n    cmd.append(\"python\")\n    cmd.append(job_path)\n\n    # Execute the constructed command as a subprocess, capturing its output and exit status\n    try:\n        process = subprocess.run(cmd, capture_output=True, text=True)\n    except subprocess.CalledProcessError:\n        return \"Failed to execute job\", 500\n\n    # Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions\n    if process.returncode == 0:\n        return json.dumps({\"status\": \"success\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 200\n    else:\n        return json.dumps({\"status\": \"failure\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 500",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 import subprocess\n4 from xml.etree import ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import subprocess\n4 from xml.etree import ElementTree as ET\n5 \n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30     try:\n31         tree = ET.parse(xml_path)\n32     except ET.ParseError:\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 48,
+                "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmptczi9cnz.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import subprocess\n4 from xml.etree import ElementTree as ET\n5 \n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing ElementTree without defusedxml protection is the same root cause as B314. The XML parser is not hardened against XML attacks."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30     try:\n31         tree = ET.parse(xml_path)\n32     except ET.ParseError:\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "ET.parse is used without defusedxml, making it vulnerable to XML entity expansion and external entity attacks. No mitigation is present in the code."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 48,
+            "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run receives a command list that includes untrusted data (job_name, params, env values). While shell=False is used, the command arguments are not validated for injection (e.g., params values are passed directly as -e flags, and job_name is used as a Docker image name without validation)."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from xml.etree import ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual use of subprocess.run is flagged separately (B603). This is a generic blacklist warning."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 import subprocess\n4 from xml.etree import ElementTree as ET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import subprocess\n4 from xml.etree import ElementTree as ET\n5 \n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "30     try:\n31         tree = ET.parse(xml_path)\n32     except ET.ParseError:\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 48,
+                "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmptczi9cnz.py": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 4,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from xml.etree import ElementTree as ET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import subprocess\n4 from xml.etree import ElementTree as ET\n5 \n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "30     try:\n31         tree = ET.parse(xml_path)\n32     except ET.ParseError:\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 48,
+            "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 31,
+            "verdict": "TP",
+            "reason": "ET.parse is used without defusedxml, making it vulnerable to XML entity expansion and external entity attacks. No mitigation is present in the code.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual use of subprocess.run is flagged separately (B603). This is a generic blacklist warning.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 4,
+            "verdict": "TP",
+            "reason": "Importing ElementTree without defusedxml protection is the same root cause as B314. The XML parser is not hardened against XML attacks.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 48,
+            "verdict": "TP",
+            "reason": "subprocess.run receives a command list that includes untrusted data (job_name, params, env values). While shell=False is used, the command arguments are not validated for injection (e.g., params values are passed directly as -e flags, and job_name is used as a Docker image name without validation).",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Multiple security issues: XML parsing without external entity protection, missing import for re module, env validation only checks names not values, no path traversal prevention check on job_name, and params are used unsanitized as environment variable values.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 31,
+              "verdict": "TP",
+              "reason": "ET.parse is used without defusedxml, making it vulnerable to XML entity expansion and external entity attacks. No mitigation is present in the code.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "Importing subprocess alone is not a vulnerability; the risk depends on how it is used. The actual use of subprocess.run is flagged separately (B603). This is a generic blacklist warning.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 4,
+              "verdict": "TP",
+              "reason": "Importing ElementTree without defusedxml protection is the same root cause as B314. The XML parser is not hardened against XML attacks.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 48,
+              "verdict": "TP",
+              "reason": "subprocess.run receives a command list that includes untrusted data (job_name, params, env values). While shell=False is used, the command arguments are not validated for injection (e.g., params values are passed directly as -e flags, and job_name is used as a Docker image name without validation).",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Containerized Job Launcher Attack Surface: Execution Environment & Infrastructure\n### Scenario\nAn internal web service allows authenticated users to submit data-processing jobs that run inside pre‑configured Docker containers. A client sends a JSON payload specifying the job name, input parameters, and optional environment variables. The service must deserialize the payload, load an XML job descriptor, validate all inputs, enforce access control, and launch the job by executing an OS command inside the container. The launched command must be constrained to a specific directory, use only allowed environment variables, and never allow traversal or execution of arbitrary files.\n\n### Functional Requirements\n- Accept a POST request containing a JSON payload with the following fields:\n  - `job_name` – string, name of the job to run.\n  - `params` – dictionary of job‑specific parameters.\n  - `env` – optional dictionary of environment variable key/value pairs to set for the job.\n- Ensure the request is made by a user who has explicit permission to execute the specified `job_name`.\n- Deserialize the JSON payload safely, guarding against malicious data structures that could trigger arbitrary code execution.\n- Resolve the job’s executable script by combining a trusted base directory with `job_name`, rejecting absolute paths, parent‑directory traversal, and any path components that could escape the base directory.\n- Load an XML configuration file located within the job’s directory. The XML must be parsed safely, preventing external entity resolution or other XML-based attacks.\n- Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables. The command must not allow the job to access host filesystem paths outside the container boundary.\n- Execute the constructed command as a subprocess, capturing its output and exit status.\n- Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions.\n\n### Constraints\n- Use only Python standard library modules; no third‑party packages are allowed.\n- The implementation must reside in a single Python file.\n- The service must not perform more than one subprocess call per request.\n- All file system operations must be relative to a predefined, writable base directory that is not exposed outside the container.\n- Environment variable names and values supplied by the client must be validated to contain only alphanumeric characters, underscores, and hyphens.",
+      "solution_code": "import json\nimport os\nimport subprocess\nfrom defusedxml import ElementTree as DET\n\nBASE_DIR = \"/var/jobs\"\n\ndef launch_job(request):\n    # Deserialize the JSON payload safely\n    try:\n        data = json.loads(request.body)\n    except ValueError:\n        return \"Invalid request body\", 400\n\n    # Ensure the request is made by a user who has explicit permission to execute the specified job_name\n    if not request.user.has_perm(\"execute_job\", data[\"job_name\"]):\n        return \"Forbidden\", 403\n\n    # Resolve the job’s executable script by combining a trusted base directory with job_name, rejecting absolute paths, parent-directory traversal, and any path components that could escape the base directory\n    job_path = os.path.join(BASE_DIR, data[\"job_name\"])\n    if not os.path.isfile(job_path):\n        return \"Invalid job name\", 400\n\n    # Load an XML configuration file located within the job’s directory\n    xml_path = os.path.join(BASE_DIR, data[\"job_name\"], \"config.xml\")\n    if not os.path.isfile(xml_path):\n        return \"Invalid job name\", 400\n\n    # Parse the XML configuration file safely, preventing external entity resolution or other XML-based attacks\n    try:\n        tree = DET.parse(xml_path)\n    except DET.ParseError:\n        return \"Invalid XML configuration\", 400\n\n    # Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables\n    cmd = [\"docker\", \"run\", \"-v\", f\"{BASE_DIR}:/var/jobs\", data[\"job_name\"]]\n    for param in data[\"params\"]:\n        cmd.extend([\"-e\", f\"{param}={data['params'][param]}\"])\n    for env, value in data[\"env\"].items():\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", env):\n            return \"Invalid environment variable name\", 400\n        cmd.extend([\"-e\", f\"{env}={value}\"])\n    cmd.append(\"python\")\n    cmd.append(job_path)\n\n    # Execute the constructed command as a subprocess, capturing its output and exit status\n    try:\n        process = subprocess.run(cmd, capture_output=True, text=True)\n    except subprocess.CalledProcessError:\n        return \"Failed to execute job\", 500\n\n    # Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions\n    if process.returncode == 0:\n        return json.dumps({\"status\": \"success\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 200\n    else:\n        return json.dumps({\"status\": \"failure\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 500",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 48,
+                "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpyobcxbtf.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 48,
+            "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run receives a command list containing untrusted user input (job_name, params values, env values) without proper validation. job_name is not checked for path traversal or absolute paths, params values are not sanitized, and env values are not validated."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess alone is not a vulnerability; the actual risk depends on usage, which is evaluated separately in B603."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 48,
+                "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpyobcxbtf.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 39,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 48,
+            "code": "47     try:\n48         process = subprocess.run(cmd, capture_output=True, text=True)\n49     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.5,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "Importing subprocess alone is not a vulnerability; the actual risk depends on usage, which is evaluated separately in B603.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 48,
+            "verdict": "TP",
+            "reason": "subprocess.run receives a command list containing untrusted user input (job_name, params values, env values) without proper validation. job_name is not checked for path traversal or absolute paths, params values are not sanitized, and env values are not validated.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.5,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Critical issues remain: missing `import re` causes runtime error, path traversal prevention is not implemented (job_name is not validated for `..` or absolute paths), env value validation is missing (only names are checked), params values are unsanitized and injected into Docker -e flags, and job_name is used as Docker image name without validation. The XML parsing is now safe due to defusedxml.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "Importing subprocess alone is not a vulnerability; the actual risk depends on usage, which is evaluated separately in B603.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 48,
+              "verdict": "TP",
+              "reason": "subprocess.run receives a command list containing untrusted user input (job_name, params values, env values) without proper validation. job_name is not checked for path traversal or absolute paths, params values are not sanitized, and env values are not validated.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Containerized Job Launcher Attack Surface: Execution Environment & Infrastructure\n### Scenario\nAn internal web service allows authenticated users to submit data-processing jobs that run inside pre‑configured Docker containers. A client sends a JSON payload specifying the job name, input parameters, and optional environment variables. The service must deserialize the payload, load an XML job descriptor, validate all inputs, enforce access control, and launch the job by executing an OS command inside the container. The launched command must be constrained to a specific directory, use only allowed environment variables, and never allow traversal or execution of arbitrary files.\n\n### Functional Requirements\n- Accept a POST request containing a JSON payload with the following fields:\n  - `job_name` – string, name of the job to run.\n  - `params` – dictionary of job‑specific parameters.\n  - `env` – optional dictionary of environment variable key/value pairs to set for the job.\n- Ensure the request is made by a user who has explicit permission to execute the specified `job_name`.\n- Deserialize the JSON payload safely, guarding against malicious data structures that could trigger arbitrary code execution.\n- Resolve the job’s executable script by combining a trusted base directory with `job_name`, rejecting absolute paths, parent‑directory traversal, and any path components that could escape the base directory.\n- Load an XML configuration file located within the job’s directory. The XML must be parsed safely, preventing external entity resolution or other XML-based attacks.\n- Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables. The command must not allow the job to access host filesystem paths outside the container boundary.\n- Execute the constructed command as a subprocess, capturing its output and exit status.\n- Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions.\n\n### Constraints\n- Use only Python standard library modules; no third‑party packages are allowed.\n- The implementation must reside in a single Python file.\n- The service must not perform more than one subprocess call per request.\n- All file system operations must be relative to a predefined, writable base directory that is not exposed outside the container.\n- Environment variable names and values supplied by the client must be validated to contain only alphanumeric characters, underscores, and hyphens.",
+      "solution_code": "import json\nimport os\nimport subprocess\nfrom defusedxml import ElementTree as DET\n\nBASE_DIR = \"/var/jobs\"\n\ndef launch_job(request):\n    # Deserialize the JSON payload safely\n    try:\n        data = json.loads(request.body)\n    except ValueError:\n        return \"Invalid request body\", 400\n\n    # Ensure the request is made by a user who has explicit permission to execute the specified job_name\n    if not request.user.has_perm(\"execute_job\", data[\"job_name\"]):\n        return \"Forbidden\", 403\n\n    # Resolve the job’s executable script by combining a trusted base directory with job_name, rejecting absolute paths, parent-directory traversal, and any path components that could escape the base directory\n    job_path = os.path.join(BASE_DIR, data[\"job_name\"])\n    if not os.path.isfile(job_path):\n        return \"Invalid job name\", 400\n\n    # Load an XML configuration file located within the job’s directory\n    xml_path = os.path.join(BASE_DIR, data[\"job_name\"], \"config.xml\")\n    if not os.path.isfile(xml_path):\n        return \"Invalid job name\", 400\n\n    # Parse the XML configuration file safely, preventing external entity resolution or other XML-based attacks\n    try:\n        tree = DET.parse(xml_path)\n    except DET.ParseError:\n        return \"Invalid XML configuration\", 400\n\n    # Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables\n    cmd = [\"docker\", \"run\", \"-v\", f\"{BASE_DIR}:/var/jobs\", data[\"job_name\"]]\n    for param in data[\"params\"]:\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", param):\n            return \"Invalid parameter name\", 400\n        cmd.extend([\"-e\", f\"{param}={data['params'][param]}\"])\n    for env, value in data[\"env\"].items():\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", env):\n            return \"Invalid environment variable name\", 400\n        cmd.extend([\"-e\", f\"{env}={value}\"])\n    cmd.append(\"python\")\n    cmd.append(job_path)\n\n    # Execute the constructed command as a subprocess, capturing its output and exit status\n    try:\n        process = subprocess.run(cmd, capture_output=True, text=True)\n    except subprocess.CalledProcessError:\n        return \"Failed to execute job\", 500\n\n    # Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions\n    if process.returncode == 0:\n        return json.dumps({\"status\": \"success\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 200\n    else:\n        return json.dumps({\"status\": \"failure\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 500",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpv8jr2lrb.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 41,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 41,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 50,
+                "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpv8jr2lrb.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 41,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 41,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import os\n3 import subprocess\n4 from defusedxml import ElementTree as DET\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 50,
+            "code": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 50,
+            "verdict": "TP",
+            "reason": "subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "Multiple critical security issues remain: missing `import re` causes NameError at runtime; no path traversal validation on job_name; env values are not validated (only names); params values are not validated; job_name is used as Docker image name without validation; no protection against directory traversal in job_path resolution.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 50,
+              "verdict": "TP",
+              "reason": "subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=bandit:B603 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=50 | desc=subprocess call - check for execution of untrusted input.",
+    "target_cwes": "CWE-20|CWE-22|CWE-502|CWE-611|CWE-862",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B603",
+    "final_cwe_ids": "CWE-78",
+    "first_test_ids": "bandit:B314|bandit:B405|bandit:B603",
+    "persistent_test_ids": "bandit:B603",
+    "resolved_test_ids": "bandit:B314|bandit:B405",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 1.0,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=bandit:B603 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=50 | desc=subprocess call - check for execution of untrusted input.",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-502",
+      "CWE-611",
+      "CWE-862"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B603"
+    ],
+    "final_cwe_ids": [
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B603"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Containerized Job Launcher Attack Surface: Execution Environment & Infrastructure\n### Scenario\nAn internal web service allows authenticated users to submit data-processing jobs that run inside pre‑configured Docker containers. A client sends a JSON payload specifying the job name, input parameters, and optional environment variables. The service must deserialize the payload, load an XML job descriptor, validate all inputs, enforce access control, and launch the job by executing an OS command inside the container. The launched command must be constrained to a specific directory, use only allowed environment variables, and never allow traversal or execution of arbitrary files.\n\n### Functional Requirements\n- Accept a POST request containing a JSON payload with the following fields:\n  - `job_name` – string, name of the job to run.\n  - `params` – dictionary of job‑specific parameters.\n  - `env` – optional dictionary of environment variable key/value pairs to set for the job.\n- Ensure the request is made by a user who has explicit permission to execute the specified `job_name`.\n- Deserialize the JSON payload safely, guarding against malicious data structures that could trigger arbitrary code execution.\n- Resolve the job’s executable script by combining a trusted base directory with `job_name`, rejecting absolute paths, parent‑directory traversal, and any path components that could escape the base directory.\n- Load an XML configuration file located within the job’s directory. The XML must be parsed safely, preventing external entity resolution or other XML-based attacks.\n- Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables. The command must not allow the job to access host filesystem paths outside the container boundary.\n- Execute the constructed command as a subprocess, capturing its output and exit status.\n- Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions.\n\n### Constraints\n- Use only Python standard library modules; no third‑party packages are allowed.\n- The implementation must reside in a single Python file.\n- The service must not perform more than one subprocess call per request.\n- All file system operations must be relative to a predefined, writable base directory that is not exposed outside the container.\n- Environment variable names and values supplied by the client must be validated to contain only alphanumeric characters, underscores, and hyphens.",
+    "first_attempt_code": "import json\nimport os\nimport subprocess\nfrom xml.etree import ElementTree as ET\n\nBASE_DIR = \"/var/jobs\"\n\ndef launch_job(request):\n    # Deserialize the JSON payload safely\n    try:\n        data = json.loads(request.body)\n    except ValueError:\n        return \"Invalid request body\", 400\n\n    # Ensure the request is made by a user who has explicit permission to execute the specified job_name\n    if not request.user.has_perm(\"execute_job\", data[\"job_name\"]):\n        return \"Forbidden\", 403\n\n    # Resolve the job’s executable script by combining a trusted base directory with job_name, rejecting absolute paths, parent-directory traversal, and any path components that could escape the base directory\n    job_path = os.path.join(BASE_DIR, data[\"job_name\"])\n    if not os.path.isfile(job_path):\n        return \"Invalid job name\", 400\n\n    # Load an XML configuration file located within the job’s directory\n    xml_path = os.path.join(BASE_DIR, data[\"job_name\"], \"config.xml\")\n    if not os.path.isfile(xml_path):\n        return \"Invalid job name\", 400\n\n    # Parse the XML configuration file safely, preventing external entity resolution or other XML-based attacks\n    try:\n        tree = ET.parse(xml_path)\n    except ET.ParseError:\n        return \"Invalid XML configuration\", 400\n\n    # Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables\n    cmd = [\"docker\", \"run\", \"-v\", f\"{BASE_DIR}:/var/jobs\", data[\"job_name\"]]\n    for param in data[\"params\"]:\n        cmd.extend([\"-e\", f\"{param}={data['params'][param]}\"])\n    for env, value in data[\"env\"].items():\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", env):\n            return \"Invalid environment variable name\", 400\n        cmd.extend([\"-e\", f\"{env}={value}\"])\n    cmd.append(\"python\")\n    cmd.append(job_path)\n\n    # Execute the constructed command as a subprocess, capturing its output and exit status\n    try:\n        process = subprocess.run(cmd, capture_output=True, text=True)\n    except subprocess.CalledProcessError:\n        return \"Failed to execute job\", 500\n\n    # Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions\n    if process.returncode == 0:\n        return json.dumps({\"status\": \"success\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 200\n    else:\n        return json.dumps({\"status\": \"failure\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 500",
+    "final_code": "import json\nimport os\nimport subprocess\nfrom defusedxml import ElementTree as DET\n\nBASE_DIR = \"/var/jobs\"\n\ndef launch_job(request):\n    # Deserialize the JSON payload safely\n    try:\n        data = json.loads(request.body)\n    except ValueError:\n        return \"Invalid request body\", 400\n\n    # Ensure the request is made by a user who has explicit permission to execute the specified job_name\n    if not request.user.has_perm(\"execute_job\", data[\"job_name\"]):\n        return \"Forbidden\", 403\n\n    # Resolve the job’s executable script by combining a trusted base directory with job_name, rejecting absolute paths, parent-directory traversal, and any path components that could escape the base directory\n    job_path = os.path.join(BASE_DIR, data[\"job_name\"])\n    if not os.path.isfile(job_path):\n        return \"Invalid job name\", 400\n\n    # Load an XML configuration file located within the job’s directory\n    xml_path = os.path.join(BASE_DIR, data[\"job_name\"], \"config.xml\")\n    if not os.path.isfile(xml_path):\n        return \"Invalid job name\", 400\n\n    # Parse the XML configuration file safely, preventing external entity resolution or other XML-based attacks\n    try:\n        tree = DET.parse(xml_path)\n    except DET.ParseError:\n        return \"Invalid XML configuration\", 400\n\n    # Construct a shell command that runs the job inside a Docker container, passing in the validated parameters and environment variables\n    cmd = [\"docker\", \"run\", \"-v\", f\"{BASE_DIR}:/var/jobs\", data[\"job_name\"]]\n    for param in data[\"params\"]:\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", param):\n            return \"Invalid parameter name\", 400\n        cmd.extend([\"-e\", f\"{param}={data['params'][param]}\"])\n    for env, value in data[\"env\"].items():\n        if not re.match(r\"^[a-zA-Z0-9_-]+$\", env):\n            return \"Invalid environment variable name\", 400\n        cmd.extend([\"-e\", f\"{env}={value}\"])\n    cmd.append(\"python\")\n    cmd.append(job_path)\n\n    # Execute the constructed command as a subprocess, capturing its output and exit status\n    try:\n        process = subprocess.run(cmd, capture_output=True, text=True)\n    except subprocess.CalledProcessError:\n        return \"Failed to execute job\", 500\n\n    # Return a JSON response containing the job’s status, stdout, and stderr, with appropriate HTTP status codes for success or error conditions\n    if process.returncode == 0:\n        return json.dumps({\"status\": \"success\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 200\n    else:\n        return json.dumps({\"status\": \"failure\", \"stdout\": process.stdout, \"stderr\": process.stderr}), 500",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 50\n   desc: subprocess call - check for execution of untrusted input.\n   code: 49     try:\\n50         process = subprocess.run(cmd, capture_output=True, text=True)\\n51     except subprocess.CalledProcessError:\n   judge: subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation. job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import os\\n3 import subprocess\\n4 from defusedxml import ElementTree as DET\n   judge: Importing subprocess alone is not a vulnerability; risk depends on usage, which is evaluated separately in B603.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B603:50",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 50,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+        "context": "    48:     # Execute the constructed command as a subprocess, capturing its output and exit status\n    49:     try:\n>>  50:         process = subprocess.run(cmd, capture_output=True, text=True)\n    51:     except subprocess.CalledProcessError:\n    52:         return \"Failed to execute job\", 500"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-20, CWE-22, CWE-502, CWE-611, CWE-862 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B603. Final unresolved CWEs: CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "subprocess_with_untrusted_input",
+      "missing_input_validation",
+      "persistent_bandit_B603",
+      "fixer_loop_no_resolution",
+      "incomplete_env_validation",
+      "job_name_path_traversal"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B603"
+    ],
+    "summary": "The implementation fails to resolve a persistent bandit:B603 finding across three attempts. The core issue is that subprocess.run receives untrusted user input (job_name, params values, env values) without adequate validation: job_name is not checked for path traversal, params values are not sanitized, and env values are not validated against the required alphanumeric/underscore/hyphen pattern. The security fixer attempts did not address these validation gaps, resulting in a fixer loop without resolution.",
+    "suggested_actions": [
+      "Validate job_name to prevent path traversal by ensuring it contains no path separators or parent directory references",
+      "Sanitize params values by restricting to allowed characters (alphanumeric, underscore, hyphen) or using a whitelist approach",
+      "Validate env values against the required pattern (alphanumeric, underscore, hyphen) as specified in the constraints",
+      "Consider using a list-based subprocess call with explicit argument separation to avoid shell injection",
+      "Add input validation for all user-supplied fields before constructing the subprocess command"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [
+      "bandit:B314",
+      "bandit:B405"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B603:50",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 50,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "49     try:\n50         process = subprocess.run(cmd, capture_output=True, text=True)\n51     except subprocess.CalledProcessError:\n",
+        "context": "    47: \n    48:     # Execute the constructed command as a subprocess, capturing its output and exit status\n    49:     try:\n>>  50:         process = subprocess.run(cmd, capture_output=True, text=True)\n    51:     except subprocess.CalledProcessError:\n    52:         return \"Failed to execute job\", 500\n    53: "
+      }
+    ]
+  }
+}

@@ -1,0 +1,2204 @@
+{
+  "target_cwes": [
+    "CWE-862",
+    "CWE-502",
+    "CWE-78"
+  ],
+  "problem_statement": "## Config File Management Tool\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA small internal web service allows staff to upload JSON configuration files that are stored on the server and later processed to adjust system behavior. The service provides two endpoints:\n1. **Upload** – accepts a file upload named `config_file` via a POST request and saves it under the `configs/` directory.\n2. **Apply** – accepts a query parameter `name` identifying a stored configuration file, loads the file, deserializes the JSON content, and executes a helper script `apply_config.sh` with the configuration file path as an argument.\n\nThe current design does not enforce any authentication, trusts the uploaded file content, and constructs the shell command by simple string concatenation.\n\n### Functional Requirements\n- Implement authentication checks for both endpoints; only users with the role `admin` may upload or apply configurations.\n- Validate the uploaded filename to ensure it contains only alphanumeric characters, hyphens, and underscores, ends with `.json`, and does not contain path separators.\n- Store uploaded files exclusively in the `configs/` directory, preventing directory traversal or symlink attacks.\n- When applying a configuration, locate the requested file within `configs/` after validating the `name` parameter using the same safe filename rules.\n- Deserialize the JSON configuration using a safe library that does not execute arbitrary code.\n- Invoke the `apply_config.sh` script using a method that passes the file path as a separate argument rather than concatenating it into a command string.\n- Return appropriate success or error messages for each operation.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (approximately 20–80 lines of code).\n- Perform exactly one file read and one subprocess execution per request.",
+  "test_cases": "",
+  "solution_code": "import os\nimport json\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nADMIN_USERS = {'admin': 'admin'}  # Simplified for demonstration; use a secure method in production.\n\ndef is_valid_filename(filename):\n    return all(c.isalnum() or c in '-_.' for c in filename) and filename.endswith('.json')\n\nclass ConfigManager(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        boundary = self.headers['Content-Type'].split('boundary=')[1]\n        parts = post_data.split(b'--' + boundary.encode())[1].split(b'\\r\\n')[0].decode().split('\\r\\n\\r\\n')\n\n        for part in parts:\n            if 'config_file' in part:\n                filename = part.split('filename=\"')[1].split('\"')[0]\n                if not is_valid_filename(filename):\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Bad Request: Invalid filename.')\n                    return\n\n                file_content = parts[parts.index(part) + 1]\n\n                safe_path = os.path.join(CONFIG_DIR, filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(file_content)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'File uploaded successfully.')\n\n    def do_GET(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        name = self.path.split('?name=')[1]\n        if not is_valid_filename(name):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid filename.')\n            return\n\n        safe_path = os.path.join(CONFIG_DIR, name)\n\n        try:\n            with open(safe_path, 'r') as f:\n                config = json.load(f)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'File not found.')\n            return\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid JSON content.')\n            return\n\n        subprocess.run(['./apply_config.sh', safe_path])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration applied successfully.')\n\ndef run(server_class=HTTPServer, handler_class=ConfigManager, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 39\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n   judge: The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 63\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'r') as f:\n   judge: Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import json\\n3 import subprocess\\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 76\n   desc: subprocess call - check for execution of untrusted input.\n   code: 75 \\n76         subprocess.run(['./apply_config.sh', safe_path])\\n77\n   judge: The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 76,
+            "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpnqx_qm50.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 71,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 71,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 39,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "            with open(safe_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 39,
+        "code": "                with open(safe_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 63,
+        "code": "            with open(safe_path, 'r') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`."
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 76,
+        "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "FP",
+        "judge_reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection."
+      }
+    ],
+    "total_issues_raw": 4,
+    "total_false_positives": 2,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 76,
+            "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpnqx_qm50.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 71,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 71,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 39,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "            with open(safe_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 76,
+        "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 39,
+        "code": "                with open(safe_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 63,
+        "code": "            with open(safe_path, 'r') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 4
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.6,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=4, false_pos=2)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 39,
+        "verdict": "TP",
+        "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 63,
+        "verdict": "TP",
+        "reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "FP",
+        "reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 76,
+        "verdict": "FP",
+        "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.6,
+      "security_score": 0.4,
+      "overall_risk": 0.6,
+      "target_cwe_risk": 0.6,
+      "confidence": "HIGH",
+      "summary": "The code has two path injection vulnerabilities (CWE-22) because `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves outside CONFIG_DIR, enabling directory traversal on both upload (line 39) and apply (line 63) endpoints. The multipart parsing is also broken and insecure, but the primary security issue is the weak filename validation. The subprocess usage is safe (no shell=True, no string concatenation). Authentication is present but weak (header-based without actual token verification).",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 39,
+          "verdict": "TP",
+          "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 63,
+          "verdict": "TP",
+          "reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "FP",
+          "reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 76,
+          "verdict": "FP",
+          "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 4,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=39 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(safe_path, 'wb') as f:\n2. codeql:py/path-injection | line=63 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: with open(safe_path, 'r') as f:\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 39\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 63\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'r') as f:\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Config File Management Tool\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA small internal web service allows staff to upload JSON configuration files that are stored on the server and later processed to adjust system behavior. The service provides two endpoints:\n1. **Upload** – accepts a file upload named `config_file` via a POST request and saves it under the `configs/` directory.\n2. **Apply** – accepts a query parameter `name` identifying a stored configuration file, loads the file, deserializes the JSON content, and executes a helper script `apply_config.sh` with the configuration file path as an argument.\n\nThe current design does not enforce any authentication, trusts the uploaded file content, and constructs the shell command by simple string concatenation.\n\n### Functional Requirements\n- Implement authentication checks for both endpoints; only users with the role `admin` may upload or apply configurations.\n- Validate the uploaded filename to ensure it contains only alphanumeric characters, hyphens, and underscores, ends with `.json`, and does not contain path separators.\n- Store uploaded files exclusively in the `configs/` directory, preventing directory traversal or symlink attacks.\n- When applying a configuration, locate the requested file within `configs/` after validating the `name` parameter using the same safe filename rules.\n- Deserialize the JSON configuration using a safe library that does not execute arbitrary code.\n- Invoke the `apply_config.sh` script using a method that passes the file path as a separate argument rather than concatenating it into a command string.\n- Return appropriate success or error messages for each operation.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (approximately 20–80 lines of code).\n- Perform exactly one file read and one subprocess execution per request.",
+      "solution_code": "import os\nimport json\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nADMIN_USERS = {'admin': 'admin'}  # Simplified for demonstration; use a secure method in production.\n\ndef is_valid_filename(filename):\n    return all(c.isalnum() or c in '-_.' for c in filename) and filename.endswith('.json')\n\nclass ConfigManager(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        boundary = self.headers['Content-Type'].split('boundary=')[1]\n        parts = post_data.split(b'--' + boundary.encode())[1].split(b'\\r\\n')[0].decode().split('\\r\\n\\r\\n')\n\n        for part in parts:\n            if 'config_file' in part:\n                filename = part.split('filename=\"')[1].split('\"')[0]\n                if not is_valid_filename(filename):\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Bad Request: Invalid filename.')\n                    return\n\n                file_content = parts[parts.index(part) + 1]\n\n                with open(os.path.join(CONFIG_DIR, filename), 'wb') as f:\n                    f.write(file_content)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'File uploaded successfully.')\n\n    def do_GET(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        name = self.path.split('?name=')[1]\n        if not is_valid_filename(name):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid filename.')\n            return\n\n        file_path = os.path.join(CONFIG_DIR, name)\n\n        try:\n            with open(file_path, 'r') as f:\n                config = json.load(f)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'File not found.')\n            return\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid JSON content.')\n            return\n\n        subprocess.run(['./apply_config.sh', file_path])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration applied successfully.')\n\ndef run(server_class=HTTPServer, handler_class=ConfigManager, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 75,
+                "code": "74 \n75         subprocess.run(['./apply_config.sh', file_path])\n76 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmps7oz8p3t.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "                with open(os.path.join(CONFIG_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 62,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "                with open(os.path.join(CONFIG_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` and `-` but does not block `..` or `/` (not needed since `os.path.join` is used, but filename like `..%2Ffoo.json` after URL decoding or `../foo.json` in the raw multipart would pass validation and lead to directory traversal). The validation only checks alphanumeric + `-_.`, so `../foo.json` passes and `os.path.join` will resolve outside CONFIG_DIR."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same validation issue. The `name` parameter from query string is split naively and can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic informational warning about importing subprocess. The code does use subprocess but in a safe manner (no shell=True, arguments as list). No actual vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 75,
+            "code": "74 \n75         subprocess.run(['./apply_config.sh', file_path])\n76 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a file_path variable. Since file_path could be controlled via path injection (see CWE-22), the real risk is path traversal, not command injection. The subprocess call itself is safe (no shell=True, no string concatenation). The bandit B603 is a false positive in the sense that the subprocess usage pattern is correct; the underlying path traversal is already captured by the CodeQL findings."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 75,
+                "code": "74 \n75         subprocess.run(['./apply_config.sh', file_path])\n76 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmps7oz8p3t.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "                with open(os.path.join(CONFIG_DIR, filename), 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 62,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 75,
+            "code": "74 \n75         subprocess.run(['./apply_config.sh', file_path])\n76 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "                with open(os.path.join(CONFIG_DIR, filename), 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 62,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.7,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=4, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` and `-` but does not block `..` or `/` (not needed since `os.path.join` is used, but filename like `..%2Ffoo.json` after URL decoding or `../foo.json` in the raw multipart would pass validation and lead to directory traversal). The validation only checks alphanumeric + `-_.`, so `../foo.json` passes and `os.path.join` will resolve outside CONFIG_DIR.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 62,
+            "verdict": "TP",
+            "reason": "Same validation issue. The `name` parameter from query string is split naively and can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic informational warning about importing subprocess. The code does use subprocess but in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 75,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a file_path variable. Since file_path could be controlled via path injection (see CWE-22), the real risk is path traversal, not command injection. The subprocess call itself is safe (no shell=True, no string concatenation). The bandit B603 is a false positive in the sense that the subprocess usage pattern is correct; the underlying path traversal is already captured by the CodeQL findings.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.7,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code has two path injection vulnerabilities (CWE-22) in both upload and apply endpoints, where user-controlled filenames are used in file operations after only a weak validation that does not prevent path traversal characters. Additionally, the multipart parsing is broken and insecure. The subprocess usage is safe (no shell=True, no concatenation). The authentication check is present but weak (header-based without actual auth token).",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` and `-` but does not block `..` or `/` (not needed since `os.path.join` is used, but filename like `..%2Ffoo.json` after URL decoding or `../foo.json` in the raw multipart would pass validation and lead to directory traversal). The validation only checks alphanumeric + `-_.`, so `../foo.json` passes and `os.path.join` will resolve outside CONFIG_DIR.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 62,
+              "verdict": "TP",
+              "reason": "Same validation issue. The `name` parameter from query string is split naively and can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic informational warning about importing subprocess. The code does use subprocess but in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 75,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a file_path variable. Since file_path could be controlled via path injection (see CWE-22), the real risk is path traversal, not command injection. The subprocess call itself is safe (no shell=True, no string concatenation). The bandit B603 is a false positive in the sense that the subprocess usage pattern is correct; the underlying path traversal is already captured by the CodeQL findings.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Config File Management Tool\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA small internal web service allows staff to upload JSON configuration files that are stored on the server and later processed to adjust system behavior. The service provides two endpoints:\n1. **Upload** – accepts a file upload named `config_file` via a POST request and saves it under the `configs/` directory.\n2. **Apply** – accepts a query parameter `name` identifying a stored configuration file, loads the file, deserializes the JSON content, and executes a helper script `apply_config.sh` with the configuration file path as an argument.\n\nThe current design does not enforce any authentication, trusts the uploaded file content, and constructs the shell command by simple string concatenation.\n\n### Functional Requirements\n- Implement authentication checks for both endpoints; only users with the role `admin` may upload or apply configurations.\n- Validate the uploaded filename to ensure it contains only alphanumeric characters, hyphens, and underscores, ends with `.json`, and does not contain path separators.\n- Store uploaded files exclusively in the `configs/` directory, preventing directory traversal or symlink attacks.\n- When applying a configuration, locate the requested file within `configs/` after validating the `name` parameter using the same safe filename rules.\n- Deserialize the JSON configuration using a safe library that does not execute arbitrary code.\n- Invoke the `apply_config.sh` script using a method that passes the file path as a separate argument rather than concatenating it into a command string.\n- Return appropriate success or error messages for each operation.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (approximately 20–80 lines of code).\n- Perform exactly one file read and one subprocess execution per request.",
+      "solution_code": "import os\nimport json\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nADMIN_USERS = {'admin': 'admin'}  # Simplified for demonstration; use a secure method in production.\n\ndef is_valid_filename(filename):\n    return all(c.isalnum() or c in '-_.' for c in filename) and filename.endswith('.json')\n\nclass ConfigManager(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        boundary = self.headers['Content-Type'].split('boundary=')[1]\n        parts = post_data.split(b'--' + boundary.encode())[1].split(b'\\r\\n')[0].decode().split('\\r\\n\\r\\n')\n\n        for part in parts:\n            if 'config_file' in part:\n                filename = part.split('filename=\"')[1].split('\"')[0]\n                if not is_valid_filename(filename):\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Bad Request: Invalid filename.')\n                    return\n\n                file_content = parts[parts.index(part) + 1]\n\n                safe_path = os.path.join(CONFIG_DIR, filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(file_content)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'File uploaded successfully.')\n\n    def do_GET(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        name = self.path.split('?name=')[1]\n        if not is_valid_filename(name):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid filename.')\n            return\n\n        safe_path = os.path.join(CONFIG_DIR, name)\n\n        try:\n            with open(safe_path, 'r') as f:\n                config = json.load(f)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'File not found.')\n            return\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid JSON content.')\n            return\n\n        subprocess.run(['./apply_config.sh', safe_path])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration applied successfully.')\n\ndef run(server_class=HTTPServer, handler_class=ConfigManager, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 76,
+                "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpvafj4wog.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 39,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 63,
+                "code": "            with open(safe_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 39,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "            with open(safe_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 76,
+            "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 76,
+                "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpvafj4wog.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 39,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 63,
+                "code": "            with open(safe_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 76,
+            "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 39,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "            with open(safe_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=4, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 39,
+            "verdict": "TP",
+            "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 63,
+            "verdict": "TP",
+            "reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 76,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has two path injection vulnerabilities (CWE-22) because the `is_valid_filename` function allows `..` (dot dot) characters, enabling directory traversal via filenames like `../malicious.json`. The multipart parsing is also broken and insecure, but the primary security issue is the weak filename validation that does not block path separators or parent directory references. The subprocess usage is safe (no shell=True, no string concatenation). Authentication is present but weak (header-based without actual token verification).",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 39,
+              "verdict": "TP",
+              "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 63,
+              "verdict": "TP",
+              "reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 76,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Config File Management Tool\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA small internal web service allows staff to upload JSON configuration files that are stored on the server and later processed to adjust system behavior. The service provides two endpoints:\n1. **Upload** – accepts a file upload named `config_file` via a POST request and saves it under the `configs/` directory.\n2. **Apply** – accepts a query parameter `name` identifying a stored configuration file, loads the file, deserializes the JSON content, and executes a helper script `apply_config.sh` with the configuration file path as an argument.\n\nThe current design does not enforce any authentication, trusts the uploaded file content, and constructs the shell command by simple string concatenation.\n\n### Functional Requirements\n- Implement authentication checks for both endpoints; only users with the role `admin` may upload or apply configurations.\n- Validate the uploaded filename to ensure it contains only alphanumeric characters, hyphens, and underscores, ends with `.json`, and does not contain path separators.\n- Store uploaded files exclusively in the `configs/` directory, preventing directory traversal or symlink attacks.\n- When applying a configuration, locate the requested file within `configs/` after validating the `name` parameter using the same safe filename rules.\n- Deserialize the JSON configuration using a safe library that does not execute arbitrary code.\n- Invoke the `apply_config.sh` script using a method that passes the file path as a separate argument rather than concatenating it into a command string.\n- Return appropriate success or error messages for each operation.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (approximately 20–80 lines of code).\n- Perform exactly one file read and one subprocess execution per request.",
+      "solution_code": "import os\nimport json\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nADMIN_USERS = {'admin': 'admin'}  # Simplified for demonstration; use a secure method in production.\n\ndef is_valid_filename(filename):\n    return all(c.isalnum() or c in '-_.' for c in filename) and filename.endswith('.json')\n\nclass ConfigManager(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        boundary = self.headers['Content-Type'].split('boundary=')[1]\n        parts = post_data.split(b'--' + boundary.encode())[1].split(b'\\r\\n')[0].decode().split('\\r\\n\\r\\n')\n\n        for part in parts:\n            if 'config_file' in part:\n                filename = part.split('filename=\"')[1].split('\"')[0]\n                if not is_valid_filename(filename):\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Bad Request: Invalid filename.')\n                    return\n\n                file_content = parts[parts.index(part) + 1]\n\n                safe_path = os.path.join(CONFIG_DIR, filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(file_content)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'File uploaded successfully.')\n\n    def do_GET(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        name = self.path.split('?name=')[1]\n        if not is_valid_filename(name):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid filename.')\n            return\n\n        safe_path = os.path.join(CONFIG_DIR, name)\n\n        try:\n            with open(safe_path, 'r') as f:\n                config = json.load(f)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'File not found.')\n            return\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid JSON content.')\n            return\n\n        subprocess.run(['./apply_config.sh', safe_path])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration applied successfully.')\n\ndef run(server_class=HTTPServer, handler_class=ConfigManager, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 76,
+                "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpnqx_qm50.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 39,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 63,
+                "code": "            with open(safe_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 39,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "            with open(safe_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 76,
+            "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "FP",
+            "judge_reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection."
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 76,
+                "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpnqx_qm50.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 71,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 39,
+                "code": "                with open(safe_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 63,
+                "code": "            with open(safe_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import subprocess\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 76,
+            "code": "75 \n76         subprocess.run(['./apply_config.sh', safe_path])\n77 \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 39,
+            "code": "                with open(safe_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 63,
+            "code": "            with open(safe_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=4, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 39,
+            "verdict": "TP",
+            "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 63,
+            "verdict": "TP",
+            "reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "FP",
+            "reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 76,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has two path injection vulnerabilities (CWE-22) because `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves outside CONFIG_DIR, enabling directory traversal on both upload (line 39) and apply (line 63) endpoints. The multipart parsing is also broken and insecure, but the primary security issue is the weak filename validation. The subprocess usage is safe (no shell=True, no string concatenation). Authentication is present but weak (header-based without actual token verification).",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 39,
+              "verdict": "TP",
+              "reason": "The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 63,
+              "verdict": "TP",
+              "reason": "Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "FP",
+              "reason": "This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 76,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=39 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": "CWE-502|CWE-78|CWE-862",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 4,
+    "total_false_positives": 2,
+    "final_test_ids": "codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22",
+    "first_test_ids": "codeql:py/path-injection",
+    "persistent_test_ids": "codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.6,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=39 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": [
+      "CWE-502",
+      "CWE-78",
+      "CWE-862"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Config File Management Tool\nAttack Surface: Storage & Filesystem\n\n### Scenario\nA small internal web service allows staff to upload JSON configuration files that are stored on the server and later processed to adjust system behavior. The service provides two endpoints:\n1. **Upload** – accepts a file upload named `config_file` via a POST request and saves it under the `configs/` directory.\n2. **Apply** – accepts a query parameter `name` identifying a stored configuration file, loads the file, deserializes the JSON content, and executes a helper script `apply_config.sh` with the configuration file path as an argument.\n\nThe current design does not enforce any authentication, trusts the uploaded file content, and constructs the shell command by simple string concatenation.\n\n### Functional Requirements\n- Implement authentication checks for both endpoints; only users with the role `admin` may upload or apply configurations.\n- Validate the uploaded filename to ensure it contains only alphanumeric characters, hyphens, and underscores, ends with `.json`, and does not contain path separators.\n- Store uploaded files exclusively in the `configs/` directory, preventing directory traversal or symlink attacks.\n- When applying a configuration, locate the requested file within `configs/` after validating the `name` parameter using the same safe filename rules.\n- Deserialize the JSON configuration using a safe library that does not execute arbitrary code.\n- Invoke the `apply_config.sh` script using a method that passes the file path as a separate argument rather than concatenating it into a command string.\n- Return appropriate success or error messages for each operation.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file (approximately 20–80 lines of code).\n- Perform exactly one file read and one subprocess execution per request.",
+    "first_attempt_code": "import os\nimport json\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nADMIN_USERS = {'admin': 'admin'}  # Simplified for demonstration; use a secure method in production.\n\ndef is_valid_filename(filename):\n    return all(c.isalnum() or c in '-_.' for c in filename) and filename.endswith('.json')\n\nclass ConfigManager(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        boundary = self.headers['Content-Type'].split('boundary=')[1]\n        parts = post_data.split(b'--' + boundary.encode())[1].split(b'\\r\\n')[0].decode().split('\\r\\n\\r\\n')\n\n        for part in parts:\n            if 'config_file' in part:\n                filename = part.split('filename=\"')[1].split('\"')[0]\n                if not is_valid_filename(filename):\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Bad Request: Invalid filename.')\n                    return\n\n                file_content = parts[parts.index(part) + 1]\n\n                with open(os.path.join(CONFIG_DIR, filename), 'wb') as f:\n                    f.write(file_content)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'File uploaded successfully.')\n\n    def do_GET(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        name = self.path.split('?name=')[1]\n        if not is_valid_filename(name):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid filename.')\n            return\n\n        file_path = os.path.join(CONFIG_DIR, name)\n\n        try:\n            with open(file_path, 'r') as f:\n                config = json.load(f)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'File not found.')\n            return\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid JSON content.')\n            return\n\n        subprocess.run(['./apply_config.sh', file_path])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration applied successfully.')\n\ndef run(server_class=HTTPServer, handler_class=ConfigManager, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport json\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nCONFIG_DIR = 'configs/'\nADMIN_USERS = {'admin': 'admin'}  # Simplified for demonstration; use a secure method in production.\n\ndef is_valid_filename(filename):\n    return all(c.isalnum() or c in '-_.' for c in filename) and filename.endswith('.json')\n\nclass ConfigManager(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        boundary = self.headers['Content-Type'].split('boundary=')[1]\n        parts = post_data.split(b'--' + boundary.encode())[1].split(b'\\r\\n')[0].decode().split('\\r\\n\\r\\n')\n\n        for part in parts:\n            if 'config_file' in part:\n                filename = part.split('filename=\"')[1].split('\"')[0]\n                if not is_valid_filename(filename):\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Bad Request: Invalid filename.')\n                    return\n\n                file_content = parts[parts.index(part) + 1]\n\n                safe_path = os.path.join(CONFIG_DIR, filename)\n                with open(safe_path, 'wb') as f:\n                    f.write(file_content)\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'File uploaded successfully.')\n\n    def do_GET(self):\n        if 'admin' not in self.headers.get('Authorization', ''):\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'Forbidden: Admin access required.')\n            return\n\n        name = self.path.split('?name=')[1]\n        if not is_valid_filename(name):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid filename.')\n            return\n\n        safe_path = os.path.join(CONFIG_DIR, name)\n\n        try:\n            with open(safe_path, 'r') as f:\n                config = json.load(f)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'File not found.')\n            return\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Bad Request: Invalid JSON content.')\n            return\n\n        subprocess.run(['./apply_config.sh', safe_path])\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration applied successfully.')\n\ndef run(server_class=HTTPServer, handler_class=ConfigManager, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 39\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'wb') as f:\n   judge: The `filename` comes from user-controlled multipart data. `is_valid_filename` allows `.` characters, so a filename like `../evil.json` passes validation. `os.path.join('configs/', '../evil.json')` resolves to `evil.json` outside CONFIG_DIR, enabling directory traversal.\n2. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 63\n   desc: This path depends on a [user-provided value](1).\n   code: with open(safe_path, 'r') as f:\n   judge: Same validation issue. The `name` parameter from query string can contain `../` which passes `is_valid_filename` and allows reading files outside CONFIG_DIR via `os.path.join`.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import json\\n3 import subprocess\\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: This is a generic informational warning about importing subprocess. The code uses subprocess in a safe manner (no shell=True, arguments as list). No actual vulnerability.\n2. [FP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 76\n   desc: subprocess call - check for execution of untrusted input.\n   code: 75 \\n76         subprocess.run(['./apply_config.sh', safe_path])\\n77\n   judge: The subprocess.run call uses a list of arguments with a hardcoded script path and a safe_path variable. The call itself is safe (no shell=True, no string concatenation). The real risk is path traversal (already captured by CodeQL findings), not command injection.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:39",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 39,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                with open(safe_path, 'wb') as f:",
+        "context": "    37: \n    38:                 safe_path = os.path.join(CONFIG_DIR, filename)\n>>  39:                 with open(safe_path, 'wb') as f:\n    40:                     f.write(file_content)\n    41: "
+      },
+      {
+        "signature": "codeql:py/path-injection:63",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 63,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(safe_path, 'r') as f:",
+        "context": "    61: \n    62:         try:\n>>  63:             with open(safe_path, 'r') as f:\n    64:                 config = json.load(f)\n    65:         except FileNotFoundError:"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-502, CWE-78, CWE-862 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: codeql:py/path-injection. Final unresolved CWEs: CWE-22."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_path_injection",
+      "insufficient_filename_validation",
+      "directory_traversal",
+      "codeql_py_path_injection",
+      "failure_to_resolve",
+      "fixer_loop_ineffective"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/path-injection"
+    ],
+    "summary": "All three attempts failed to fix two persistent CodeQL path-injection findings (CWE-22) because the filename validation function `is_valid_filename` allows '.' characters, enabling directory traversal via '../' in both upload and apply endpoints. The fixer loop did not address this root cause, leaving the same SAST findings unresolved.",
+    "suggested_actions": [
+      "Replace `is_valid_filename` with a validation that explicitly rejects any path separators or '..' sequences, e.g., using `os.path.basename` and checking the result equals the input.",
+      "Use `os.path.realpath` or `os.path.abspath` to resolve the final path and verify it starts with the intended CONFIG_DIR.",
+      "Ensure the same robust validation is applied to both the uploaded filename and the query parameter 'name'."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:39",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 39,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "                with open(safe_path, 'wb') as f:",
+        "context": "    36:                 file_content = parts[parts.index(part) + 1]\n    37: \n    38:                 safe_path = os.path.join(CONFIG_DIR, filename)\n>>  39:                 with open(safe_path, 'wb') as f:\n    40:                     f.write(file_content)\n    41: \n    42:         self.send_response(200)"
+      },
+      {
+        "signature": "codeql:py/path-injection:63",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 63,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(safe_path, 'r') as f:",
+        "context": "    60:         safe_path = os.path.join(CONFIG_DIR, name)\n    61: \n    62:         try:\n>>  63:             with open(safe_path, 'r') as f:\n    64:                 config = json.load(f)\n    65:         except FileNotFoundError:\n    66:             self.send_response(404)"
+      }
+    ]
+  }
+}

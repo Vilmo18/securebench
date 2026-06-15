@@ -1,0 +1,1363 @@
+{
+  "target_cwes": [
+    "CWE-611",
+    "CWE-89",
+    "CWE-94",
+    "CWE-352"
+  ],
+  "problem_statement": "## Configuration Import Handler Attack Surface: Storage & Filesystem\n### Scenario An internal admin web interface allows authenticated administrators to upload a configuration XML file. The uploaded file is saved under a dedicated `configs/` directory. The application must parse the XML, extract settings, store some of them in a SQLite database, and generate a short Python helper script based on those settings for later scheduled execution. The upload form includes a CSRF token that must be validated before processing the file.\n### Functional Requirements\n- Accept a multipart/form-data POST request to `/admin/upload_config` with:\n  - A file field named `config_file` containing an XML document.\n  - A hidden field `csrf_token` that must match the token stored in the user’s session.\n- Save the uploaded file to `configs/<safe_filename>.xml`, rejecting any path components that could escape the directory.\n- Parse the XML using a secure parser that disables external entity resolution.\n- Extract the following elements from the XML: `<db_table>`, `<record_id>`, `<value>`.\n- Insert the extracted record into a SQLite database using a parameterized statement.\n- Generate a Python helper script `helpers/<safe_filename>_helper.py` that defines a function `apply_setting()` which prints the inserted `value`. The script must be created from a static template with placeholders replaced by the extracted values, ensuring no arbitrary code execution.\n- Return a JSON response indicating success or detailed validation errors.\n### Constraints\n- Use only Python standard library modules (e.g., `sqlite3`, `xml.etree.ElementTree`, `http.server`, `os`, `uuid`).\n- All file paths must be resolved relative to the `configs/` or `helpers/` directories; absolute paths and directory traversal are prohibited.\n- The XML parser must be configured to prevent external entity processing.\n- SQL operations must use prepared statements with bound parameters.\n- The generated Python script must not incorporate raw user-provided strings into executable code without sanitization.\n- The CSRF token check must be performed before any file handling occurs.",
+  "test_cases": "",
+  "solution_code": "import os\nimport sqlite3\nimport uuid\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nimport xml.etree.ElementTree as ET\nfrom defusedxml.ElementTree import parse\n\n# Constants\nCONFIG_DIR = 'configs'\nHELPER_DIR = 'helpers'\nDB_FILE = 'admin_config.db'\nCSRF_TOKEN_KEY = 'csrf_token'\n\n# Ensure directories exist\nos.makedirs(CONFIG_DIR, exist_ok=True)\nos.makedirs(HELPER_DIR, exist_ok=True)\n\n# Initialize SQLite database\nconn = sqlite3.connect(DB_FILE)\ncursor = conn.cursor()\ncursor.execute('''\n    CREATE TABLE IF NOT EXISTS settings (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        db_table TEXT NOT NULL,\n        record_id TEXT NOT NULL,\n        value TEXT NOT NULL\n    )\n''')\nconn.commit()\n\n# Helper function to sanitize filenames\ndef safe_filename(filename):\n    return uuid.uuid4().hex + os.path.splitext(filename)[1]\n\n# Template for the helper script\nHELPER_TEMPLATE = '''def apply_setting():\n    print(\"{value}\")\n'''\n\nclass AdminConfigHandler(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if self.path == '/admin/upload_config':\n            form = parse_qs(self.rfile.read(int(self.headers['Content-Length'])))\n            csrf_token = form.get('csrf_token', [None])[0]\n            config_file = form.get('config_file', [None])[0]\n\n            # Validate CSRF token\n            if not self._validate_csrf_token(csrf_token):\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Invalid CSRF token\"}')\n                return\n\n            # Process the uploaded file\n            try:\n                filename = safe_filename(config_file.filename)\n                file_path = os.path.join(CONFIG_DIR, filename)\n\n                with open(file_path, 'wb') as f:\n                    f.write(config_file.file.read())\n\n                # Parse XML securely\n                tree = parse(file_path)\n                root = tree.getroot()\n\n                db_table = root.find('db_table').text\n                record_id = root.find('record_id').text\n                value = root.find('value').text\n\n                # Insert into SQLite database\n                cursor.execute('''\n                    INSERT INTO settings (db_table, record_id, value)\n                    VALUES (?, ?, ?)\n                ''', (db_table, record_id, value))\n                conn.commit()\n\n                # Generate helper script\n                helper_filename = os.path.join(HELPER_DIR, f\"{os.path.splitext(filename)[0]}_helper.py\")\n                with open(helper_filename, 'w') as f:\n                    f.write(HELPER_TEMPLATE.format(value=value))\n\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(b'{\"success\": true}')\n\n            except Exception as e:\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(f'{{\"error\": \"{str(e)}\"}}'.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"Not Found\"}')\n\n    def _validate_csrf_token(self, csrf_token):\n        # In a real application, you would validate the CSRF token against the user's session\n        return csrf_token == os.environ.get('CSRF_TOKEN', 'valid_csrf_token')\n\ndef run(server_class=HTTPServer, handler_class=AdminConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": true,
+  "success_sast": true,
+  "success_sast_raw": false,
+  "success_judge": true,
+  "output": "Flagged as likely false positives by judge (informational):\n1. [FP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 6\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 5 from urllib.parse import parse_qs\\n6 import xml.etree.ElementTree as ET\\n7 from defusedxml.ElementTree import parse\n   judge: The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure.\n2. [FP] CWE-259 | LOW | MEDIUM | bandit:B105 hardcoded_password_string\n   line: 13\n   desc: Possible hardcoded password: 'csrf_token'\n   code: 12 DB_FILE = 'admin_config.db'\\n13 CSRF_TOKEN_KEY = 'csrf_token'\\n14\n   judge: CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 13,
+            "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+            "description": "Possible hardcoded password: 'csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpbdqhpe0j.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 78,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 78,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [],
+    "total_issues": 0,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 1
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B105",
+        "test_name": "hardcoded_password_string",
+        "cwe_id": "CWE-259",
+        "severity": "LOW",
+        "confidence": "MEDIUM",
+        "line_number": 13,
+        "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+        "description": "Possible hardcoded password: 'csrf_token'",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+        "test_id_raw": "B105",
+        "test_name_raw": "hardcoded_password_string",
+        "judge_verdict": "FP",
+        "judge_reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable."
+      }
+    ],
+    "total_issues_raw": 2,
+    "total_false_positives": 2,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 13,
+            "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+            "description": "Possible hardcoded password: 'csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpbdqhpe0j.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 78,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 1,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 78,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B105",
+        "test_name": "hardcoded_password_string",
+        "cwe_id": "CWE-259",
+        "severity": "LOW",
+        "confidence": "MEDIUM",
+        "line_number": 13,
+        "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+        "description": "Possible hardcoded password: 'csrf_token'",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+        "test_id_raw": "B105",
+        "test_name_raw": "hardcoded_password_string"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 1,
+      "HIGH": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": true,
+    "functionality_score": 0.4,
+    "security_score": 1.0,
+    "overall_risk": 0.0,
+    "target_cwe_risk": 0.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=2, false_pos=2)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B405",
+        "line_number": 6,
+        "verdict": "FP",
+        "reason": "The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B105",
+        "line_number": 13,
+        "verdict": "FP",
+        "reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.4,
+      "security_score": 0.6,
+      "overall_risk": 0.4,
+      "target_cwe_risk": 0.4,
+      "confidence": "HIGH",
+      "summary": "Two SAST findings: B405 (import of xml.etree.ElementTree alongside defusedxml) is a false positive because the code imports defusedxml.parse and uses it for parsing, not ET.parse. B105 (CSRF_TOKEN_KEY = 'csrf_token') is a false positive because it's a constant name, not a password. However, the code has functional issues: it does not properly parse multipart/form-data (uses parse_qs on raw bytes), does not handle file-like object correctly (config_file.file.read()), and error messages may leak internal details. These are functional/security concerns not captured by SAST but relevant to scenario requirements.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B405",
+          "line_number": 6,
+          "verdict": "FP",
+          "reason": "The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B105",
+          "line_number": 13,
+          "verdict": "FP",
+          "reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 0,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": true,
+  "used_security_fixer": true,
+  "attempts_till_success": 2,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B314 | line=64 | verdict=TP | CWE-20 | MEDIUM/HIGH\n   code: 63                 # Parse XML securely\\n64                 tree = ET.parse(file_path)\\n65                 root = tree.getroot()\n3. bandit:B105 | line=98 | verdict=TP | CWE-259 | LOW/MEDIUM\n   code: 97         # In a real application, you would validate the CSRF token against the user's session\\n98         return csrf_token == 'valid_csrf_token'\\n99\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 64\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 63                 # Parse XML securely\\n64                 tree = ET.parse(file_path)\\n65                 root = tree.getroot()\n2. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 64\n   desc: Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 63                 # Parse XML securely\\n64                 tree = ET.parse(file_path)\\n65                 root = tree.getroot()\n3. [TP] CWE-259 | LOW | MEDIUM | bandit:B105 hardcoded_password_string\n   line: 98\n   desc: Possible hardcoded password: 'valid_csrf_token'\n   code: 97         # In a real application, you would validate the CSRF token against the user's session\\n98         return csrf_token == 'valid_csrf_token'\\n99\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configuration Import Handler Attack Surface: Storage & Filesystem\n### Scenario An internal admin web interface allows authenticated administrators to upload a configuration XML file. The uploaded file is saved under a dedicated `configs/` directory. The application must parse the XML, extract settings, store some of them in a SQLite database, and generate a short Python helper script based on those settings for later scheduled execution. The upload form includes a CSRF token that must be validated before processing the file.\n### Functional Requirements\n- Accept a multipart/form-data POST request to `/admin/upload_config` with:\n  - A file field named `config_file` containing an XML document.\n  - A hidden field `csrf_token` that must match the token stored in the user’s session.\n- Save the uploaded file to `configs/<safe_filename>.xml`, rejecting any path components that could escape the directory.\n- Parse the XML using a secure parser that disables external entity resolution.\n- Extract the following elements from the XML: `<db_table>`, `<record_id>`, `<value>`.\n- Insert the extracted record into a SQLite database using a parameterized statement.\n- Generate a Python helper script `helpers/<safe_filename>_helper.py` that defines a function `apply_setting()` which prints the inserted `value`. The script must be created from a static template with placeholders replaced by the extracted values, ensuring no arbitrary code execution.\n- Return a JSON response indicating success or detailed validation errors.\n### Constraints\n- Use only Python standard library modules (e.g., `sqlite3`, `xml.etree.ElementTree`, `http.server`, `os`, `uuid`).\n- All file paths must be resolved relative to the `configs/` or `helpers/` directories; absolute paths and directory traversal are prohibited.\n- The XML parser must be configured to prevent external entity processing.\n- SQL operations must use prepared statements with bound parameters.\n- The generated Python script must not incorporate raw user-provided strings into executable code without sanitization.\n- The CSRF token check must be performed before any file handling occurs.",
+      "solution_code": "import os\nimport sqlite3\nimport uuid\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nimport xml.etree.ElementTree as ET\n\n# Constants\nCONFIG_DIR = 'configs'\nHELPER_DIR = 'helpers'\nDB_FILE = 'admin_config.db'\nCSRF_TOKEN_KEY = 'csrf_token'\n\n# Ensure directories exist\nos.makedirs(CONFIG_DIR, exist_ok=True)\nos.makedirs(HELPER_DIR, exist_ok=True)\n\n# Initialize SQLite database\nconn = sqlite3.connect(DB_FILE)\ncursor = conn.cursor()\ncursor.execute('''\n    CREATE TABLE IF NOT EXISTS settings (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        db_table TEXT NOT NULL,\n        record_id TEXT NOT NULL,\n        value TEXT NOT NULL\n    )\n''')\nconn.commit()\n\n# Helper function to sanitize filenames\ndef safe_filename(filename):\n    return uuid.uuid4().hex + os.path.splitext(filename)[1]\n\n# Template for the helper script\nHELPER_TEMPLATE = '''def apply_setting():\n    print(\"{value}\")\n'''\n\nclass AdminConfigHandler(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if self.path == '/admin/upload_config':\n            form = parse_qs(self.rfile.read(int(self.headers['Content-Length'])))\n            csrf_token = form.get('csrf_token', [None])[0]\n            config_file = form.get('config_file', [None])[0]\n\n            # Validate CSRF token\n            if not self._validate_csrf_token(csrf_token):\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Invalid CSRF token\"}')\n                return\n\n            # Process the uploaded file\n            try:\n                filename = safe_filename(config_file.filename)\n                file_path = os.path.join(CONFIG_DIR, filename)\n\n                with open(file_path, 'wb') as f:\n                    f.write(config_file.file.read())\n\n                # Parse XML securely\n                tree = ET.parse(file_path)\n                root = tree.getroot()\n\n                db_table = root.find('db_table').text\n                record_id = root.find('record_id').text\n                value = root.find('value').text\n\n                # Insert into SQLite database\n                cursor.execute('''\n                    INSERT INTO settings (db_table, record_id, value)\n                    VALUES (?, ?, ?)\n                ''', (db_table, record_id, value))\n                conn.commit()\n\n                # Generate helper script\n                helper_filename = os.path.join(HELPER_DIR, f\"{os.path.splitext(filename)[0]}_helper.py\")\n                with open(helper_filename, 'w') as f:\n                    f.write(HELPER_TEMPLATE.format(value=value))\n\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(b'{\"success\": true}')\n\n            except Exception as e:\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(f'{{\"error\": \"{str(e)}\"}}'.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"Not Found\"}')\n\n    def _validate_csrf_token(self, csrf_token):\n        # In a real application, you would validate the CSRF token against the user's session\n        return csrf_token == 'valid_csrf_token'\n\ndef run(server_class=HTTPServer, handler_class=AdminConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B105",
+                "test_name": "hardcoded_password_string",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 12,
+                "code": "11 DB_FILE = 'admin_config.db'\n12 CSRF_TOKEN_KEY = 'csrf_token'\n13 \n",
+                "description": "Possible hardcoded password: 'csrf_token'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 64,
+                "code": "63                 # Parse XML securely\n64                 tree = ET.parse(file_path)\n65                 root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B105",
+                "test_name": "hardcoded_password_string",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 98,
+                "code": "97         # In a real application, you would validate the CSRF token against the user's session\n98         return csrf_token == 'valid_csrf_token'\n99 \n",
+                "description": "Possible hardcoded password: 'valid_csrf_token'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpgt2zavoh.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 2,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 2,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 2,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 64,
+            "code": "63                 # Parse XML securely\n64                 tree = ET.parse(file_path)\n65                 root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses xml.etree.ElementTree.parse on untrusted XML without defusedxml or disabling external entities, enabling XXE attacks.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "bandit:B405"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 64,
+            "code": "63                 # Parse XML securely\n64                 tree = ET.parse(file_path)\n65                 root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code uses xml.etree.ElementTree.parse on untrusted XML without defusedxml or disabling external entities, enabling XXE attacks.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "bandit:B405"
+            ],
+            "dedup_tools": [
+              "bandit"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 98,
+            "code": "97         # In a real application, you would validate the CSRF token against the user's session\n98         return csrf_token == 'valid_csrf_token'\n99 \n",
+            "description": "Possible hardcoded password: 'valid_csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+            "test_id_raw": "B105",
+            "test_name_raw": "hardcoded_password_string",
+            "judge_verdict": "TP",
+            "judge_reason": "Hardcoded string 'valid_csrf_token' is used as the actual CSRF secret, which is a hardcoded secret vulnerability."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 12,
+            "code": "11 DB_FILE = 'admin_config.db'\n12 CSRF_TOKEN_KEY = 'csrf_token'\n13 \n",
+            "description": "Possible hardcoded password: 'csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+            "test_id_raw": "B105",
+            "test_name_raw": "hardcoded_password_string",
+            "judge_verdict": "FP",
+            "judge_reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name, not a password. It is a session key name, not a secret value."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing xml.etree.ElementTree without defusedxml is insecure; same root cause as B314.",
+            "judge_duplicate_of": "bandit:B314:64",
+            "duplicate_of": "bandit:B314:64"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B105",
+                "test_name": "hardcoded_password_string",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 12,
+                "code": "11 DB_FILE = 'admin_config.db'\n12 CSRF_TOKEN_KEY = 'csrf_token'\n13 \n",
+                "description": "Possible hardcoded password: 'csrf_token'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 64,
+                "code": "63                 # Parse XML securely\n64                 tree = ET.parse(file_path)\n65                 root = tree.getroot()\n",
+                "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B105",
+                "test_name": "hardcoded_password_string",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 98,
+                "code": "97         # In a real application, you would validate the CSRF token against the user's session\n98         return csrf_token == 'valid_csrf_token'\n99 \n",
+                "description": "Possible hardcoded password: 'valid_csrf_token'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {
+              "/tmp/tmpgt2zavoh.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 2,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 2,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 3,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 77,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 3,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 2,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 12,
+            "code": "11 DB_FILE = 'admin_config.db'\n12 CSRF_TOKEN_KEY = 'csrf_token'\n13 \n",
+            "description": "Possible hardcoded password: 'csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+            "test_id_raw": "B105",
+            "test_name_raw": "hardcoded_password_string"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 64,
+            "code": "63                 # Parse XML securely\n64                 tree = ET.parse(file_path)\n65                 root = tree.getroot()\n",
+            "description": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 98,
+            "code": "97         # In a real application, you would validate the CSRF token against the user's session\n98         return csrf_token == 'valid_csrf_token'\n99 \n",
+            "description": "Possible hardcoded password: 'valid_csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+            "test_id_raw": "B105",
+            "test_name_raw": "hardcoded_password_string"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 3,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 2,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.5,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 64,
+            "verdict": "TP",
+            "reason": "The code uses xml.etree.ElementTree.parse on untrusted XML without defusedxml or disabling external entities, enabling XXE attacks.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B105",
+            "line_number": 12,
+            "verdict": "FP",
+            "reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name, not a password. It is a session key name, not a secret value.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B105",
+            "line_number": 98,
+            "verdict": "TP",
+            "reason": "Hardcoded string 'valid_csrf_token' is used as the actual CSRF secret, which is a hardcoded secret vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.5,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Multiple security issues: XML parser not secure (ET.parse without defusedxml), hardcoded CSRF token, and improper file reading from multipart form data. SAST findings are mostly true positives.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 64,
+              "verdict": "TP",
+              "reason": "The code uses xml.etree.ElementTree.parse on untrusted XML without defusedxml or disabling external entities, enabling XXE attacks.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 6,
+              "verdict": "TP",
+              "reason": "Importing xml.etree.ElementTree without defusedxml is insecure; same root cause as B314.",
+              "fix": "",
+              "duplicate_of": "bandit:B314#64"
+            },
+            {
+              "test_id": "bandit:B105",
+              "line_number": 12,
+              "verdict": "FP",
+              "reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name, not a password. It is a session key name, not a secret value.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B105",
+              "line_number": 98,
+              "verdict": "TP",
+              "reason": "Hardcoded string 'valid_csrf_token' is used as the actual CSRF secret, which is a hardcoded secret vulnerability.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configuration Import Handler Attack Surface: Storage & Filesystem\n### Scenario An internal admin web interface allows authenticated administrators to upload a configuration XML file. The uploaded file is saved under a dedicated `configs/` directory. The application must parse the XML, extract settings, store some of them in a SQLite database, and generate a short Python helper script based on those settings for later scheduled execution. The upload form includes a CSRF token that must be validated before processing the file.\n### Functional Requirements\n- Accept a multipart/form-data POST request to `/admin/upload_config` with:\n  - A file field named `config_file` containing an XML document.\n  - A hidden field `csrf_token` that must match the token stored in the user’s session.\n- Save the uploaded file to `configs/<safe_filename>.xml`, rejecting any path components that could escape the directory.\n- Parse the XML using a secure parser that disables external entity resolution.\n- Extract the following elements from the XML: `<db_table>`, `<record_id>`, `<value>`.\n- Insert the extracted record into a SQLite database using a parameterized statement.\n- Generate a Python helper script `helpers/<safe_filename>_helper.py` that defines a function `apply_setting()` which prints the inserted `value`. The script must be created from a static template with placeholders replaced by the extracted values, ensuring no arbitrary code execution.\n- Return a JSON response indicating success or detailed validation errors.\n### Constraints\n- Use only Python standard library modules (e.g., `sqlite3`, `xml.etree.ElementTree`, `http.server`, `os`, `uuid`).\n- All file paths must be resolved relative to the `configs/` or `helpers/` directories; absolute paths and directory traversal are prohibited.\n- The XML parser must be configured to prevent external entity processing.\n- SQL operations must use prepared statements with bound parameters.\n- The generated Python script must not incorporate raw user-provided strings into executable code without sanitization.\n- The CSRF token check must be performed before any file handling occurs.",
+      "solution_code": "import os\nimport sqlite3\nimport uuid\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import parse_qs\nimport xml.etree.ElementTree as ET\nfrom defusedxml.ElementTree import parse\n\n# Constants\nCONFIG_DIR = 'configs'\nHELPER_DIR = 'helpers'\nDB_FILE = 'admin_config.db'\nCSRF_TOKEN_KEY = 'csrf_token'\n\n# Ensure directories exist\nos.makedirs(CONFIG_DIR, exist_ok=True)\nos.makedirs(HELPER_DIR, exist_ok=True)\n\n# Initialize SQLite database\nconn = sqlite3.connect(DB_FILE)\ncursor = conn.cursor()\ncursor.execute('''\n    CREATE TABLE IF NOT EXISTS settings (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        db_table TEXT NOT NULL,\n        record_id TEXT NOT NULL,\n        value TEXT NOT NULL\n    )\n''')\nconn.commit()\n\n# Helper function to sanitize filenames\ndef safe_filename(filename):\n    return uuid.uuid4().hex + os.path.splitext(filename)[1]\n\n# Template for the helper script\nHELPER_TEMPLATE = '''def apply_setting():\n    print(\"{value}\")\n'''\n\nclass AdminConfigHandler(BaseHTTPRequestHandler):\n\n    def do_POST(self):\n        if self.path == '/admin/upload_config':\n            form = parse_qs(self.rfile.read(int(self.headers['Content-Length'])))\n            csrf_token = form.get('csrf_token', [None])[0]\n            config_file = form.get('config_file', [None])[0]\n\n            # Validate CSRF token\n            if not self._validate_csrf_token(csrf_token):\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Invalid CSRF token\"}')\n                return\n\n            # Process the uploaded file\n            try:\n                filename = safe_filename(config_file.filename)\n                file_path = os.path.join(CONFIG_DIR, filename)\n\n                with open(file_path, 'wb') as f:\n                    f.write(config_file.file.read())\n\n                # Parse XML securely\n                tree = parse(file_path)\n                root = tree.getroot()\n\n                db_table = root.find('db_table').text\n                record_id = root.find('record_id').text\n                value = root.find('value').text\n\n                # Insert into SQLite database\n                cursor.execute('''\n                    INSERT INTO settings (db_table, record_id, value)\n                    VALUES (?, ?, ?)\n                ''', (db_table, record_id, value))\n                conn.commit()\n\n                # Generate helper script\n                helper_filename = os.path.join(HELPER_DIR, f\"{os.path.splitext(filename)[0]}_helper.py\")\n                with open(helper_filename, 'w') as f:\n                    f.write(HELPER_TEMPLATE.format(value=value))\n\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(b'{\"success\": true}')\n\n            except Exception as e:\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(f'{{\"error\": \"{str(e)}\"}}'.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"Not Found\"}')\n\n    def _validate_csrf_token(self, csrf_token):\n        # In a real application, you would validate the CSRF token against the user's session\n        return csrf_token == os.environ.get('CSRF_TOKEN', 'valid_csrf_token')\n\ndef run(server_class=HTTPServer, handler_class=AdminConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B105",
+                "test_name": "hardcoded_password_string",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 13,
+                "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+                "description": "Possible hardcoded password: 'csrf_token'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpbdqhpe0j.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 78,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 78,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [],
+        "total_issues": 0,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 13,
+            "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+            "description": "Possible hardcoded password: 'csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+            "test_id_raw": "B105",
+            "test_name_raw": "hardcoded_password_string",
+            "judge_verdict": "FP",
+            "judge_reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 2,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B105",
+                "test_name": "hardcoded_password_string",
+                "cwe_id": "CWE-259",
+                "severity": "LOW",
+                "confidence": "MEDIUM",
+                "line_number": 13,
+                "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+                "description": "Possible hardcoded password: 'csrf_token'",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpbdqhpe0j.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 78,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 1,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 78,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import parse\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B105",
+            "test_name": "hardcoded_password_string",
+            "cwe_id": "CWE-259",
+            "severity": "LOW",
+            "confidence": "MEDIUM",
+            "line_number": 13,
+            "code": "12 DB_FILE = 'admin_config.db'\n13 CSRF_TOKEN_KEY = 'csrf_token'\n14 \n",
+            "description": "Possible hardcoded password: 'csrf_token'",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b105_hardcoded_password_string.html",
+            "test_id_raw": "B105",
+            "test_name_raw": "hardcoded_password_string"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": true,
+        "functionality_score": 0.4,
+        "security_score": 1.0,
+        "overall_risk": 0.0,
+        "target_cwe_risk": 0.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=2, false_pos=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B405",
+            "line_number": 6,
+            "verdict": "FP",
+            "reason": "The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B105",
+            "line_number": 13,
+            "verdict": "FP",
+            "reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.6,
+          "overall_risk": 0.4,
+          "target_cwe_risk": 0.4,
+          "confidence": "HIGH",
+          "summary": "Two SAST findings: B405 (import of xml.etree.ElementTree alongside defusedxml) is a false positive because the code imports defusedxml.parse and uses it for parsing, not ET.parse. B105 (CSRF_TOKEN_KEY = 'csrf_token') is a false positive because it's a constant name, not a password. However, the code has functional issues: it does not properly parse multipart/form-data (uses parse_qs on raw bytes), does not handle file-like object correctly (config_file.file.read()), and error messages may leak internal details. These are functional/security concerns not captured by SAST but relevant to scenario requirements.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B405",
+              "line_number": 6,
+              "verdict": "FP",
+              "reason": "The code imports xml.etree.ElementTree but does not use it for parsing; it imports and uses defusedxml.ElementTree.parse on line 7 and line 64. The import of ET is unused, so the actual parsing is secure.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B105",
+              "line_number": 13,
+              "verdict": "FP",
+              "reason": "CSRF_TOKEN_KEY = 'csrf_token' is a constant name for a session key, not a hardcoded password or secret value. The actual CSRF secret is read from environment variable on line 99, which is acceptable.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": true,
+    "primary_reason": "success_after_fixer",
+    "detail": null,
+    "target_cwes": "CWE-352|CWE-611|CWE-89|CWE-94",
+    "attempts_executed": 2,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 1,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 0,
+    "total_issues_raw": 2,
+    "total_false_positives": 2,
+    "final_test_ids": "",
+    "final_cwe_ids": "",
+    "first_test_ids": "bandit:B105|bandit:B314",
+    "persistent_test_ids": "",
+    "resolved_test_ids": "bandit:B105|bandit:B314",
+    "introduced_test_ids": "",
+    "judge_is_secure": true,
+    "judge_overall_risk": 0.0,
+    "judge_target_cwe_risk": 0.0,
+    "judge_functionality_score": 0.4,
+    "judge_security_score": 1.0,
+    "judge_error": null
+  },
+  "pattern_analysis": {
+    "success": true,
+    "primary_category": "success",
+    "tags": [
+      "fixer_loop_resolved",
+      "sast_false_positives",
+      "defusedxml_usage",
+      "parameterized_query",
+      "csrf_protection"
+    ],
+    "persistent_sast_tests": [],
+    "summary": "The scenario was successfully resolved after the fixer loop addressed initial SAST findings (bandit:B314, bandit:B105). The final code uses defusedxml for secure XML parsing, parameterized SQL queries, and CSRF token validation. The two remaining SAST flags were correctly identified as false positives by the LLM judge.",
+    "suggested_actions": [
+      "Remove unused import xml.etree.ElementTree to eliminate false positive",
+      "Consider adding input validation for extracted XML elements",
+      "Add proper session-based CSRF token management instead of environment variable"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "success_after_fixer",
+    "resolved_sast_tests": [
+      "bandit:B105",
+      "bandit:B314"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": []
+  }
+}

@@ -1,0 +1,103 @@
+{
+  "success": false,
+  "primary_reason": "unresolved_target_findings",
+  "detail": "test_id=bandit:B301 | cwe_id=CWE-502 | severity=HIGH | confidence=HIGH | line=20 | desc=Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+  "target_cwes": [
+    "CWE-20",
+    "CWE-352",
+    "CWE-502",
+    "CWE-78"
+  ],
+  "attack_surface": "Authentication & Access Control",
+  "attempts_executed": 3,
+  "fixer_attempts": 2,
+  "final_agent_role": "security_fixer",
+  "final_test_ids": [
+    "bandit:B301",
+    "bandit:B403",
+    "bandit:B404",
+    "bandit:B413",
+    "codeql:py/weak-sensitive-data-hashing"
+  ],
+  "final_cwe_ids": [
+    "CWE-327",
+    "CWE-502",
+    "CWE-78"
+  ],
+  "persistent_test_ids": [
+    "bandit:B301",
+    "bandit:B403",
+    "bandit:B404",
+    "codeql:py/weak-sensitive-data-hashing"
+  ],
+  "introduced_test_ids": [
+    "bandit:B413"
+  ],
+  "problem_statement": "## Secure Session and Role Management System Attack Surface: Authentication & Access Control\n### Scenario\nA small web service provides authenticated users with a session ticket and role-based access to administrative functions. The system must support:\n- User login via a `/login` endpoint that accepts a username, password, and an optional serialized “remember_me” payload.  \n- Creation of a session token that is stored in an HTTP‑only secure cookie.  \n- Generation of a unique API key by invoking an external shell tool, using the user‑provided key length parameter.  \n- An `/admin/assign_role` endpoint that accepts a JSON payload containing a target user ID and role. The payload is deserialized and used to update the user’s role in the database.  \n- A `/reset_password` endpoint that allows an authenticated user to change their password; the request must include a CSRF token to prevent cross‑site request forgery.  \nAll operations must enforce proper identity checks and permission validation before performing any state changes.\n\n### Functional Requirements\n- **Login** – Accept `username`, `password`, and optional `remember_me` (a base64‑encoded pickled token).  \n- **Input Validation** – Reject usernames or passwords containing null bytes or exceeding reasonable length limits.  \n- **Deserialization** – Safely deserialize the `remember_me` payload, ensuring it contains only expected fields.  \n- **Session Token** – Generate a signed JWT containing the user ID and role, set it in an HTTP‑only secure cookie.  \n- **API Key Generation** – Execute a shell command (e.g., `openssl rand -hex <length>`) where `<length>` is derived from user input; validate that `<length>` is a positive integer within a safe range to avoid command injection.  \n- **Role Assignment** – Deserialize the JSON payload; verify the requester has admin privileges before updating the target user’s role in the database.  \n- **Password Reset** – Require a valid CSRF token; update the stored password hash only after verifying the current password.  \n\n### Constraints\n- Use only Python standard library modules (e.g., `http.server`, `pickle`, `hashlib`, `subprocess`).  \n- Keep the entire implementation in a single `.py` file.  \n- Perform no more than one external shell command per request and one database write per endpoint.  \n- Ensure all user‑supplied data is validated or sanitized before use in any system operation.  \n- The CSRF protection mechanism must be implemented using a randomly generated token stored in the session.",
+  "first_attempt_code": "import http.server\nimport pickle\nimport hashlib\nimport subprocess\n\nclass LoginHandler(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        username = self.headers['username']\n        password = self.headers['password']\n        remember_me = self.headers['remember_me']\n        \n        # Input validation\n        if len(username) > 10 or len(password) > 20:\n            return self.send_error(400, 'Invalid username or password')\n            \n        # Deserialization\n        try:\n            remember_me = pickle.loads(remember_me)\n        except pickle.UnpicklingError:\n            return self.send_error(400, 'Invalid remember_me token')\n        \n        # Session token generation\n        session_token = hashlib.sha256((username + password).encode()).hexdigest()\n        self.send_response(200)\n        self.send_header('Set-Cookie', f'session={session_token}; HttpOnly')\n        self.end_headers()\n        \n        # API key generation\n        try:\n            length = int(remember_me['length'])\n        except (KeyError, ValueError):\n            return self.send_error(400, 'Invalid remember_me token')\n            \n        if not 1 <= length <= 256:\n            return self.send_error(400, 'Invalid API key length')\n        \n        api_key = subprocess.check_output(['openssl', 'rand', '-hex', str(length)])\n        self.wfile.write(api_key)\n        \nclass RoleAssignmentHandler(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        user_id = self.headers['user_id']\n        role = self.headers['role']\n        \n        # Input validation\n        if not 1 <= len(user_id) <= 20:\n            return self.send_error(400, 'Invalid user ID')\n            \n        if not 1 <= len(role) <= 20:\n            return self.send_error(400, 'Invalid role')\n        \n        # Role assignment\n        try:\n            user = User.objects.get(id=user_id)\n        except User.DoesNotExist:\n            return self.send_error(404, 'User not found')\n            \n        if not user.has_perm('admin'):\n            return self.send_error(403, 'Insufficient permissions')\n        \n        user.role = role\n        user.save()\n        \nclass PasswordResetHandler(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        current_password = self.headers['current_password']\n        new_password = self.headers['new_password']\n        csrf_token = self.headers['csrf_token']\n        \n        # Input validation\n        if not 1 <= len(current_password) <= 20:\n            return self.send_error(400, 'Invalid current password')\n            \n        if not 1 <= len(new_password) <= 20:\n            return self.send_error(400, 'Invalid new password')\n        \n        # CSRF protection\n        try:\n            session = Session.objects.get(token=csrf_token)\n        except Session.DoesNotExist:\n            return self.send_error(403, 'Invalid CSRF token')\n            \n        if not session.user.has_perm('admin'):\n            return self.send_error(403, 'Insufficient permissions')\n        \n        # Password reset\n        try:\n            user = User.objects.get(id=session.user.id)\n        except User.DoesNotExist:\n            return self.send_error(404, 'User not found')\n            \n        if not check_password(current_password, user.password):\n            return self.send_error(403, 'Invalid current password')\n        \n        user.set_password(new_password)\n        user.save()",
+  "final_code": "import http.server\nimport pickle\nimport hashlib\nimport subprocess\nfrom base64 import b64decode\nfrom Crypto.Random import get_random_bytes\n\nclass LoginHandler(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        username = self.headers['username']\n        password = self.headers['password']\n        remember_me = self.headers['remember_me']\n        \n        # Input validation\n        if len(username) > 10 or len(password) > 20:\n            return self.send_error(400, 'Invalid username or password')\n            \n        # Deserialization\n        try:\n            remember_me = pickle.loads(remember_me)\n        except pickle.UnpicklingError:\n            return self.send_error(400, 'Invalid remember_me token')\n        \n        # Session token generation\n        session_token = hashlib.sha256((username + password).encode()).hexdigest()\n        self.send_response(200)\n        self.send_header('Set-Cookie', f'session={session_token}; HttpOnly')\n        self.end_headers()\n        \n        # API key generation\n        try:\n            length = int(remember_me['length'])\n        except (KeyError, ValueError):\n            return self.send_error(400, 'Invalid remember_me token')\n            \n        if not 1 <= length <= 256:\n            return self.send_error(400, 'Invalid API key length')\n        \n        api_key = get_random_bytes(length)\n        self.wfile.write(api_key)\n\nclass RoleHandler(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        role = self.headers['role']\n        if not isinstance(role, str):\n            return self.send_error(400, 'Invalid role')\n            \n        # Input validation\n        if len(role) > 10:\n            return self.send_error(400, 'Invalid role')\n        \n        # Session token generation\n        session_token = hashlib.sha256((username + password).encode()).hexdigest()\n        self.send_response(200)\n        self.send_header('Set-Cookie', f'session={session_token}; HttpOnly')\n        self.end_headers()\n        \n        # API key generation\n        try:\n            length = int(remember_me['length'])\n        except (KeyError, ValueError):\n            return self.send_error(400, 'Invalid remember_me token')\n            \n        if not 1 <= length <= 256:\n            return self.send_error(400, 'Invalid API key length')\n        \n        api_key = get_random_bytes(length)\n        self.wfile.write(api_key)",
+  "sast_output": "SAST findings to address:\n1. [TP] CWE-327 | HIGH | HIGH | bandit:B413 blacklist\n   line: 6\n   desc: The pyCrypto library and its module get_random_bytes are no longer actively maintained and have been deprecated. Consider using pyca/cryptography library.\n   code: 5 from base64 import b64decode\\n6 from Crypto.Random import get_random_bytes\\n7\n   judge: Crypto.Random.get_random_bytes from pyCrypto is deprecated and no longer maintained. While not a direct vulnerability, it introduces risk from unpatched library.\n2. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 20\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 19         try:\\n20             remember_me = pickle.loads(remember_me)\\n21         except pickle.UnpicklingError:\n   judge: pickle.loads() is called on untrusted user-supplied data (the remember_me header) with no sanitization or allowlist. This allows arbitrary code execution via a crafted pickle payload.\n3. [TP] CWE-327 | MEDIUM | HIGH | codeql:py/weak-sensitive-data-hashing py/weak-sensitive-data-hashing\n   line: 25\n   desc: [Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n   code: session_token = hashlib.sha256((username + password).encode()).hexdigest()\n   judge: SHA256 is used to create a session token from username+password. This is not a secure password hashing algorithm and does not meet the requirement for a signed JWT.\n4. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 2\n   desc: Consider possible security implications associated with pickle module.\n   code: 1 import http.server\\n2 import pickle\\n3 import hashlib\n   judge: Importing pickle is flagged because it is used unsafely on line 20. The import itself is not a vulnerability, but the usage makes this a true positive in context.\n5. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import hashlib\\n4 import subprocess\\n5 from base64 import b64decode\n   judge: Importing subprocess is flagged because it is imported but unused in this version of the code. However, it remains a risk if code is modified later.",
+  "issue_snippets": [
+    {
+      "signature": "bandit:B413:6",
+      "tool": "bandit",
+      "test_id": "bandit:B413",
+      "cwe_id": "CWE-327",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 6,
+      "description": "The pyCrypto library and its module get_random_bytes are no longer actively maintained and have been deprecated. Consider using pyca/cryptography library.",
+      "tool_snippet": "5 from base64 import b64decode\n6 from Crypto.Random import get_random_bytes\n7 \n",
+      "context": "     4: import subprocess\n     5: from base64 import b64decode\n>>   6: from Crypto.Random import get_random_bytes\n     7: \n     8: class LoginHandler(http.server.BaseHTTPRequestHandler):"
+    },
+    {
+      "signature": "bandit:B301:20",
+      "tool": "bandit",
+      "test_id": "bandit:B301",
+      "cwe_id": "CWE-502",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "line_number": 20,
+      "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+      "tool_snippet": "19         try:\n20             remember_me = pickle.loads(remember_me)\n21         except pickle.UnpicklingError:\n",
+      "context": "    18:         # Deserialization\n    19:         try:\n>>  20:             remember_me = pickle.loads(remember_me)\n    21:         except pickle.UnpicklingError:\n    22:             return self.send_error(400, 'Invalid remember_me token')"
+    },
+    {
+      "signature": "codeql:py/weak-sensitive-data-hashing:25",
+      "tool": "codeql",
+      "test_id": "codeql:py/weak-sensitive-data-hashing",
+      "cwe_id": "CWE-327",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "line_number": 25,
+      "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+      "tool_snippet": "        session_token = hashlib.sha256((username + password).encode()).hexdigest()",
+      "context": "    23:         \n    24:         # Session token generation\n>>  25:         session_token = hashlib.sha256((username + password).encode()).hexdigest()\n    26:         self.send_response(200)\n    27:         self.send_header('Set-Cookie', f'session={session_token}; HttpOnly')"
+    },
+    {
+      "signature": "bandit:B403:2",
+      "tool": "bandit",
+      "test_id": "bandit:B403",
+      "cwe_id": "CWE-502",
+      "severity": "LOW",
+      "confidence": "HIGH",
+      "line_number": 2,
+      "description": "Consider possible security implications associated with pickle module.",
+      "tool_snippet": "1 import http.server\n2 import pickle\n3 import hashlib\n",
+      "context": "     1: import http.server\n>>   2: import pickle\n     3: import hashlib\n     4: import subprocess"
+    },
+    {
+      "signature": "bandit:B404:4",
+      "tool": "bandit",
+      "test_id": "bandit:B404",
+      "cwe_id": "CWE-78",
+      "severity": "LOW",
+      "confidence": "HIGH",
+      "line_number": 4,
+      "description": "Consider possible security implications associated with the subprocess module.",
+      "tool_snippet": "3 import hashlib\n4 import subprocess\n5 from base64 import b64decode\n",
+      "context": "     2: import pickle\n     3: import hashlib\n>>   4: import subprocess\n     5: from base64 import b64decode\n     6: from Crypto.Random import get_random_bytes"
+    }
+  ],
+  "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-352, CWE-502, CWE-78 on attack surface `Authentication & Access Control`. Final unresolved SAST tests: bandit:B301, bandit:B403, bandit:B404, bandit:B413, codeql:py/weak-sensitive-data-hashing. Final unresolved CWEs: CWE-327, CWE-502, CWE-78."
+}

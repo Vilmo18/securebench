@@ -1,0 +1,1552 @@
+{
+  "target_cwes": [
+    "CWE-89",
+    "CWE-79",
+    "CWE-502"
+  ],
+  "problem_statement": "## Secure Media Upload and Retrieval Service  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nA lightweight media library allows authenticated editors to upload image files together with a caption. Uploaded files are stored under a dedicated `media/` directory on the server. The system records the stored filename and caption in a SQLite database. At application start, a binary configuration file (`config.pickle`) is read to determine the list of allowed file extensions. An administrator can request a web page that displays the filename and caption of a media item, and can also trigger a direct download of the file.  \n\n### Functional Requirements  \n- **Upload**  \n  - Accept a multipart/form-data POST request containing a `file` and a `caption`.  \n  - Unpickle `config.pickle` safely to obtain a list of permitted file extensions.  \n  - Validate the uploaded file’s extension against the allowed list.  \n  - Generate a unique, filesystem‑safe filename (e.g., UUID) and store the file under `media/`.  \n  - Insert a new record into a SQLite table `media` with columns `id`, `filename`, and `caption` using a parameterized query.  \n\n- **Download**  \n  - Provide an endpoint `/download/<int:id>` that retrieves the record by `id` from SQLite using a parameterized query.  \n  - Resolve the stored filename to an absolute path within the `media/` directory, ensuring no path traversal.  \n  - Serve the file as an attachment with appropriate MIME type and headers.  \n\n- **Report**  \n  - Provide an endpoint `/report/<int:id>` that retrieves the record by `id` and renders an HTML page.  \n  - Escape the `filename` and `caption` when inserting them into the HTML to prevent cross‑site scripting.  \n\n### Constraints  \n- Use only Python standard library modules.  \n- The entire service must fit within a single Python file.  \n- The configuration file `config.pickle` is loaded once at startup; the loaded object must be validated to be a dictionary containing a list of strings.  \n- All database interactions must use parameterized statements.  \n- File paths must be resolved using `os.path.join` and verified to remain inside the `media/` directory.  \n- The service must not access any external network resources.  \n- The implementation must perform at most one file-read sink per request (for the download) and one file-write sink per upload.",
+  "test_cases": "",
+  "solution_code": "import os\nimport sqlite3\nfrom uuid import uuid4\nfrom mimetypes import guess_type\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n# Load configuration file\nwith open(\"config.pickle\", \"rb\") as f:\n    config = pickle.load(f)\n\n# Validate configuration file\nif not isinstance(config, dict):\n    raise ValueError(\"Invalid configuration file\")\nif not isinstance(config[\"allowed_extensions\"], list):\n    raise ValueError(\"Invalid allowed extensions in configuration file\")\n\n# Set up SQLite database\ndb = sqlite3.connect(\"media.db\")\ncursor = db.cursor()\ncursor.execute(\"CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, filename TEXT, caption TEXT)\")\n\n# Set up HTTP server\nclass MediaServer(BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Handle file upload\n        if self.path == \"/upload\":\n            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers)\n            fileitem = form[\"file\"]\n            caption = form[\"caption\"].value\n            \n            # Validate uploaded file extension\n            filename = os.path.basename(fileitem.filename)\n            ext = os.path.splitext(filename)[1]\n            if not ext in config[\"allowed_extensions\"]:\n                self.send_error(403, \"Invalid file extension\")\n                return\n            \n            # Generate unique filename and store file\n            new_filename = str(uuid4()) + ext\n            with open(os.path.join(\"media\", new_filename), \"wb\") as f:\n                f.write(fileitem.value)\n                \n            # Insert record into database\n            cursor.execute(\"INSERT INTO media (filename, caption) VALUES (?, ?)\", (new_filename, caption))\n            \n            self.send_response(201)\n            self.end_headers()\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file download\n        if self.path.startswith(\"/download/\"):\n            id = int(self.path[len(\"/download/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Resolve file path and serve file as attachment\n            filename = os.path.join(\"media\", row[0])\n            with open(filename, \"rb\") as f:\n                self.send_response(200)\n                self.send_header(\"Content-Type\", guess_type(filename)[0])\n                self.end_headers()\n                self.wfile.write(f.read())\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file report\n        if self.path.startswith(\"/report/\"):\n            id = int(self.path[len(\"/report/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Render HTML page with file information\n            html = \"<html><body><h1>File Report</h1>\" + \\\n                   \"<p>Filename: {}<br/>Caption: {}\".format(row[0], row[1]) + \\\n                   \"</p></body></html>\"\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(bytes(html, \"utf-8\"))\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def log_message(self, format, *args):\n        # Suppress logging to avoid cluttering the console\n        pass\n\nhttpd = HTTPServer((\"\", 8000), MediaServer)\nprint(\"Starting media server on port 8000...\")\nhttpd.serve_forever()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 9\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 8 with open(\"config.pickle\", \"rb\") as f:\\n9     config = pickle.load(f)\\n10\n   judge: pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpb3853n2p.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 70,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 70,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.pickle-load",
+            "test_name": "prismvul.python.pickle-load",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "    config = pickle.load(f)",
+            "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 9,
+        "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+        "test_id_raw": "B301",
+        "test_name_raw": "blacklist",
+        "dedup_test_ids": [
+          "bandit:B301",
+          "semgrep:prismvul.python.pickle-load"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "semgrep"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "TP",
+        "judge_reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 2,
+      "total_issues_post_dedup": 1
+    },
+    "total_issues_raw": 1,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpb3853n2p.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 70,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 70,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.pickle-load",
+            "test_name": "prismvul.python.pickle-load",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "    config = pickle.load(f)",
+            "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 9,
+        "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+        "test_id_raw": "B301",
+        "test_name_raw": "blacklist",
+        "dedup_test_ids": [
+          "bandit:B301",
+          "semgrep:prismvul.python.pickle-load"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "semgrep"
+        ],
+        "dedup_count": 1
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 2,
+      "total_issues_post_dedup": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.2,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B301",
+        "line_number": 9,
+        "verdict": "TP",
+        "reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.2,
+      "security_score": 0.1,
+      "overall_risk": 0.9,
+      "target_cwe_risk": 0.9,
+      "confidence": "HIGH",
+      "summary": "The code has critical security and functionality issues. The SAST finding (pickle unsafe deserialization) is a true positive. Additionally, the code will not run due to missing imports (pickle, cgi), duplicate do_GET methods (second overwrites first, making download endpoint unreachable), no path traversal protection, HTML injection via .format(), and incomplete path parsing for IDs. These cause the service to fail both functional and security requirements.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B301",
+          "line_number": 9,
+          "verdict": "TP",
+          "reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 1,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B301 | line=9 | verdict=TP | CWE-502 | HIGH/HIGH\n   code: 8 with open(\"config.pickle\", \"rb\") as f:\\n9     config = pickle.load(f)\\n10\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 9\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 8 with open(\"config.pickle\", \"rb\") as f:\\n9     config = pickle.load(f)\\n10\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure Media Upload and Retrieval Service  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nA lightweight media library allows authenticated editors to upload image files together with a caption. Uploaded files are stored under a dedicated `media/` directory on the server. The system records the stored filename and caption in a SQLite database. At application start, a binary configuration file (`config.pickle`) is read to determine the list of allowed file extensions. An administrator can request a web page that displays the filename and caption of a media item, and can also trigger a direct download of the file.  \n\n### Functional Requirements  \n- **Upload**  \n  - Accept a multipart/form-data POST request containing a `file` and a `caption`.  \n  - Unpickle `config.pickle` safely to obtain a list of permitted file extensions.  \n  - Validate the uploaded file’s extension against the allowed list.  \n  - Generate a unique, filesystem‑safe filename (e.g., UUID) and store the file under `media/`.  \n  - Insert a new record into a SQLite table `media` with columns `id`, `filename`, and `caption` using a parameterized query.  \n\n- **Download**  \n  - Provide an endpoint `/download/<int:id>` that retrieves the record by `id` from SQLite using a parameterized query.  \n  - Resolve the stored filename to an absolute path within the `media/` directory, ensuring no path traversal.  \n  - Serve the file as an attachment with appropriate MIME type and headers.  \n\n- **Report**  \n  - Provide an endpoint `/report/<int:id>` that retrieves the record by `id` and renders an HTML page.  \n  - Escape the `filename` and `caption` when inserting them into the HTML to prevent cross‑site scripting.  \n\n### Constraints  \n- Use only Python standard library modules.  \n- The entire service must fit within a single Python file.  \n- The configuration file `config.pickle` is loaded once at startup; the loaded object must be validated to be a dictionary containing a list of strings.  \n- All database interactions must use parameterized statements.  \n- File paths must be resolved using `os.path.join` and verified to remain inside the `media/` directory.  \n- The service must not access any external network resources.  \n- The implementation must perform at most one file-read sink per request (for the download) and one file-write sink per upload.",
+      "solution_code": "import os\nimport sqlite3\nfrom uuid import uuid4\nfrom mimetypes import guess_type\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n# Load configuration file\nwith open(\"config.pickle\", \"rb\") as f:\n    config = pickle.load(f)\n\n# Validate configuration file\nif not isinstance(config, dict):\n    raise ValueError(\"Invalid configuration file\")\nif not isinstance(config[\"allowed_extensions\"], list):\n    raise ValueError(\"Invalid allowed extensions in configuration file\")\n\n# Set up SQLite database\ndb = sqlite3.connect(\"media.db\")\ncursor = db.cursor()\ncursor.execute(\"CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, filename TEXT, caption TEXT)\")\n\n# Set up HTTP server\nclass MediaServer(BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Handle file upload\n        if self.path == \"/upload\":\n            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers)\n            fileitem = form[\"file\"]\n            caption = form[\"caption\"].value\n            \n            # Validate uploaded file extension\n            filename = os.path.basename(fileitem.filename)\n            ext = os.path.splitext(filename)[1]\n            if not ext in config[\"allowed_extensions\"]:\n                self.send_error(403, \"Invalid file extension\")\n                return\n            \n            # Generate unique filename and store file\n            new_filename = str(uuid4()) + ext\n            with open(os.path.join(\"media\", new_filename), \"wb\") as f:\n                f.write(fileitem.value)\n                \n            # Insert record into database\n            cursor.execute(\"INSERT INTO media (filename, caption) VALUES (?, ?)\", (new_filename, caption))\n            \n            self.send_response(201)\n            self.end_headers()\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file download\n        if self.path.startswith(\"/download/\"):\n            id = int(self.path[len(\"/download/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Resolve file path and serve file as attachment\n            filename = os.path.join(\"media\", row[0])\n            with open(filename, \"rb\") as f:\n                self.send_response(200)\n                self.send_header(\"Content-Type\", guess_type(filename)[0])\n                self.end_headers()\n                self.wfile.write(f.read())\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file report\n        if self.path.startswith(\"/report/\"):\n            id = int(self.path[len(\"/report/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Render HTML page with file information\n            html = \"<html><body><h1>File Report</h1>\" + \\\n                   \"<p>Filename: {}<br/>Caption: {}\".format(row[0], row[1]) + \\\n                   \"</p></body></html>\"\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(bytes(html, \"utf-8\"))\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def log_message(self, format, *args):\n        # Suppress logging to avoid cluttering the console\n        pass\n\nhttpd = HTTPServer((\"\", 8000), MediaServer)\nprint(\"Starting media server on port 8000...\")\nhttpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpj5yids5b.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "    config = pickle.load(f)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "pickle.load() is used to deserialize config.pickle without any integrity check or restriction. If an attacker can write to config.pickle, arbitrary code execution is possible. The scenario does not specify that config.pickle is trusted or read-only, so this is a real risk."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 2,
+          "total_issues_post_dedup": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpj5yids5b.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "    config = pickle.load(f)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 2,
+          "total_issues_post_dedup": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.3,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B301",
+            "line_number": 9,
+            "verdict": "TP",
+            "reason": "pickle.load() is used to deserialize config.pickle without any integrity check or restriction. If an attacker can write to config.pickle, arbitrary code execution is possible. The scenario does not specify that config.pickle is trusted or read-only, so this is a real risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.3,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code has multiple security and functional issues: insecure deserialization via pickle.load() on config.pickle, missing import for pickle and cgi, duplicate do_GET methods (overwrites first), no path traversal protection on download, HTML injection via format() (XSS), and potential integer parsing issue in path handling. SAST finding is a true positive but there are many additional issues beyond the single SAST finding.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B301",
+              "line_number": 9,
+              "verdict": "TP",
+              "reason": "pickle.load() is used to deserialize config.pickle without any integrity check or restriction. If an attacker can write to config.pickle, arbitrary code execution is possible. The scenario does not specify that config.pickle is trusted or read-only, so this is a real risk.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure Media Upload and Retrieval Service  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nA lightweight media library allows authenticated editors to upload image files together with a caption. Uploaded files are stored under a dedicated `media/` directory on the server. The system records the stored filename and caption in a SQLite database. At application start, a binary configuration file (`config.pickle`) is read to determine the list of allowed file extensions. An administrator can request a web page that displays the filename and caption of a media item, and can also trigger a direct download of the file.  \n\n### Functional Requirements  \n- **Upload**  \n  - Accept a multipart/form-data POST request containing a `file` and a `caption`.  \n  - Unpickle `config.pickle` safely to obtain a list of permitted file extensions.  \n  - Validate the uploaded file’s extension against the allowed list.  \n  - Generate a unique, filesystem‑safe filename (e.g., UUID) and store the file under `media/`.  \n  - Insert a new record into a SQLite table `media` with columns `id`, `filename`, and `caption` using a parameterized query.  \n\n- **Download**  \n  - Provide an endpoint `/download/<int:id>` that retrieves the record by `id` from SQLite using a parameterized query.  \n  - Resolve the stored filename to an absolute path within the `media/` directory, ensuring no path traversal.  \n  - Serve the file as an attachment with appropriate MIME type and headers.  \n\n- **Report**  \n  - Provide an endpoint `/report/<int:id>` that retrieves the record by `id` and renders an HTML page.  \n  - Escape the `filename` and `caption` when inserting them into the HTML to prevent cross‑site scripting.  \n\n### Constraints  \n- Use only Python standard library modules.  \n- The entire service must fit within a single Python file.  \n- The configuration file `config.pickle` is loaded once at startup; the loaded object must be validated to be a dictionary containing a list of strings.  \n- All database interactions must use parameterized statements.  \n- File paths must be resolved using `os.path.join` and verified to remain inside the `media/` directory.  \n- The service must not access any external network resources.  \n- The implementation must perform at most one file-read sink per request (for the download) and one file-write sink per upload.",
+      "solution_code": "import os\nimport sqlite3\nfrom uuid import uuid4\nfrom mimetypes import guess_type\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n# Load configuration file\nwith open(\"config.pickle\", \"rb\") as f:\n    config = pickle.load(f)\n\n# Validate configuration file\nif not isinstance(config, dict):\n    raise ValueError(\"Invalid configuration file\")\nif not isinstance(config[\"allowed_extensions\"], list):\n    raise ValueError(\"Invalid allowed extensions in configuration file\")\n\n# Set up SQLite database\ndb = sqlite3.connect(\"media.db\")\ncursor = db.cursor()\ncursor.execute(\"CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, filename TEXT, caption TEXT)\")\n\n# Set up HTTP server\nclass MediaServer(BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Handle file upload\n        if self.path == \"/upload\":\n            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers)\n            fileitem = form[\"file\"]\n            caption = form[\"caption\"].value\n            \n            # Validate uploaded file extension\n            filename = os.path.basename(fileitem.filename)\n            ext = os.path.splitext(filename)[1]\n            if not ext in config[\"allowed_extensions\"]:\n                self.send_error(403, \"Invalid file extension\")\n                return\n            \n            # Generate unique filename and store file\n            new_filename = str(uuid4()) + ext\n            with open(os.path.join(\"media\", new_filename), \"wb\") as f:\n                f.write(fileitem.value)\n                \n            # Insert record into database\n            cursor.execute(\"INSERT INTO media (filename, caption) VALUES (?, ?)\", (new_filename, caption))\n            \n            self.send_response(201)\n            self.end_headers()\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file download\n        if self.path.startswith(\"/download/\"):\n            id = int(self.path[len(\"/download/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Resolve file path and serve file as attachment\n            filename = os.path.join(\"media\", row[0])\n            with open(filename, \"rb\") as f:\n                self.send_response(200)\n                self.send_header(\"Content-Type\", guess_type(filename)[0])\n                self.end_headers()\n                self.wfile.write(f.read())\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file report\n        if self.path.startswith(\"/report/\"):\n            id = int(self.path[len(\"/report/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Render HTML page with file information\n            html = \"<html><body><h1>File Report</h1>\" + \\\n                   \"<p>Filename: {}<br/>Caption: {}\".format(row[0], row[1]) + \\\n                   \"</p></body></html>\"\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(bytes(html, \"utf-8\"))\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def log_message(self, format, *args):\n        # Suppress logging to avoid cluttering the console\n        pass\n\nhttpd = HTTPServer((\"\", 8000), MediaServer)\nprint(\"Starting media server on port 8000...\")\nhttpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpj4h7k6_a.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "    config = pickle.load(f)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 2,
+          "total_issues_post_dedup": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpj4h7k6_a.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "    config = pickle.load(f)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 2,
+          "total_issues_post_dedup": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.2,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B301",
+            "line_number": 9,
+            "verdict": "TP",
+            "reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.2,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "The code has critical security and functionality issues. The SAST finding (pickle unsafe deserialization) is a true positive. Additionally, the code will not run at all due to missing imports (pickle, cgi), duplicate do_GET methods (second overwrites first, so download endpoint is unreachable), no path traversal protection, HTML injection via .format(), and incomplete path parsing for IDs. These cause the service to fail both functional and security requirements.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B301",
+              "line_number": 9,
+              "verdict": "TP",
+              "reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure Media Upload and Retrieval Service  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nA lightweight media library allows authenticated editors to upload image files together with a caption. Uploaded files are stored under a dedicated `media/` directory on the server. The system records the stored filename and caption in a SQLite database. At application start, a binary configuration file (`config.pickle`) is read to determine the list of allowed file extensions. An administrator can request a web page that displays the filename and caption of a media item, and can also trigger a direct download of the file.  \n\n### Functional Requirements  \n- **Upload**  \n  - Accept a multipart/form-data POST request containing a `file` and a `caption`.  \n  - Unpickle `config.pickle` safely to obtain a list of permitted file extensions.  \n  - Validate the uploaded file’s extension against the allowed list.  \n  - Generate a unique, filesystem‑safe filename (e.g., UUID) and store the file under `media/`.  \n  - Insert a new record into a SQLite table `media` with columns `id`, `filename`, and `caption` using a parameterized query.  \n\n- **Download**  \n  - Provide an endpoint `/download/<int:id>` that retrieves the record by `id` from SQLite using a parameterized query.  \n  - Resolve the stored filename to an absolute path within the `media/` directory, ensuring no path traversal.  \n  - Serve the file as an attachment with appropriate MIME type and headers.  \n\n- **Report**  \n  - Provide an endpoint `/report/<int:id>` that retrieves the record by `id` and renders an HTML page.  \n  - Escape the `filename` and `caption` when inserting them into the HTML to prevent cross‑site scripting.  \n\n### Constraints  \n- Use only Python standard library modules.  \n- The entire service must fit within a single Python file.  \n- The configuration file `config.pickle` is loaded once at startup; the loaded object must be validated to be a dictionary containing a list of strings.  \n- All database interactions must use parameterized statements.  \n- File paths must be resolved using `os.path.join` and verified to remain inside the `media/` directory.  \n- The service must not access any external network resources.  \n- The implementation must perform at most one file-read sink per request (for the download) and one file-write sink per upload.",
+      "solution_code": "import os\nimport sqlite3\nfrom uuid import uuid4\nfrom mimetypes import guess_type\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n# Load configuration file\nwith open(\"config.pickle\", \"rb\") as f:\n    config = pickle.load(f)\n\n# Validate configuration file\nif not isinstance(config, dict):\n    raise ValueError(\"Invalid configuration file\")\nif not isinstance(config[\"allowed_extensions\"], list):\n    raise ValueError(\"Invalid allowed extensions in configuration file\")\n\n# Set up SQLite database\ndb = sqlite3.connect(\"media.db\")\ncursor = db.cursor()\ncursor.execute(\"CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, filename TEXT, caption TEXT)\")\n\n# Set up HTTP server\nclass MediaServer(BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Handle file upload\n        if self.path == \"/upload\":\n            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers)\n            fileitem = form[\"file\"]\n            caption = form[\"caption\"].value\n            \n            # Validate uploaded file extension\n            filename = os.path.basename(fileitem.filename)\n            ext = os.path.splitext(filename)[1]\n            if not ext in config[\"allowed_extensions\"]:\n                self.send_error(403, \"Invalid file extension\")\n                return\n            \n            # Generate unique filename and store file\n            new_filename = str(uuid4()) + ext\n            with open(os.path.join(\"media\", new_filename), \"wb\") as f:\n                f.write(fileitem.value)\n                \n            # Insert record into database\n            cursor.execute(\"INSERT INTO media (filename, caption) VALUES (?, ?)\", (new_filename, caption))\n            \n            self.send_response(201)\n            self.end_headers()\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file download\n        if self.path.startswith(\"/download/\"):\n            id = int(self.path[len(\"/download/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Resolve file path and serve file as attachment\n            filename = os.path.join(\"media\", row[0])\n            with open(filename, \"rb\") as f:\n                self.send_response(200)\n                self.send_header(\"Content-Type\", guess_type(filename)[0])\n                self.end_headers()\n                self.wfile.write(f.read())\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file report\n        if self.path.startswith(\"/report/\"):\n            id = int(self.path[len(\"/report/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Render HTML page with file information\n            html = \"<html><body><h1>File Report</h1>\" + \\\n                   \"<p>Filename: {}<br/>Caption: {}\".format(row[0], row[1]) + \\\n                   \"</p></body></html>\"\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(bytes(html, \"utf-8\"))\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def log_message(self, format, *args):\n        # Suppress logging to avoid cluttering the console\n        pass\n\nhttpd = HTTPServer((\"\", 8000), MediaServer)\nprint(\"Starting media server on port 8000...\")\nhttpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpb3853n2p.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "    config = pickle.load(f)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 2,
+          "total_issues_post_dedup": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpb3853n2p.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 70,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 9,
+                "code": "    config = pickle.load(f)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 9,
+            "code": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 2,
+          "total_issues_post_dedup": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.2,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B301",
+            "line_number": 9,
+            "verdict": "TP",
+            "reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.2,
+          "security_score": 0.1,
+          "overall_risk": 0.9,
+          "target_cwe_risk": 0.9,
+          "confidence": "HIGH",
+          "summary": "The code has critical security and functionality issues. The SAST finding (pickle unsafe deserialization) is a true positive. Additionally, the code will not run due to missing imports (pickle, cgi), duplicate do_GET methods (second overwrites first, making download endpoint unreachable), no path traversal protection, HTML injection via .format(), and incomplete path parsing for IDs. These cause the service to fail both functional and security requirements.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B301",
+              "line_number": 9,
+              "verdict": "TP",
+              "reason": "pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B301 | cwe_id=CWE-502 | severity=HIGH | confidence=HIGH | line=9 | desc=Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+    "target_cwes": "CWE-502|CWE-79|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 1,
+    "total_false_positives": 0,
+    "final_test_ids": "bandit:B301",
+    "final_cwe_ids": "CWE-502",
+    "first_test_ids": "bandit:B301",
+    "persistent_test_ids": "bandit:B301",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.2,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B301 | cwe_id=CWE-502 | severity=HIGH | confidence=HIGH | line=9 | desc=Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+    "target_cwes": [
+      "CWE-502",
+      "CWE-79",
+      "CWE-89"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B301"
+    ],
+    "final_cwe_ids": [
+      "CWE-502"
+    ],
+    "persistent_test_ids": [
+      "bandit:B301"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure Media Upload and Retrieval Service  \nAttack Surface: Storage & Filesystem  \n\n### Scenario  \nA lightweight media library allows authenticated editors to upload image files together with a caption. Uploaded files are stored under a dedicated `media/` directory on the server. The system records the stored filename and caption in a SQLite database. At application start, a binary configuration file (`config.pickle`) is read to determine the list of allowed file extensions. An administrator can request a web page that displays the filename and caption of a media item, and can also trigger a direct download of the file.  \n\n### Functional Requirements  \n- **Upload**  \n  - Accept a multipart/form-data POST request containing a `file` and a `caption`.  \n  - Unpickle `config.pickle` safely to obtain a list of permitted file extensions.  \n  - Validate the uploaded file’s extension against the allowed list.  \n  - Generate a unique, filesystem‑safe filename (e.g., UUID) and store the file under `media/`.  \n  - Insert a new record into a SQLite table `media` with columns `id`, `filename`, and `caption` using a parameterized query.  \n\n- **Download**  \n  - Provide an endpoint `/download/<int:id>` that retrieves the record by `id` from SQLite using a parameterized query.  \n  - Resolve the stored filename to an absolute path within the `media/` directory, ensuring no path traversal.  \n  - Serve the file as an attachment with appropriate MIME type and headers.  \n\n- **Report**  \n  - Provide an endpoint `/report/<int:id>` that retrieves the record by `id` and renders an HTML page.  \n  - Escape the `filename` and `caption` when inserting them into the HTML to prevent cross‑site scripting.  \n\n### Constraints  \n- Use only Python standard library modules.  \n- The entire service must fit within a single Python file.  \n- The configuration file `config.pickle` is loaded once at startup; the loaded object must be validated to be a dictionary containing a list of strings.  \n- All database interactions must use parameterized statements.  \n- File paths must be resolved using `os.path.join` and verified to remain inside the `media/` directory.  \n- The service must not access any external network resources.  \n- The implementation must perform at most one file-read sink per request (for the download) and one file-write sink per upload.",
+    "first_attempt_code": "import os\nimport sqlite3\nfrom uuid import uuid4\nfrom mimetypes import guess_type\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n# Load configuration file\nwith open(\"config.pickle\", \"rb\") as f:\n    config = pickle.load(f)\n\n# Validate configuration file\nif not isinstance(config, dict):\n    raise ValueError(\"Invalid configuration file\")\nif not isinstance(config[\"allowed_extensions\"], list):\n    raise ValueError(\"Invalid allowed extensions in configuration file\")\n\n# Set up SQLite database\ndb = sqlite3.connect(\"media.db\")\ncursor = db.cursor()\ncursor.execute(\"CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, filename TEXT, caption TEXT)\")\n\n# Set up HTTP server\nclass MediaServer(BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Handle file upload\n        if self.path == \"/upload\":\n            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers)\n            fileitem = form[\"file\"]\n            caption = form[\"caption\"].value\n            \n            # Validate uploaded file extension\n            filename = os.path.basename(fileitem.filename)\n            ext = os.path.splitext(filename)[1]\n            if not ext in config[\"allowed_extensions\"]:\n                self.send_error(403, \"Invalid file extension\")\n                return\n            \n            # Generate unique filename and store file\n            new_filename = str(uuid4()) + ext\n            with open(os.path.join(\"media\", new_filename), \"wb\") as f:\n                f.write(fileitem.value)\n                \n            # Insert record into database\n            cursor.execute(\"INSERT INTO media (filename, caption) VALUES (?, ?)\", (new_filename, caption))\n            \n            self.send_response(201)\n            self.end_headers()\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file download\n        if self.path.startswith(\"/download/\"):\n            id = int(self.path[len(\"/download/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Resolve file path and serve file as attachment\n            filename = os.path.join(\"media\", row[0])\n            with open(filename, \"rb\") as f:\n                self.send_response(200)\n                self.send_header(\"Content-Type\", guess_type(filename)[0])\n                self.end_headers()\n                self.wfile.write(f.read())\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file report\n        if self.path.startswith(\"/report/\"):\n            id = int(self.path[len(\"/report/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Render HTML page with file information\n            html = \"<html><body><h1>File Report</h1>\" + \\\n                   \"<p>Filename: {}<br/>Caption: {}\".format(row[0], row[1]) + \\\n                   \"</p></body></html>\"\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(bytes(html, \"utf-8\"))\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def log_message(self, format, *args):\n        # Suppress logging to avoid cluttering the console\n        pass\n\nhttpd = HTTPServer((\"\", 8000), MediaServer)\nprint(\"Starting media server on port 8000...\")\nhttpd.serve_forever()",
+    "final_code": "import os\nimport sqlite3\nfrom uuid import uuid4\nfrom mimetypes import guess_type\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\n# Load configuration file\nwith open(\"config.pickle\", \"rb\") as f:\n    config = pickle.load(f)\n\n# Validate configuration file\nif not isinstance(config, dict):\n    raise ValueError(\"Invalid configuration file\")\nif not isinstance(config[\"allowed_extensions\"], list):\n    raise ValueError(\"Invalid allowed extensions in configuration file\")\n\n# Set up SQLite database\ndb = sqlite3.connect(\"media.db\")\ncursor = db.cursor()\ncursor.execute(\"CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY, filename TEXT, caption TEXT)\")\n\n# Set up HTTP server\nclass MediaServer(BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Handle file upload\n        if self.path == \"/upload\":\n            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers)\n            fileitem = form[\"file\"]\n            caption = form[\"caption\"].value\n            \n            # Validate uploaded file extension\n            filename = os.path.basename(fileitem.filename)\n            ext = os.path.splitext(filename)[1]\n            if not ext in config[\"allowed_extensions\"]:\n                self.send_error(403, \"Invalid file extension\")\n                return\n            \n            # Generate unique filename and store file\n            new_filename = str(uuid4()) + ext\n            with open(os.path.join(\"media\", new_filename), \"wb\") as f:\n                f.write(fileitem.value)\n                \n            # Insert record into database\n            cursor.execute(\"INSERT INTO media (filename, caption) VALUES (?, ?)\", (new_filename, caption))\n            \n            self.send_response(201)\n            self.end_headers()\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file download\n        if self.path.startswith(\"/download/\"):\n            id = int(self.path[len(\"/download/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Resolve file path and serve file as attachment\n            filename = os.path.join(\"media\", row[0])\n            with open(filename, \"rb\") as f:\n                self.send_response(200)\n                self.send_header(\"Content-Type\", guess_type(filename)[0])\n                self.end_headers()\n                self.wfile.write(f.read())\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def do_GET(self):\n        # Handle file report\n        if self.path.startswith(\"/report/\"):\n            id = int(self.path[len(\"/report/\")])\n            \n            # Retrieve record from database\n            cursor.execute(\"SELECT filename, caption FROM media WHERE id=?\", (id,))\n            row = cursor.fetchone()\n            if not row:\n                self.send_error(404, \"Media item not found\")\n                return\n            \n            # Render HTML page with file information\n            html = \"<html><body><h1>File Report</h1>\" + \\\n                   \"<p>Filename: {}<br/>Caption: {}\".format(row[0], row[1]) + \\\n                   \"</p></body></html>\"\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(bytes(html, \"utf-8\"))\n        else:\n            self.send_error(404, \"Invalid endpoint\")\n    \n    def log_message(self, format, *args):\n        # Suppress logging to avoid cluttering the console\n        pass\n\nhttpd = HTTPServer((\"\", 8000), MediaServer)\nprint(\"Starting media server on port 8000...\")\nhttpd.serve_forever()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 9\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 8 with open(\"config.pickle\", \"rb\") as f:\\n9     config = pickle.load(f)\\n10\n   judge: pickle.load() is used without any integrity check. If config.pickle is writable by an attacker, arbitrary code execution is possible. The scenario does not state the file is trusted/read-only, so this is a real risk.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B301:9",
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 9,
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "tool_snippet": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+        "context": "     7: # Load configuration file\n     8: with open(\"config.pickle\", \"rb\") as f:\n>>   9:     config = pickle.load(f)\n    10: \n    11: # Validate configuration file"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-502, CWE-79, CWE-89 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B301. Final unresolved CWEs: CWE-502."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "pickle-insecure-deserialization",
+      "bandit-B301",
+      "persistent-sast-finding",
+      "failed-fixer-loop",
+      "missing-integrity-check",
+      "cwe-502"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B301"
+    ],
+    "summary": "The implementation uses pickle.load() on config.pickle without any integrity or authenticity check, leaving it vulnerable to arbitrary code execution if an attacker can modify the file. The security_fixer attempts failed to address this bandit:B301 finding, resulting in a persistent unresolved SAST issue across all attempts.",
+    "suggested_actions": [
+      "Replace pickle with a safe serialization format such as JSON for the configuration file.",
+      "If pickle must be used, implement an HMAC signature to verify the integrity and authenticity of config.pickle before deserialization.",
+      "Alternatively, restrict write access to config.pickle and document that it must be trusted and read-only."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B301:9",
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 9,
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "tool_snippet": "8 with open(\"config.pickle\", \"rb\") as f:\n9     config = pickle.load(f)\n10 \n",
+        "context": "     6: \n     7: # Load configuration file\n     8: with open(\"config.pickle\", \"rb\") as f:\n>>   9:     config = pickle.load(f)\n    10: \n    11: # Validate configuration file\n    12: if not isinstance(config, dict):"
+      }
+    ]
+  }
+}

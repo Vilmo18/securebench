@@ -1,0 +1,1046 @@
+{
+  "target_cwes": [
+    "CWE-611"
+  ],
+  "problem_statement": "## XML‑Based Account Login Service\nAttack Surface: Authentication & Access Control\n\n### Scenario\nThe internal portal provides a `/api/xml_login` endpoint that accepts an HTTP POST containing an XML document with user credentials. The request body must conform to the following structure:\n\n```xml\n<LoginRequest>\n    <Username>string</Username>\n    <Password>string</Password>\n</LoginRequest>\n```\n\nThe service must parse the XML, authenticate the user against the `users` table, create a session token, and return a JSON response indicating success or failure. The implementation must prevent XML External Entity (XXE) processing and enforce strict authentication and authorization checks.\n\n### Functional Requirements\n- Accept an HTTP POST with a raw XML payload matching the `LoginRequest` format.\n- Parse the XML safely, disabling any DTD or external entity processing.\n- Extract the `Username` and `Password` values.\n- Validate that both fields are present and consist of printable ASCII characters only (no control characters).\n- Verify the credentials against the `users` table using a single parameterized SQL query (`SELECT password_hash, role FROM users WHERE username = ?`).\n- Compare the provided password with the stored password hash using a constant‑time comparison function.\n- On successful authentication, generate a cryptographically random session token, store it in the `sessions` table (`INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)`) with an appropriate expiration time, and return a JSON response containing the token and the user's role.\n- On failure, return a generic JSON error response without revealing whether the username or password was incorrect.\n- Ensure that only users with the role `admin` are allowed to access the `/admin/*` route namespace; reject access with a 403 response for other roles.\n\n### Constraints\n- Use only Python standard library modules and the `sqlite3` module for database access.\n- Implement the entire endpoint in a single Python file.\n- Do not use `eval`, `exec`, or any dynamic code execution facilities.\n- Disable DTD and external entity processing in the XML parser to mitigate CWE‑611.\n- Perform exactly one SQL query for credential verification and one SQL statement for session creation per request.",
+  "test_cases": "",
+  "solution_code": "import sqlite3\nimport hashlib\nimport hmac\nimport os\nimport time\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\n# Constants\nDB_FILE = 'portal.db'\nSESSION_EXPIRATION_SECONDS = 3600\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.set_feature(self.FEATURE_PROCESS_DTD, False)\n\ndef hash_password(password: str) -> str:\n    return hashlib.pbkdf2_hmac('sha256', password.encode(), b'salt_', 100000).hex()\n\ndef verify_password(stored_password: str, provided_password: str) -> bool:\n    return hmac.compare_digest(stored_password, hash_password(provided_password))\n\ndef generate_session_token() -> str:\n    return os.urandom(16).hex()\n\nclass XMLLoginHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/api/xml_login':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        raw_xml = self.rfile.read(content_length)\n\n        try:\n            parser = SafeXMLParser()\n            parser.feed(raw_xml.decode())\n            root = parser.close()\n\n            username = root.find('Username').text\n            password = root.find('Password').text\n\n            if not (username and password and all(c.isprintable() for c in username + password)):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Invalid input\"}')\n                return\n\n            conn = sqlite3.connect(DB_FILE)\n            cursor = conn.cursor()\n\n            cursor.execute(\"SELECT id, password_hash, role FROM users WHERE username = ?\", (username,))\n            user_record = cursor.fetchone()\n\n            if not user_record or not verify_password(user_record[1], password):\n                self.send_response(401)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Authentication failed\"}')\n                return\n\n            user_id, _, role = user_record\n            session_token = generate_session_token()\n            expires_at = int(time.time()) + SESSION_EXPIRATION_SECONDS\n\n            cursor.execute(\"INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)\",\n                           (user_id, session_token, expires_at))\n            conn.commit()\n\n            self.send_response(200)\n            self.end_headers()\n            response = {\n                'token': session_token,\n                'role': role\n            }\n            self.wfile.write(bytes(json.dumps(response), \"utf8\"))\n\n        except Exception as e:\n            self.send_response(500)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"Internal server error\"}')\n\n    def do_GET(self):\n        if not self.path.startswith('/admin/'):\n            self.send_error(403)\n            return\n\n        token = self.headers.get('Authorization')\n        if not token:\n            self.send_error(401)\n            return\n\n        conn = sqlite3.connect(DB_FILE)\n        cursor = conn.cursor()\n\n        cursor.execute(\"SELECT user_id, expires_at FROM sessions WHERE token = ?\", (token,))\n        session_record = cursor.fetchone()\n\n        if not session_record or int(time.time()) > session_record[1]:\n            self.send_error(401)\n            return\n\n        user_id = session_record[0]\n        cursor.execute(\"SELECT role FROM users WHERE id = ?\", (user_id,))\n        role_record = cursor.fetchone()\n\n        if role_record and role_record[0] != 'admin':\n            self.send_error(403)\n\nif __name__ == '__main__':\n    server_address = ('', 8000)\n    httpd = HTTPServer(server_address, XMLLoginHandler)\n    print(\"Starting server on port 8000...\")\n    httpd.serve_forever()",
+  "success": true,
+  "success_sast": true,
+  "success_sast_raw": false,
+  "success_judge": true,
+  "output": "Flagged as likely false positives by judge (informational):\n1. [FP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 8\n   desc: Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 7 from http.server import BaseHTTPRequestHandler, HTTPServer\\n8 from xml.etree.ElementTree import XMLParser\\n9\n   judge: The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 8,
+            "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpq1kbwxfu.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [],
+    "total_issues": 0,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 8,
+        "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+        "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser."
+      }
+    ],
+    "total_issues_raw": 1,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 8,
+            "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpq1kbwxfu.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 8,
+        "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+        "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": true,
+    "functionality_score": 0.95,
+    "security_score": 1.0,
+    "overall_risk": 0.0,
+    "target_cwe_risk": 0.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=1, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B405",
+        "line_number": 8,
+        "verdict": "FP",
+        "reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.95,
+      "security_score": 0.8,
+      "overall_risk": 0.2,
+      "target_cwe_risk": 0.2,
+      "confidence": "HIGH",
+      "summary": "The code addresses the scenario requirements well: PBKDF2 is used for password hashing (secure), XXE is mitigated via SafeXMLParser with DTD disabled, parameterized queries are used, constant-time comparison via HMAC compare_digest, and session tokens are cryptographically random. The single SAST finding (bandit:B405) is a false positive because the custom SafeXMLParser explicitly disables DTD processing. The admin GET handler has a minor logic flaw: it returns 403 for non-admin paths instead of 404, and does not return a 403 after checking role (missing return statement), but this is a functional bug rather than a security vulnerability. Overall, the code is functionally correct and secure against the main attack vectors.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B405",
+          "line_number": 8,
+          "verdict": "FP",
+          "reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 0,
+  "total_issues_raw": 1,
+  "fixed_by_security_fixer": true,
+  "used_security_fixer": true,
+  "attempts_till_success": 2,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Authentication & Access Control",
+  "attack_surface": "Authentication & Access Control",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/weak-sensitive-data-hashing | line=19 | verdict=TP | CWE-327 | MEDIUM/HIGH\n   code: return hashlib.sha256(password.encode()).hexdigest()\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-327 | MEDIUM | HIGH | codeql:py/weak-sensitive-data-hashing py/weak-sensitive-data-hashing\n   line: 19\n   desc: [Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](3) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n   code: return hashlib.sha256(password.encode()).hexdigest()\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## XML‑Based Account Login Service\nAttack Surface: Authentication & Access Control\n\n### Scenario\nThe internal portal provides a `/api/xml_login` endpoint that accepts an HTTP POST containing an XML document with user credentials. The request body must conform to the following structure:\n\n```xml\n<LoginRequest>\n    <Username>string</Username>\n    <Password>string</Password>\n</LoginRequest>\n```\n\nThe service must parse the XML, authenticate the user against the `users` table, create a session token, and return a JSON response indicating success or failure. The implementation must prevent XML External Entity (XXE) processing and enforce strict authentication and authorization checks.\n\n### Functional Requirements\n- Accept an HTTP POST with a raw XML payload matching the `LoginRequest` format.\n- Parse the XML safely, disabling any DTD or external entity processing.\n- Extract the `Username` and `Password` values.\n- Validate that both fields are present and consist of printable ASCII characters only (no control characters).\n- Verify the credentials against the `users` table using a single parameterized SQL query (`SELECT password_hash, role FROM users WHERE username = ?`).\n- Compare the provided password with the stored password hash using a constant‑time comparison function.\n- On successful authentication, generate a cryptographically random session token, store it in the `sessions` table (`INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)`) with an appropriate expiration time, and return a JSON response containing the token and the user's role.\n- On failure, return a generic JSON error response without revealing whether the username or password was incorrect.\n- Ensure that only users with the role `admin` are allowed to access the `/admin/*` route namespace; reject access with a 403 response for other roles.\n\n### Constraints\n- Use only Python standard library modules and the `sqlite3` module for database access.\n- Implement the entire endpoint in a single Python file.\n- Do not use `eval`, `exec`, or any dynamic code execution facilities.\n- Disable DTD and external entity processing in the XML parser to mitigate CWE‑611.\n- Perform exactly one SQL query for credential verification and one SQL statement for session creation per request.",
+      "solution_code": "import sqlite3\nimport hashlib\nimport hmac\nimport os\nimport time\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\n# Constants\nDB_FILE = 'portal.db'\nSESSION_EXPIRATION_SECONDS = 3600\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.set_feature(self.FEATURE_PROCESS_DTD, False)\n\ndef hash_password(password: str) -> str:\n    return hashlib.sha256(password.encode()).hexdigest()\n\ndef verify_password(stored_password: str, provided_password: str) -> bool:\n    return hmac.compare_digest(stored_password, hash_password(provided_password))\n\ndef generate_session_token() -> str:\n    return os.urandom(16).hex()\n\nclass XMLLoginHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/api/xml_login':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        raw_xml = self.rfile.read(content_length)\n\n        try:\n            parser = SafeXMLParser()\n            parser.feed(raw_xml.decode())\n            root = parser.close()\n\n            username = root.find('Username').text\n            password = root.find('Password').text\n\n            if not (username and password and all(c.isprintable() for c in username + password)):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Invalid input\"}')\n                return\n\n            conn = sqlite3.connect(DB_FILE)\n            cursor = conn.cursor()\n\n            cursor.execute(\"SELECT id, password_hash, role FROM users WHERE username = ?\", (username,))\n            user_record = cursor.fetchone()\n\n            if not user_record or not verify_password(user_record[1], password):\n                self.send_response(401)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Authentication failed\"}')\n                return\n\n            user_id, _, role = user_record\n            session_token = generate_session_token()\n            expires_at = int(time.time()) + SESSION_EXPIRATION_SECONDS\n\n            cursor.execute(\"INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)\",\n                           (user_id, session_token, expires_at))\n            conn.commit()\n\n            self.send_response(200)\n            self.end_headers()\n            response = {\n                'token': session_token,\n                'role': role\n            }\n            self.wfile.write(bytes(json.dumps(response), \"utf8\"))\n\n        except Exception as e:\n            self.send_response(500)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"Internal server error\"}')\n\n    def do_GET(self):\n        if not self.path.startswith('/admin/'):\n            self.send_error(403)\n            return\n\n        token = self.headers.get('Authorization')\n        if not token:\n            self.send_error(401)\n            return\n\n        conn = sqlite3.connect(DB_FILE)\n        cursor = conn.cursor()\n\n        cursor.execute(\"SELECT user_id, expires_at FROM sessions WHERE token = ?\", (token,))\n        session_record = cursor.fetchone()\n\n        if not session_record or int(time.time()) > session_record[1]:\n            self.send_error(401)\n            return\n\n        user_id = session_record[0]\n        cursor.execute(\"SELECT role FROM users WHERE id = ?\", (user_id,))\n        role_record = cursor.fetchone()\n\n        if role_record and role_record[0] != 'admin':\n            self.send_error(403)\n\nif __name__ == '__main__':\n    server_address = ('', 8000)\n    httpd = HTTPServer(server_address, XMLLoginHandler)\n    print(\"Starting server on port 8000...\")\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 from http.server import BaseHTTPRequestHandler, HTTPServer\n7 from xml.etree.ElementTree import XMLParser\n8 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpde_gkr7v.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 88,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 88,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/weak-sensitive-data-hashing",
+                "test_name": "py/weak-sensitive-data-hashing",
+                "cwe_id": "CWE-327",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "    return hashlib.sha256(password.encode()).hexdigest()",
+                "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](3) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "test_name": "py/weak-sensitive-data-hashing",
+            "cwe_id": "CWE-327",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    return hashlib.sha256(password.encode()).hexdigest()",
+            "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](3) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+            "more_info": null,
+            "test_id_raw": "py/weak-sensitive-data-hashing",
+            "test_name_raw": "py/weak-sensitive-data-hashing",
+            "judge_verdict": "TP",
+            "judge_reason": "SHA256 is not a computationally expensive hash function and is vulnerable to brute-force attacks for password hashing. The scenario does not specify a required algorithm, but security best practice demands a slow hash like bcrypt/scrypt/argon2."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 from http.server import BaseHTTPRequestHandler, HTTPServer\n7 from xml.etree.ElementTree import XMLParser\n8 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 7,
+                "code": "6 from http.server import BaseHTTPRequestHandler, HTTPServer\n7 from xml.etree.ElementTree import XMLParser\n8 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpde_gkr7v.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 88,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 88,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/weak-sensitive-data-hashing",
+                "test_name": "py/weak-sensitive-data-hashing",
+                "cwe_id": "CWE-327",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "    return hashlib.sha256(password.encode()).hexdigest()",
+                "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](3) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 7,
+            "code": "6 from http.server import BaseHTTPRequestHandler, HTTPServer\n7 from xml.etree.ElementTree import XMLParser\n8 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "test_name": "py/weak-sensitive-data-hashing",
+            "cwe_id": "CWE-327",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "    return hashlib.sha256(password.encode()).hexdigest()",
+            "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](3) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+            "more_info": null,
+            "test_id_raw": "py/weak-sensitive-data-hashing",
+            "test_name_raw": "py/weak-sensitive-data-hashing"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "line_number": 19,
+            "verdict": "TP",
+            "reason": "SHA256 is not a computationally expensive hash function and is vulnerable to brute-force attacks for password hashing. The scenario does not specify a required algorithm, but security best practice demands a slow hash like bcrypt/scrypt/argon2.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 7,
+            "verdict": "FP",
+            "reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Two SAST findings: (1) SHA256 for password hashing is weak (should use bcrypt/argon2), but scenario does not mandate a specific algorithm; (2) Bandit flags XMLParser as potentially unsafe for XXE, but code explicitly disables DTD processing via SafeXMLParser subclass. Both findings are real concerns but partially mitigated. The code has additional issues: missing `json` import, admin GET handler incorrectly rejects non-admin paths (should check role before rejecting), and no constant-time comparison for password (HMAC compare_digest is used but on hashed password, which is okay). Overall, the XXE mitigation is effective, password hashing is weak but functional, and admin access control is flawed (403 on non-admin paths instead of 404).",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/weak-sensitive-data-hashing",
+              "line_number": 19,
+              "verdict": "TP",
+              "reason": "SHA256 is not a computationally expensive hash function and is vulnerable to brute-force attacks for password hashing. The scenario does not specify a required algorithm, but security best practice demands a slow hash like bcrypt/scrypt/argon2.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 7,
+              "verdict": "FP",
+              "reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## XML‑Based Account Login Service\nAttack Surface: Authentication & Access Control\n\n### Scenario\nThe internal portal provides a `/api/xml_login` endpoint that accepts an HTTP POST containing an XML document with user credentials. The request body must conform to the following structure:\n\n```xml\n<LoginRequest>\n    <Username>string</Username>\n    <Password>string</Password>\n</LoginRequest>\n```\n\nThe service must parse the XML, authenticate the user against the `users` table, create a session token, and return a JSON response indicating success or failure. The implementation must prevent XML External Entity (XXE) processing and enforce strict authentication and authorization checks.\n\n### Functional Requirements\n- Accept an HTTP POST with a raw XML payload matching the `LoginRequest` format.\n- Parse the XML safely, disabling any DTD or external entity processing.\n- Extract the `Username` and `Password` values.\n- Validate that both fields are present and consist of printable ASCII characters only (no control characters).\n- Verify the credentials against the `users` table using a single parameterized SQL query (`SELECT password_hash, role FROM users WHERE username = ?`).\n- Compare the provided password with the stored password hash using a constant‑time comparison function.\n- On successful authentication, generate a cryptographically random session token, store it in the `sessions` table (`INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)`) with an appropriate expiration time, and return a JSON response containing the token and the user's role.\n- On failure, return a generic JSON error response without revealing whether the username or password was incorrect.\n- Ensure that only users with the role `admin` are allowed to access the `/admin/*` route namespace; reject access with a 403 response for other roles.\n\n### Constraints\n- Use only Python standard library modules and the `sqlite3` module for database access.\n- Implement the entire endpoint in a single Python file.\n- Do not use `eval`, `exec`, or any dynamic code execution facilities.\n- Disable DTD and external entity processing in the XML parser to mitigate CWE‑611.\n- Perform exactly one SQL query for credential verification and one SQL statement for session creation per request.",
+      "solution_code": "import sqlite3\nimport hashlib\nimport hmac\nimport os\nimport time\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom xml.etree.ElementTree import XMLParser\n\n# Constants\nDB_FILE = 'portal.db'\nSESSION_EXPIRATION_SECONDS = 3600\n\nclass SafeXMLParser(XMLParser):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.set_feature(self.FEATURE_PROCESS_DTD, False)\n\ndef hash_password(password: str) -> str:\n    return hashlib.pbkdf2_hmac('sha256', password.encode(), b'salt_', 100000).hex()\n\ndef verify_password(stored_password: str, provided_password: str) -> bool:\n    return hmac.compare_digest(stored_password, hash_password(provided_password))\n\ndef generate_session_token() -> str:\n    return os.urandom(16).hex()\n\nclass XMLLoginHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/api/xml_login':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        raw_xml = self.rfile.read(content_length)\n\n        try:\n            parser = SafeXMLParser()\n            parser.feed(raw_xml.decode())\n            root = parser.close()\n\n            username = root.find('Username').text\n            password = root.find('Password').text\n\n            if not (username and password and all(c.isprintable() for c in username + password)):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Invalid input\"}')\n                return\n\n            conn = sqlite3.connect(DB_FILE)\n            cursor = conn.cursor()\n\n            cursor.execute(\"SELECT id, password_hash, role FROM users WHERE username = ?\", (username,))\n            user_record = cursor.fetchone()\n\n            if not user_record or not verify_password(user_record[1], password):\n                self.send_response(401)\n                self.end_headers()\n                self.wfile.write(b'{\"error\": \"Authentication failed\"}')\n                return\n\n            user_id, _, role = user_record\n            session_token = generate_session_token()\n            expires_at = int(time.time()) + SESSION_EXPIRATION_SECONDS\n\n            cursor.execute(\"INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)\",\n                           (user_id, session_token, expires_at))\n            conn.commit()\n\n            self.send_response(200)\n            self.end_headers()\n            response = {\n                'token': session_token,\n                'role': role\n            }\n            self.wfile.write(bytes(json.dumps(response), \"utf8\"))\n\n        except Exception as e:\n            self.send_response(500)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"Internal server error\"}')\n\n    def do_GET(self):\n        if not self.path.startswith('/admin/'):\n            self.send_error(403)\n            return\n\n        token = self.headers.get('Authorization')\n        if not token:\n            self.send_error(401)\n            return\n\n        conn = sqlite3.connect(DB_FILE)\n        cursor = conn.cursor()\n\n        cursor.execute(\"SELECT user_id, expires_at FROM sessions WHERE token = ?\", (token,))\n        session_record = cursor.fetchone()\n\n        if not session_record or int(time.time()) > session_record[1]:\n            self.send_error(401)\n            return\n\n        user_id = session_record[0]\n        cursor.execute(\"SELECT role FROM users WHERE id = ?\", (user_id,))\n        role_record = cursor.fetchone()\n\n        if role_record and role_record[0] != 'admin':\n            self.send_error(403)\n\nif __name__ == '__main__':\n    server_address = ('', 8000)\n    httpd = HTTPServer(server_address, XMLLoginHandler)\n    print(\"Starting server on port 8000...\")\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 8,
+                "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpq1kbwxfu.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [],
+        "total_issues": 0,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 8,
+            "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser."
+          }
+        ],
+        "total_issues_raw": 1,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 8,
+                "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+                "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpq1kbwxfu.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 8,
+            "code": "7 from http.server import BaseHTTPRequestHandler, HTTPServer\n8 from xml.etree.ElementTree import XMLParser\n9 \n",
+            "description": "Using XMLParser to parse untrusted XML data is known to be vulnerable to XML attacks. Replace XMLParser with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": true,
+        "functionality_score": 0.95,
+        "security_score": 1.0,
+        "overall_risk": 0.0,
+        "target_cwe_risk": 0.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=1, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B405",
+            "line_number": 8,
+            "verdict": "FP",
+            "reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.95,
+          "security_score": 0.8,
+          "overall_risk": 0.2,
+          "target_cwe_risk": 0.2,
+          "confidence": "HIGH",
+          "summary": "The code addresses the scenario requirements well: PBKDF2 is used for password hashing (secure), XXE is mitigated via SafeXMLParser with DTD disabled, parameterized queries are used, constant-time comparison via HMAC compare_digest, and session tokens are cryptographically random. The single SAST finding (bandit:B405) is a false positive because the custom SafeXMLParser explicitly disables DTD processing. The admin GET handler has a minor logic flaw: it returns 403 for non-admin paths instead of 404, and does not return a 403 after checking role (missing return statement), but this is a functional bug rather than a security vulnerability. Overall, the code is functionally correct and secure against the main attack vectors.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B405",
+              "line_number": 8,
+              "verdict": "FP",
+              "reason": "The code defines SafeXMLParser that explicitly disables DTD processing via set_feature(FEATURE_PROCESS_DTD, False), which effectively prevents XXE attacks. The bandit rule is a generic warning that does not account for the custom safe parser.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": true,
+    "primary_reason": "success_after_fixer",
+    "detail": null,
+    "target_cwes": "CWE-611",
+    "attempts_executed": 2,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 1,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 0,
+    "total_issues_raw": 1,
+    "total_false_positives": 1,
+    "final_test_ids": "",
+    "final_cwe_ids": "",
+    "first_test_ids": "codeql:py/weak-sensitive-data-hashing",
+    "persistent_test_ids": "",
+    "resolved_test_ids": "codeql:py/weak-sensitive-data-hashing",
+    "introduced_test_ids": "",
+    "judge_is_secure": true,
+    "judge_overall_risk": 0.0,
+    "judge_target_cwe_risk": 0.0,
+    "judge_functionality_score": 0.95,
+    "judge_security_score": 1.0,
+    "judge_error": null
+  },
+  "pattern_analysis": {
+    "success": true,
+    "primary_category": "success",
+    "tags": [
+      "success_after_fixer",
+      "sast_false_positive_ignored",
+      "fixer_loop_resolved"
+    ],
+    "persistent_sast_tests": [],
+    "summary": "The final code successfully meets all security and functional requirements. The only SAST finding (bandit:B405) was correctly triaged as a false positive because the custom SafeXMLParser explicitly disables DTD processing. The fixer loop resolved the initial weak-sensitive-data-hashing finding.",
+    "suggested_actions": [
+      "No further changes needed; the implementation is secure and compliant."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "success_after_fixer",
+    "resolved_sast_tests": [
+      "codeql:py/weak-sensitive-data-hashing"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": []
+  }
+}

@@ -1,0 +1,2206 @@
+{
+  "target_cwes": [
+    "CWE-22",
+    "CWE-502",
+    "CWE-20"
+  ],
+  "problem_statement": "## Container Command Executor\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA web‑based admin console runs inside a Docker container and provides a `/run-task` endpoint. An authenticated operator can submit a JSON payload containing a `script_name` and optional `parameters`. The service must locate a script file in the container’s `/opt/tasks/` directory, validate the name, deserialize the JSON, and then execute the script with the supplied parameters using the OS command interpreter. Implement the endpoint so that it correctly validates inputs, safely deserializes the data, and constructs the command without allowing unintended filesystem access or command injection.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing:\n  - `script_name`: string indicating the script to run.\n  - `parameters`: optional dictionary of key/value pairs to pass as command‑line arguments.\n- Validate `script_name` so that it refers to a regular file located directly under `/opt/tasks/` (no absolute paths, no parent‑directory components, no null bytes).\n- Deserialize the JSON payload using a safe method that does not execute arbitrary code.\n- Build the command line as `/opt/tasks/<script_name>` followed by `--key value` arguments for each entry in `parameters`.\n- Execute the constructed command using a subprocess call that does not invoke a shell.\n- Capture the command’s stdout and stderr and return them in the HTTP response.\n- Return a 400 error for any validation failure or deserialization error, and a 500 error if the script cannot be executed.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (approximately 20–80 lines).\n- Perform exactly one subprocess execution per request.",
+  "test_cases": "",
+  "solution_code": "from http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\nimport os\nimport subprocess\n\nclass ContainerCommandExecutor(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/run-task':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                payload = json.loads(post_data)\n            except json.JSONDecodeError:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid JSON')\n                return\n\n            script_name = payload.get('script_name')\n            parameters = payload.get('parameters', {})\n\n            if not isinstance(script_name, str) or not script_name or '..' in script_name or '\\0' in script_name:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid script_name')\n                return\n\n            script_path = os.path.join('/opt/tasks/', script_name)\n            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Script not found')\n                return\n\n            cmd = [script_path]\n            for key, value in parameters.items():\n                if isinstance(key, str) and isinstance(value, str):\n                    cmd.extend([f'--{key}', value])\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Invalid parameters')\n                    return\n\n            try:\n                result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n                response = result.stdout + result.stderr\n            except (subprocess.CalledProcessError, FileNotFoundError):\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(b'Script execution failed')\n                return\n\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(response.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Not Found')\n\ndef run(server_class=HTTPServer, handler_class=ContainerCommandExecutor, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 29\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n   judge: The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.\n2. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 46\n   desc: subprocess call - check for execution of untrusted input.\n   code: 45             try:\\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n47                 response = result.stdout + result.stderr\n   judge: The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import os\\n4 import subprocess\\n5\n   judge: This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpt0jmu2dl.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 60,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 60,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 46,
+        "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 29,
+        "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 4,
+      "total_issues_post_dedup": 3
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 import os\n4 import subprocess\n5 \n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue."
+      }
+    ],
+    "total_issues_raw": 3,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "fp_overrides": [
+      {
+        "test_id": "bandit:B603",
+        "line_number": 46,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 29,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      }
+    ],
+    "total_fp_overrides": 2
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpt0jmu2dl.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 60,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 60,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 import os\n4 import subprocess\n5 \n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 46,
+        "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 29,
+        "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 3,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 4,
+      "total_issues_post_dedup": 3
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 1.0,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=1, fp_overrides=2)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 29,
+        "verdict": "FP",
+        "reason": "The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 46,
+        "verdict": "FP",
+        "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 4,
+        "verdict": "FP",
+        "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": true,
+      "functionality_score": 1.0,
+      "security_score": 1.0,
+      "overall_risk": 0.0,
+      "target_cwe_risk": 0.0,
+      "confidence": "HIGH",
+      "summary": "The code properly validates script_name by checking for '..' and null bytes, uses os.path.join for safe path construction, and verifies the resolved real path starts with '/opt/tasks/' to prevent symlink escapes. Parameters are validated as strings. The subprocess call uses a list (no shell). All SAST findings are false positives.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 29,
+          "verdict": "FP",
+          "reason": "The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 46,
+          "verdict": "FP",
+          "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 4,
+          "verdict": "FP",
+          "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 3,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=29 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n2. bandit:B603 | line=46 | verdict=UNCERTAIN (override from FP) | CWE-78 | HIGH/HIGH\n   code: 45             try:\\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n47                 response = result.stdout + result.stderr\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 29\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n2. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 46\n   desc: subprocess call - check for execution of untrusted input.\n   code: 45             try:\\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n47                 response = result.stdout + result.stderr\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Container Command Executor\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA web‑based admin console runs inside a Docker container and provides a `/run-task` endpoint. An authenticated operator can submit a JSON payload containing a `script_name` and optional `parameters`. The service must locate a script file in the container’s `/opt/tasks/` directory, validate the name, deserialize the JSON, and then execute the script with the supplied parameters using the OS command interpreter. Implement the endpoint so that it correctly validates inputs, safely deserializes the data, and constructs the command without allowing unintended filesystem access or command injection.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing:\n  - `script_name`: string indicating the script to run.\n  - `parameters`: optional dictionary of key/value pairs to pass as command‑line arguments.\n- Validate `script_name` so that it refers to a regular file located directly under `/opt/tasks/` (no absolute paths, no parent‑directory components, no null bytes).\n- Deserialize the JSON payload using a safe method that does not execute arbitrary code.\n- Build the command line as `/opt/tasks/<script_name>` followed by `--key value` arguments for each entry in `parameters`.\n- Execute the constructed command using a subprocess call that does not invoke a shell.\n- Capture the command’s stdout and stderr and return them in the HTTP response.\n- Return a 400 error for any validation failure or deserialization error, and a 500 error if the script cannot be executed.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (approximately 20–80 lines).\n- Perform exactly one subprocess execution per request.",
+      "solution_code": "from http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\nimport os\nimport subprocess\n\nclass ContainerCommandExecutor(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/run-task':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                payload = json.loads(post_data)\n            except json.JSONDecodeError:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid JSON')\n                return\n\n            script_name = payload.get('script_name')\n            parameters = payload.get('parameters', {})\n\n            if not isinstance(script_name, str) or not script_name:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid script_name')\n                return\n\n            script_path = f'/opt/tasks/{script_name}'\n            if not os.path.isfile(script_path):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Script not found')\n                return\n\n            cmd = [script_path]\n            for key, value in parameters.items():\n                cmd.extend([f'--{key}', str(value)])\n\n            try:\n                result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n                response = result.stdout + result.stderr\n            except (subprocess.CalledProcessError, FileNotFoundError):\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(b'Script execution failed')\n                return\n\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(response.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Not Found')\n\ndef run(server_class=HTTPServer, handler_class=ContainerCommandExecutor, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import os\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "39             try:\n40                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n41                 response = result.stdout + result.stderr\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpo6w8jq5x.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 54,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 54,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 29,
+                "code": "            if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "39             try:\n40                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n41                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The risk is command injection via path traversal (already covered by the path-injection finding), not via subprocess arguments.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The script_name is directly concatenated into the path without any sanitization. An attacker can use '../' sequences to escape /opt/tasks/ and execute arbitrary files (e.g., /bin/sh). The os.path.isfile check only verifies existence, not that the resolved path is within /opt/tasks/."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 3
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue."
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 40,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 1
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import os\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "39             try:\n40                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n41                 response = result.stdout + result.stderr\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpo6w8jq5x.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 54,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 54,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 40,
+                "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 29,
+                "code": "            if not os.path.isfile(script_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 40,
+            "code": "39             try:\n40                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n41                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=1, fp_overrides=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 29,
+            "verdict": "TP",
+            "reason": "The script_name is directly concatenated into the path without any sanitization. An attacker can use '../' sequences to escape /opt/tasks/ and execute arbitrary files (e.g., /bin/sh). The os.path.isfile check only verifies existence, not that the resolved path is within /opt/tasks/.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 40,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The risk is command injection via path traversal (already covered by the path-injection finding), not via subprocess arguments.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code lacks path validation for script_name, allowing path traversal (CWE-22) which can lead to arbitrary command execution. The subprocess call is safe (no shell), but the path injection is a critical security issue that bypasses the intended directory restriction.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 29,
+              "verdict": "TP",
+              "reason": "The script_name is directly concatenated into the path without any sanitization. An attacker can use '../' sequences to escape /opt/tasks/ and execute arbitrary files (e.g., /bin/sh). The os.path.isfile check only verifies existence, not that the resolved path is within /opt/tasks/.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 40,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The risk is command injection via path traversal (already covered by the path-injection finding), not via subprocess arguments.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Container Command Executor\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA web‑based admin console runs inside a Docker container and provides a `/run-task` endpoint. An authenticated operator can submit a JSON payload containing a `script_name` and optional `parameters`. The service must locate a script file in the container’s `/opt/tasks/` directory, validate the name, deserialize the JSON, and then execute the script with the supplied parameters using the OS command interpreter. Implement the endpoint so that it correctly validates inputs, safely deserializes the data, and constructs the command without allowing unintended filesystem access or command injection.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing:\n  - `script_name`: string indicating the script to run.\n  - `parameters`: optional dictionary of key/value pairs to pass as command‑line arguments.\n- Validate `script_name` so that it refers to a regular file located directly under `/opt/tasks/` (no absolute paths, no parent‑directory components, no null bytes).\n- Deserialize the JSON payload using a safe method that does not execute arbitrary code.\n- Build the command line as `/opt/tasks/<script_name>` followed by `--key value` arguments for each entry in `parameters`.\n- Execute the constructed command using a subprocess call that does not invoke a shell.\n- Capture the command’s stdout and stderr and return them in the HTTP response.\n- Return a 400 error for any validation failure or deserialization error, and a 500 error if the script cannot be executed.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (approximately 20–80 lines).\n- Perform exactly one subprocess execution per request.",
+      "solution_code": "from http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\nimport os\nimport subprocess\n\nclass ContainerCommandExecutor(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/run-task':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                payload = json.loads(post_data)\n            except json.JSONDecodeError:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid JSON')\n                return\n\n            script_name = payload.get('script_name')\n            parameters = payload.get('parameters', {})\n\n            if not isinstance(script_name, str) or not script_name or '..' in script_name or '\\0' in script_name:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid script_name')\n                return\n\n            script_path = f'/opt/tasks/{script_name}'\n            if not os.path.isfile(script_path) or not script_path.startswith('/opt/tasks/'):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Script not found')\n                return\n\n            cmd = [script_path]\n            for key, value in parameters.items():\n                if isinstance(key, str) and isinstance(value, str):\n                    cmd.extend([f'--{key}', value])\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Invalid parameters')\n                    return\n\n            try:\n                result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n                response = result.stdout + result.stderr\n            except (subprocess.CalledProcessError, FileNotFoundError):\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(b'Script execution failed')\n                return\n\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(response.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Not Found')\n\ndef run(server_class=HTTPServer, handler_class=ContainerCommandExecutor, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import os\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmps1wwpk9n.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 29,
+                "code": "            if not os.path.isfile(script_path) or not script_path.startswith('/opt/tasks/'):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path) or not script_path.startswith('/opt/tasks/'):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The code checks for '..' and null bytes in script_name, and additionally verifies that the resolved path starts with '/opt/tasks/' using startswith(). This prevents directory traversal and ensures the file is within the intended directory.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 3
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue."
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 46,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 29,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 2
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import os\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmps1wwpk9n.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 29,
+                "code": "            if not os.path.isfile(script_path) or not script_path.startswith('/opt/tasks/'):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path) or not script_path.startswith('/opt/tasks/'):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=1, fp_overrides=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 29,
+            "verdict": "FP",
+            "reason": "The code checks for '..' and null bytes in script_name, and additionally verifies that the resolved path starts with '/opt/tasks/' using startswith(). This prevents directory traversal and ensures the file is within the intended directory.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 46,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": true,
+          "functionality_score": 1.0,
+          "security_score": 1.0,
+          "overall_risk": 0.0,
+          "target_cwe_risk": 0.0,
+          "confidence": "HIGH",
+          "summary": "The code properly validates script_name by checking for '..' and null bytes, and verifies the resolved path starts with '/opt/tasks/'. Parameters are validated as strings. The subprocess call uses a list (no shell). All SAST findings are false positives.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 29,
+              "verdict": "FP",
+              "reason": "The code checks for '..' and null bytes in script_name, and additionally verifies that the resolved path starts with '/opt/tasks/' using startswith(). This prevents directory traversal and ensures the file is within the intended directory.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 46,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Container Command Executor\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA web‑based admin console runs inside a Docker container and provides a `/run-task` endpoint. An authenticated operator can submit a JSON payload containing a `script_name` and optional `parameters`. The service must locate a script file in the container’s `/opt/tasks/` directory, validate the name, deserialize the JSON, and then execute the script with the supplied parameters using the OS command interpreter. Implement the endpoint so that it correctly validates inputs, safely deserializes the data, and constructs the command without allowing unintended filesystem access or command injection.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing:\n  - `script_name`: string indicating the script to run.\n  - `parameters`: optional dictionary of key/value pairs to pass as command‑line arguments.\n- Validate `script_name` so that it refers to a regular file located directly under `/opt/tasks/` (no absolute paths, no parent‑directory components, no null bytes).\n- Deserialize the JSON payload using a safe method that does not execute arbitrary code.\n- Build the command line as `/opt/tasks/<script_name>` followed by `--key value` arguments for each entry in `parameters`.\n- Execute the constructed command using a subprocess call that does not invoke a shell.\n- Capture the command’s stdout and stderr and return them in the HTTP response.\n- Return a 400 error for any validation failure or deserialization error, and a 500 error if the script cannot be executed.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (approximately 20–80 lines).\n- Perform exactly one subprocess execution per request.",
+      "solution_code": "from http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\nimport os\nimport subprocess\n\nclass ContainerCommandExecutor(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/run-task':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                payload = json.loads(post_data)\n            except json.JSONDecodeError:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid JSON')\n                return\n\n            script_name = payload.get('script_name')\n            parameters = payload.get('parameters', {})\n\n            if not isinstance(script_name, str) or not script_name or '..' in script_name or '\\0' in script_name:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid script_name')\n                return\n\n            script_path = os.path.join('/opt/tasks/', script_name)\n            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Script not found')\n                return\n\n            cmd = [script_path]\n            for key, value in parameters.items():\n                if isinstance(key, str) and isinstance(value, str):\n                    cmd.extend([f'--{key}', value])\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Invalid parameters')\n                    return\n\n            try:\n                result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n                response = result.stdout + result.stderr\n            except (subprocess.CalledProcessError, FileNotFoundError):\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(b'Script execution failed')\n                return\n\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(response.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Not Found')\n\ndef run(server_class=HTTPServer, handler_class=ContainerCommandExecutor, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import os\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpt0jmu2dl.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 29,
+                "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 3
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue."
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 46,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 29,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 2
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 import os\n4 import subprocess\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpt0jmu2dl.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 60,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "                result = subprocess.run(cmd, capture_output=True, text=True, check=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 29,
+                "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 import os\n4 import subprocess\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 29,
+            "code": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=1, fp_overrides=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 29,
+            "verdict": "FP",
+            "reason": "The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 46,
+            "verdict": "FP",
+            "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": true,
+          "functionality_score": 1.0,
+          "security_score": 1.0,
+          "overall_risk": 0.0,
+          "target_cwe_risk": 0.0,
+          "confidence": "HIGH",
+          "summary": "The code properly validates script_name by checking for '..' and null bytes, uses os.path.join for safe path construction, and verifies the resolved real path starts with '/opt/tasks/' to prevent symlink escapes. Parameters are validated as strings. The subprocess call uses a list (no shell). All SAST findings are false positives.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 29,
+              "verdict": "FP",
+              "reason": "The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 46,
+              "verdict": "FP",
+              "reason": "The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=29 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": "CWE-20|CWE-22|CWE-502",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 3,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B603|codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22|CWE-78",
+    "first_test_ids": "bandit:B603|codeql:py/path-injection",
+    "persistent_test_ids": "bandit:B603|codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 1.0,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=29 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-502"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22",
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Container Command Executor\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA web‑based admin console runs inside a Docker container and provides a `/run-task` endpoint. An authenticated operator can submit a JSON payload containing a `script_name` and optional `parameters`. The service must locate a script file in the container’s `/opt/tasks/` directory, validate the name, deserialize the JSON, and then execute the script with the supplied parameters using the OS command interpreter. Implement the endpoint so that it correctly validates inputs, safely deserializes the data, and constructs the command without allowing unintended filesystem access or command injection.\n\n### Functional Requirements\n- Accept a POST request with a JSON body containing:\n  - `script_name`: string indicating the script to run.\n  - `parameters`: optional dictionary of key/value pairs to pass as command‑line arguments.\n- Validate `script_name` so that it refers to a regular file located directly under `/opt/tasks/` (no absolute paths, no parent‑directory components, no null bytes).\n- Deserialize the JSON payload using a safe method that does not execute arbitrary code.\n- Build the command line as `/opt/tasks/<script_name>` followed by `--key value` arguments for each entry in `parameters`.\n- Execute the constructed command using a subprocess call that does not invoke a shell.\n- Capture the command’s stdout and stderr and return them in the HTTP response.\n- Return a 400 error for any validation failure or deserialization error, and a 500 error if the script cannot be executed.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (approximately 20–80 lines).\n- Perform exactly one subprocess execution per request.",
+    "first_attempt_code": "from http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\nimport os\nimport subprocess\n\nclass ContainerCommandExecutor(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/run-task':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                payload = json.loads(post_data)\n            except json.JSONDecodeError:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid JSON')\n                return\n\n            script_name = payload.get('script_name')\n            parameters = payload.get('parameters', {})\n\n            if not isinstance(script_name, str) or not script_name:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid script_name')\n                return\n\n            script_path = f'/opt/tasks/{script_name}'\n            if not os.path.isfile(script_path):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Script not found')\n                return\n\n            cmd = [script_path]\n            for key, value in parameters.items():\n                cmd.extend([f'--{key}', str(value)])\n\n            try:\n                result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n                response = result.stdout + result.stderr\n            except (subprocess.CalledProcessError, FileNotFoundError):\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(b'Script execution failed')\n                return\n\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(response.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Not Found')\n\ndef run(server_class=HTTPServer, handler_class=ContainerCommandExecutor, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "from http.server import BaseHTTPRequestHandler, HTTPServer\nimport json\nimport os\nimport subprocess\n\nclass ContainerCommandExecutor(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/run-task':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                payload = json.loads(post_data)\n            except json.JSONDecodeError:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid JSON')\n                return\n\n            script_name = payload.get('script_name')\n            parameters = payload.get('parameters', {})\n\n            if not isinstance(script_name, str) or not script_name or '..' in script_name or '\\0' in script_name:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Invalid script_name')\n                return\n\n            script_path = os.path.join('/opt/tasks/', script_name)\n            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'Script not found')\n                return\n\n            cmd = [script_path]\n            for key, value in parameters.items():\n                if isinstance(key, str) and isinstance(value, str):\n                    cmd.extend([f'--{key}', value])\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n                    self.wfile.write(b'Invalid parameters')\n                    return\n\n            try:\n                result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n                response = result.stdout + result.stderr\n            except (subprocess.CalledProcessError, FileNotFoundError):\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(b'Script execution failed')\n                return\n\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(response.encode())\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b'Not Found')\n\ndef run(server_class=HTTPServer, handler_class=ContainerCommandExecutor, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f'Starting httpd server on port {port}')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 29\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n   judge: The code checks for '..' and null bytes in script_name, uses os.path.join for safe path construction, and additionally verifies that os.path.realpath(script_path) starts with '/opt/tasks/'. This prevents directory traversal and symlink escapes, ensuring the file is within the intended directory.\n2. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 46\n   desc: subprocess call - check for execution of untrusted input.\n   code: 45             try:\\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n47                 response = result.stdout + result.stderr\n   judge: The subprocess.run call uses a list (cmd) and does not set shell=True, so no shell injection is possible. The arguments are validated as strings before being added to the command list.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 import os\\n4 import subprocess\\n5\n   judge: This is an informational warning about importing subprocess, not a vulnerability. The import itself is necessary and does not introduce a security issue.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:29",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 29,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+        "context": "    27: \n    28:             script_path = os.path.join('/opt/tasks/', script_name)\n>>  29:             if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n    30:                 self.send_response(400)\n    31:                 self.end_headers()"
+      },
+      {
+        "signature": "bandit:B603:46",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 46,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+        "context": "    44: \n    45:             try:\n>>  46:                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n    47:                 response = result.stdout + result.stderr\n    48:             except (subprocess.CalledProcessError, FileNotFoundError):"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-20, CWE-22, CWE-502 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B603, codeql:py/path-injection. Final unresolved CWEs: CWE-22, CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_sast_findings",
+      "false_positive_overrides",
+      "path_injection",
+      "subprocess_without_shell",
+      "sast_tool_limitation",
+      "fixer_loop_ineffective"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "summary": "The code correctly validates script_name against path traversal and uses subprocess.run without shell=True, but SAST tools (bandit, CodeQL) persistently flag these lines as path injection and subprocess execution of untrusted input. The LLM judge overrode both as false positives, yet the SAST findings remain unresolved, causing the scenario to fail despite functionally correct security controls.",
+    "suggested_actions": [
+      "Use a different subprocess API (e.g., subprocess.Popen with explicit argument list) to see if bandit B603 is suppressed.",
+      "Add an explicit allowlist of valid script names from /opt/tasks/ to eliminate CodeQL path-injection false positive.",
+      "Use a SAST suppression comment (e.g., # nosec for bandit) on the flagged lines to explicitly mark the findings as accepted.",
+      "Consider splitting the path validation into a separate helper function that is annotated to satisfy static analysis.",
+      "If the target environment permits, use a configuration file or environment variable to define allowed scripts instead of dynamic path resolution."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:29",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 29,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):",
+        "context": "    26:                 return\n    27: \n    28:             script_path = os.path.join('/opt/tasks/', script_name)\n>>  29:             if not os.path.isfile(script_path) or not os.path.realpath(script_path).startswith('/opt/tasks/'):\n    30:                 self.send_response(400)\n    31:                 self.end_headers()\n    32:                 self.wfile.write(b'Script not found')"
+      },
+      {
+        "signature": "bandit:B603:46",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 46,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "45             try:\n46                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n47                 response = result.stdout + result.stderr\n",
+        "context": "    43:                     return\n    44: \n    45:             try:\n>>  46:                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n    47:                 response = result.stdout + result.stderr\n    48:             except (subprocess.CalledProcessError, FileNotFoundError):\n    49:                 self.send_response(500)"
+      }
+    ]
+  }
+}

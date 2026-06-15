@@ -1,0 +1,1229 @@
+{
+  "target_cwes": [
+    "CWE-611",
+    "CWE-20",
+    "CWE-862"
+  ],
+  "problem_statement": "## User Role Management API Attack Surface: Authentication & Access Control\n### Scenario A web service provides a `/login` endpoint that accepts a JSON payload containing `username`, `password`, and an optional `profile_xml` field. The service authenticates the user against a stored credential store, validates all received fields, parses the optional XML to extract user profile attributes, and then creates a session token that encodes the user's role. Only users with the appropriate role may access the `/admin/*` routes. Implement the login handler, the XML profile parser, and the role‑based access check for protected endpoints.\n### Functional Requirements\n- Accept a POST request with a JSON body containing `username`, `password`, and optionally `profile_xml`.\n- Validate that `username` and `password` are non‑empty strings and conform to expected character sets.\n- If `profile_xml` is provided, safely parse the XML to extract a `<role>` element value without processing external entities.\n- Verify the supplied credentials against an in‑memory user database.\n- Upon successful authentication, generate a signed session token that includes the user's role.\n- Implement a decorator or middleware that checks the session token and ensures the user’s role permits access to any `/admin/*` endpoint; otherwise return an unauthorized response.\n- Return appropriate success or error responses for authentication failures, input validation errors, and authorization denials.\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file.\n- Perform at most one XML parsing operation per request.\n- Do not persist sessions to external storage; use an in‑process token mechanism.",
+  "test_cases": "",
+  "solution_code": "import hashlib\nimport hmac\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\nimport xml.etree.ElementTree as ET\nfrom defusedxml.ElementTree import fromstring\n\n# In-memory user database\nusers_db = {\n    \"admin\": hashlib.pbkdf2_hmac('sha256', \"adminpass\".encode(), b'salt', 100000).hex(),\n    \"user\": hashlib.pbkdf2_hmac('sha256', \"userpass\".encode(), b'salt', 100000).hex()\n}\n\n# Secret key for signing tokens\nSECRET_KEY = b'secret_key'\n\ndef generate_token(username, role):\n    \"\"\"Generate a signed session token.\"\"\"\n    token_data = f\"{username}:{role}\"\n    signature = hmac.new(SECRET_KEY, token_data.encode(), hashlib.sha256).hexdigest()\n    return f\"{token_data}:{signature}\"\n\ndef verify_token(token):\n    \"\"\"Verify the signed session token and extract user data.\"\"\"\n    try:\n        token_data, signature = token.split(':')\n        username, role = token_data.split(':')\n        expected_signature = hmac.new(SECRET_KEY, token_data.encode(), hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(signature, expected_signature):\n            return None\n        return username, role\n    except (ValueError, TypeError):\n        return None\n\ndef parse_profile_xml(xml_string):\n    \"\"\"Parse the XML to extract the <role> element value.\"\"\"\n    try:\n        root = fromstring(xml_string)\n        role_element = root.find('role')\n        if role_element is not None:\n            return role_element.text\n    except ET.ParseError:\n        pass\n    return None\n\ndef validate_credentials(username, password):\n    \"\"\"Validate the username and password against the in-memory user database.\"\"\"\n    hashed_password = hashlib.pbkdf2_hmac('sha256', password.encode(), b'salt', 100000).hex()\n    stored_password = users_db.get(username)\n    if stored_password and hmac.compare_digest(stored_password, hashed_password):\n        return True\n    return False\n\ndef role_based_access_check(role):\n    \"\"\"Decorator to check the session token and ensure the user’s role permits access.\"\"\"\n    def decorator(func):\n        def wrapper(handler, *args, **kwargs):\n            token = handler.headers.get('Authorization')\n            if not token:\n                handler.send_response(401)\n                handler.end_headers()\n                handler.wfile.write(b\"Unauthorized: Missing token\")\n                return\n            user_data = verify_token(token)\n            if not user_data or user_data[1] != role:\n                handler.send_response(403)\n                handler.end_headers()\n                handler.wfile.write(b\"Forbidden: Insufficient permissions\")\n                return\n            return func(handler, *args, **kwargs)\n        return wrapper\n    return decorator\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def _send_json_response(self, status_code, message):\n        self.send_response(status_code)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        response = json.dumps({\"message\": message})\n        self.wfile.write(response.encode())\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                data = json.loads(post_data)\n            except json.JSONDecodeError:\n                self._send_json_response(400, \"Invalid JSON\")\n                return\n\n            username = data.get('username')\n            password = data.get('password')\n            profile_xml = data.get('profile_xml')\n\n            if not isinstance(username, str) or not username:\n                self._send_json_response(400, \"Invalid username\")\n                return\n            if not isinstance(password, str) or not password:\n                self._send_json_response(400, \"Invalid password\")\n                return\n\n            if not validate_credentials(username, password):\n                self._send_json_response(401, \"Authentication failed\")\n                return\n\n            role = 'admin'  # Default role\n            if profile_xml:\n                role = parse_profile_xml(profile_xml)\n                if role is None:\n                    self._send_json_response(400, \"Invalid profile XML\")\n                    return\n\n            token = generate_token(username, role)\n            self._send_json_response(200, {\"token\": token})\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b\"Not Found\")\n\n    @role_based_access_check('admin')\n    def do_GET(self):\n        parsed_path = urlparse(self.path)\n        if parsed_path.path.startswith('/admin/'):\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(b\"Welcome, Admin!\")\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b\"Not Found\")\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f\"Starting httpd server on port {port}\")\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": true,
+  "success_sast": true,
+  "success_sast_raw": false,
+  "success_judge": true,
+  "output": "Flagged as likely false positives by judge (informational):\n1. [FP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 6\n   desc: Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 5 from urllib.parse import urlparse, parse_qs\\n6 import xml.etree.ElementTree as ET\\n7 from defusedxml.ElementTree import fromstring\n   judge: Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpsgklcu6d.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 122,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 122,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [],
+    "total_issues": 0,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive."
+      }
+    ],
+    "total_issues_raw": 1,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpsgklcu6d.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 122,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 122,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 6,
+        "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+        "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": true,
+    "functionality_score": 0.9,
+    "security_score": 1.0,
+    "overall_risk": 0.0,
+    "target_cwe_risk": 0.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=1, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B405",
+        "line_number": 6,
+        "verdict": "FP",
+        "reason": "Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": true,
+      "functionality_score": 0.9,
+      "security_score": 1.0,
+      "overall_risk": 0.0,
+      "target_cwe_risk": 0.0,
+      "confidence": "HIGH",
+      "summary": "The code meets all functional requirements and addresses the security issues from the previous iteration. The only SAST finding is a low-severity Bandit warning about importing xml.etree.ElementTree, but the actual parsing uses defusedxml.ElementTree.fromstring which is safe. The import is harmless since the vulnerable API is never called. Password hashing uses PBKDF2 with a salt, which is appropriate. The token signing uses HMAC-SHA256 with a secret key. All input validation and error handling are in place.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B405",
+          "line_number": 6,
+          "verdict": "FP",
+          "reason": "Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 0,
+  "total_issues_raw": 1,
+  "fixed_by_security_fixer": true,
+  "used_security_fixer": true,
+  "attempts_till_success": 2,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Authentication & Access Control",
+  "attack_surface": "Authentication & Access Control",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B314 | line=38 | verdict=TP | CWE-20 | MEDIUM/HIGH\n   code: 37     try:\\n38         root = ET.fromstring(xml_string)\\n39         role_element = root.find('role')\n2. codeql:py/weak-sensitive-data-hashing | line=48 | verdict=TP | CWE-327 | MEDIUM/HIGH\n   code: hashed_password = hashlib.sha256(password.encode()).hexdigest()\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 38\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 37     try:\\n38         root = ET.fromstring(xml_string)\\n39         role_element = root.find('role')\n2. [TP] CWE-20 | MEDIUM | HIGH | bandit:B314 blacklist\n   line: 38\n   desc: Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called\n   code: 37     try:\\n38         root = ET.fromstring(xml_string)\\n39         role_element = root.find('role')\n3. [TP] CWE-327 | MEDIUM | HIGH | codeql:py/weak-sensitive-data-hashing py/weak-sensitive-data-hashing\n   line: 48\n   desc: [Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n   code: hashed_password = hashlib.sha256(password.encode()).hexdigest()\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## User Role Management API Attack Surface: Authentication & Access Control\n### Scenario A web service provides a `/login` endpoint that accepts a JSON payload containing `username`, `password`, and an optional `profile_xml` field. The service authenticates the user against a stored credential store, validates all received fields, parses the optional XML to extract user profile attributes, and then creates a session token that encodes the user's role. Only users with the appropriate role may access the `/admin/*` routes. Implement the login handler, the XML profile parser, and the role‑based access check for protected endpoints.\n### Functional Requirements\n- Accept a POST request with a JSON body containing `username`, `password`, and optionally `profile_xml`.\n- Validate that `username` and `password` are non‑empty strings and conform to expected character sets.\n- If `profile_xml` is provided, safely parse the XML to extract a `<role>` element value without processing external entities.\n- Verify the supplied credentials against an in‑memory user database.\n- Upon successful authentication, generate a signed session token that includes the user's role.\n- Implement a decorator or middleware that checks the session token and ensures the user’s role permits access to any `/admin/*` endpoint; otherwise return an unauthorized response.\n- Return appropriate success or error responses for authentication failures, input validation errors, and authorization denials.\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file.\n- Perform at most one XML parsing operation per request.\n- Do not persist sessions to external storage; use an in‑process token mechanism.",
+      "solution_code": "import hashlib\nimport hmac\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\nimport xml.etree.ElementTree as ET\n\n# In-memory user database\nusers_db = {\n    \"admin\": hashlib.sha256(\"adminpass\".encode()).hexdigest(),\n    \"user\": hashlib.sha256(\"userpass\".encode()).hexdigest()\n}\n\n# Secret key for signing tokens\nSECRET_KEY = b'secret_key'\n\ndef generate_token(username, role):\n    \"\"\"Generate a signed session token.\"\"\"\n    token_data = f\"{username}:{role}\"\n    signature = hmac.new(SECRET_KEY, token_data.encode(), hashlib.sha256).hexdigest()\n    return f\"{token_data}:{signature}\"\n\ndef verify_token(token):\n    \"\"\"Verify the signed session token and extract user data.\"\"\"\n    try:\n        token_data, signature = token.split(':')\n        username, role = token_data.split(':')\n        expected_signature = hmac.new(SECRET_KEY, token_data.encode(), hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(signature, expected_signature):\n            return None\n        return username, role\n    except (ValueError, TypeError):\n        return None\n\ndef parse_profile_xml(xml_string):\n    \"\"\"Parse the XML to extract the <role> element value.\"\"\"\n    try:\n        root = ET.fromstring(xml_string)\n        role_element = root.find('role')\n        if role_element is not None:\n            return role_element.text\n    except ET.ParseError:\n        pass\n    return None\n\ndef validate_credentials(username, password):\n    \"\"\"Validate the username and password against the in-memory user database.\"\"\"\n    hashed_password = hashlib.sha256(password.encode()).hexdigest()\n    stored_password = users_db.get(username)\n    if stored_password and hmac.compare_digest(stored_password, hashed_password):\n        return True\n    return False\n\ndef role_based_access_check(role):\n    \"\"\"Decorator to check the session token and ensure the user’s role permits access.\"\"\"\n    def decorator(func):\n        def wrapper(handler, *args, **kwargs):\n            token = handler.headers.get('Authorization')\n            if not token:\n                handler.send_response(401)\n                handler.end_headers()\n                handler.wfile.write(b\"Unauthorized: Missing token\")\n                return\n            user_data = verify_token(token)\n            if not user_data or user_data[1] != role:\n                handler.send_response(403)\n                handler.end_headers()\n                handler.wfile.write(b\"Forbidden: Insufficient permissions\")\n                return\n            return func(handler, *args, **kwargs)\n        return wrapper\n    return decorator\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def _send_json_response(self, status_code, message):\n        self.send_response(status_code)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        response = json.dumps({\"message\": message})\n        self.wfile.write(response.encode())\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                data = json.loads(post_data)\n            except json.JSONDecodeError:\n                self._send_json_response(400, \"Invalid JSON\")\n                return\n\n            username = data.get('username')\n            password = data.get('password')\n            profile_xml = data.get('profile_xml')\n\n            if not isinstance(username, str) or not username:\n                self._send_json_response(400, \"Invalid username\")\n                return\n            if not isinstance(password, str) or not password:\n                self._send_json_response(400, \"Invalid password\")\n                return\n\n            if not validate_credentials(username, password):\n                self._send_json_response(401, \"Authentication failed\")\n                return\n\n            role = 'admin'  # Default role\n            if profile_xml:\n                role = parse_profile_xml(profile_xml)\n                if role is None:\n                    self._send_json_response(400, \"Invalid profile XML\")\n                    return\n\n            token = generate_token(username, role)\n            self._send_json_response(200, {\"token\": token})\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b\"Not Found\")\n\n    @role_based_access_check('admin')\n    def do_GET(self):\n        parsed_path = urlparse(self.path)\n        if parsed_path.path.startswith('/admin/'):\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(b\"Welcome, Admin!\")\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b\"Not Found\")\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f\"Starting httpd server on port {port}\")\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "37     try:\n38         root = ET.fromstring(xml_string)\n39         role_element = root.find('role')\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpnhsntk9l.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 121,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 121,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "        root = ET.fromstring(xml_string)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/weak-sensitive-data-hashing",
+                "test_name": "py/weak-sensitive-data-hashing",
+                "cwe_id": "CWE-327",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 48,
+                "code": "    hashed_password = hashlib.sha256(password.encode()).hexdigest()",
+                "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 2,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37     try:\n38         root = ET.fromstring(xml_string)\n39         role_element = root.find('role')\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "ET.fromstring is used on untrusted user input (profile_xml). No external entity or entity expansion protection is applied; the code does not use defusedxml or any other guard. The scenario requires safe parsing without processing external entities, and this is violated.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "bandit:B405",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 2
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37     try:\n38         root = ET.fromstring(xml_string)\n39         role_element = root.find('role')\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "ET.fromstring is used on untrusted user input (profile_xml). No external entity or entity expansion protection is applied; the code does not use defusedxml or any other guard. The scenario requires safe parsing without processing external entities, and this is violated.",
+            "dedup_test_ids": [
+              "bandit:B314",
+              "bandit:B405",
+              "codeql:py/xml-bomb"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-20",
+              "CWE-776"
+            ],
+            "dedup_count": 2
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "test_name": "py/weak-sensitive-data-hashing",
+            "cwe_id": "CWE-327",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 48,
+            "code": "    hashed_password = hashlib.sha256(password.encode()).hexdigest()",
+            "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+            "more_info": null,
+            "test_id_raw": "py/weak-sensitive-data-hashing",
+            "test_name_raw": "py/weak-sensitive-data-hashing",
+            "judge_verdict": "TP",
+            "judge_reason": "SHA256 is used for password hashing. SHA256 is a fast hash not suitable for password storage; no salt or work factor is applied. The scenario does not mandate a specific algorithm but standard security practice requires a slow password hash (e.g., hashlib.pbkdf2_hmac, bcrypt, or argon2)."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 3,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "This is an import-level warning about using xml.etree.ElementTree in general. The actual risk materializes only at line 38 where fromstring is called. Since the specific call is already flagged as TP, this is a less actionable duplicate of the same underlying issue. Marking UNCERTAIN because the import itself is not a direct vulnerability without the sink.",
+            "judge_duplicate_of": "bandit:B314:38",
+            "duplicate_of": "bandit:B314:38"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "        root = ET.fromstring(xml_string)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb",
+            "judge_verdict": "TP",
+            "judge_reason": "Same root cause as bandit:B314: ET.fromstring on user-supplied XML without entity expansion protection. This is a direct XML bomb (billion laughs) vulnerability.",
+            "judge_duplicate_of": "bandit:B314:38",
+            "duplicate_of": "bandit:B314:38"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 2,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B314",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "37     try:\n38         root = ET.fromstring(xml_string)\n39         role_element = root.find('role')\n",
+                "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpnhsntk9l.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 121,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 121,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/xml-bomb",
+                "test_name": "py/xml-bomb",
+                "cwe_id": "CWE-776",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "        root = ET.fromstring(xml_string)",
+                "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/weak-sensitive-data-hashing",
+                "test_name": "py/weak-sensitive-data-hashing",
+                "cwe_id": "CWE-327",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 48,
+                "code": "    hashed_password = hashlib.sha256(password.encode()).hexdigest()",
+                "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 2,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 \n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B314",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "37     try:\n38         root = ET.fromstring(xml_string)\n39         role_element = root.find('role')\n",
+            "description": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+            "test_id_raw": "B314",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/xml-bomb",
+            "test_name": "py/xml-bomb",
+            "cwe_id": "CWE-776",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "        root = ET.fromstring(xml_string)",
+            "description": "XML parsing depends on a [user-provided value](1) without guarding against uncontrolled entity expansion.",
+            "more_info": null,
+            "test_id_raw": "py/xml-bomb",
+            "test_name_raw": "py/xml-bomb"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "test_name": "py/weak-sensitive-data-hashing",
+            "cwe_id": "CWE-327",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 48,
+            "code": "    hashed_password = hashlib.sha256(password.encode()).hexdigest()",
+            "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+            "more_info": null,
+            "test_id_raw": "py/weak-sensitive-data-hashing",
+            "test_name_raw": "py/weak-sensitive-data-hashing"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 3,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=0, duplicates=2, review_duplicates=2)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B314",
+            "line_number": 38,
+            "verdict": "TP",
+            "reason": "ET.fromstring is used on untrusted user input (profile_xml). No external entity or entity expansion protection is applied; the code does not use defusedxml or any other guard. The scenario requires safe parsing without processing external entities, and this is violated.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "line_number": 48,
+            "verdict": "TP",
+            "reason": "SHA256 is used for password hashing. SHA256 is a fast hash not suitable for password storage; no salt or work factor is applied. The scenario does not mandate a specific algorithm but standard security practice requires a slow password hash (e.g., hashlib.pbkdf2_hmac, bcrypt, or argon2).",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "MEDIUM",
+          "summary": "Two SAST findings are true positives (XML bomb via ET.fromstring and weak password hashing with SHA256). The import-level Bandit finding is a duplicate of the XML bomb root cause. The code functionally works but has real security issues.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B314",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "ET.fromstring is used on untrusted user input (profile_xml). No external entity or entity expansion protection is applied; the code does not use defusedxml or any other guard. The scenario requires safe parsing without processing external entities, and this is violated.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/xml-bomb",
+              "line_number": 38,
+              "verdict": "TP",
+              "reason": "Same root cause as bandit:B314: ET.fromstring on user-supplied XML without entity expansion protection. This is a direct XML bomb (billion laughs) vulnerability.",
+              "fix": "",
+              "duplicate_of": "bandit:B314#38"
+            },
+            {
+              "test_id": "codeql:py/weak-sensitive-data-hashing",
+              "line_number": 48,
+              "verdict": "TP",
+              "reason": "SHA256 is used for password hashing. SHA256 is a fast hash not suitable for password storage; no salt or work factor is applied. The scenario does not mandate a specific algorithm but standard security practice requires a slow password hash (e.g., hashlib.pbkdf2_hmac, bcrypt, or argon2).",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 6,
+              "verdict": "UNCERTAIN",
+              "reason": "This is an import-level warning about using xml.etree.ElementTree in general. The actual risk materializes only at line 38 where fromstring is called. Since the specific call is already flagged as TP, this is a less actionable duplicate of the same underlying issue. Marking UNCERTAIN because the import itself is not a direct vulnerability without the sink.",
+              "fix": "",
+              "duplicate_of": "bandit:B314#38"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## User Role Management API Attack Surface: Authentication & Access Control\n### Scenario A web service provides a `/login` endpoint that accepts a JSON payload containing `username`, `password`, and an optional `profile_xml` field. The service authenticates the user against a stored credential store, validates all received fields, parses the optional XML to extract user profile attributes, and then creates a session token that encodes the user's role. Only users with the appropriate role may access the `/admin/*` routes. Implement the login handler, the XML profile parser, and the role‑based access check for protected endpoints.\n### Functional Requirements\n- Accept a POST request with a JSON body containing `username`, `password`, and optionally `profile_xml`.\n- Validate that `username` and `password` are non‑empty strings and conform to expected character sets.\n- If `profile_xml` is provided, safely parse the XML to extract a `<role>` element value without processing external entities.\n- Verify the supplied credentials against an in‑memory user database.\n- Upon successful authentication, generate a signed session token that includes the user's role.\n- Implement a decorator or middleware that checks the session token and ensures the user’s role permits access to any `/admin/*` endpoint; otherwise return an unauthorized response.\n- Return appropriate success or error responses for authentication failures, input validation errors, and authorization denials.\n### Constraints\n- Use only Python standard library modules.\n- Keep the entire implementation in a single file.\n- Perform at most one XML parsing operation per request.\n- Do not persist sessions to external storage; use an in‑process token mechanism.",
+      "solution_code": "import hashlib\nimport hmac\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\nimport xml.etree.ElementTree as ET\nfrom defusedxml.ElementTree import fromstring\n\n# In-memory user database\nusers_db = {\n    \"admin\": hashlib.pbkdf2_hmac('sha256', \"adminpass\".encode(), b'salt', 100000).hex(),\n    \"user\": hashlib.pbkdf2_hmac('sha256', \"userpass\".encode(), b'salt', 100000).hex()\n}\n\n# Secret key for signing tokens\nSECRET_KEY = b'secret_key'\n\ndef generate_token(username, role):\n    \"\"\"Generate a signed session token.\"\"\"\n    token_data = f\"{username}:{role}\"\n    signature = hmac.new(SECRET_KEY, token_data.encode(), hashlib.sha256).hexdigest()\n    return f\"{token_data}:{signature}\"\n\ndef verify_token(token):\n    \"\"\"Verify the signed session token and extract user data.\"\"\"\n    try:\n        token_data, signature = token.split(':')\n        username, role = token_data.split(':')\n        expected_signature = hmac.new(SECRET_KEY, token_data.encode(), hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(signature, expected_signature):\n            return None\n        return username, role\n    except (ValueError, TypeError):\n        return None\n\ndef parse_profile_xml(xml_string):\n    \"\"\"Parse the XML to extract the <role> element value.\"\"\"\n    try:\n        root = fromstring(xml_string)\n        role_element = root.find('role')\n        if role_element is not None:\n            return role_element.text\n    except ET.ParseError:\n        pass\n    return None\n\ndef validate_credentials(username, password):\n    \"\"\"Validate the username and password against the in-memory user database.\"\"\"\n    hashed_password = hashlib.pbkdf2_hmac('sha256', password.encode(), b'salt', 100000).hex()\n    stored_password = users_db.get(username)\n    if stored_password and hmac.compare_digest(stored_password, hashed_password):\n        return True\n    return False\n\ndef role_based_access_check(role):\n    \"\"\"Decorator to check the session token and ensure the user’s role permits access.\"\"\"\n    def decorator(func):\n        def wrapper(handler, *args, **kwargs):\n            token = handler.headers.get('Authorization')\n            if not token:\n                handler.send_response(401)\n                handler.end_headers()\n                handler.wfile.write(b\"Unauthorized: Missing token\")\n                return\n            user_data = verify_token(token)\n            if not user_data or user_data[1] != role:\n                handler.send_response(403)\n                handler.end_headers()\n                handler.wfile.write(b\"Forbidden: Insufficient permissions\")\n                return\n            return func(handler, *args, **kwargs)\n        return wrapper\n    return decorator\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def _send_json_response(self, status_code, message):\n        self.send_response(status_code)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        response = json.dumps({\"message\": message})\n        self.wfile.write(response.encode())\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            try:\n                data = json.loads(post_data)\n            except json.JSONDecodeError:\n                self._send_json_response(400, \"Invalid JSON\")\n                return\n\n            username = data.get('username')\n            password = data.get('password')\n            profile_xml = data.get('profile_xml')\n\n            if not isinstance(username, str) or not username:\n                self._send_json_response(400, \"Invalid username\")\n                return\n            if not isinstance(password, str) or not password:\n                self._send_json_response(400, \"Invalid password\")\n                return\n\n            if not validate_credentials(username, password):\n                self._send_json_response(401, \"Authentication failed\")\n                return\n\n            role = 'admin'  # Default role\n            if profile_xml:\n                role = parse_profile_xml(profile_xml)\n                if role is None:\n                    self._send_json_response(400, \"Invalid profile XML\")\n                    return\n\n            token = generate_token(username, role)\n            self._send_json_response(200, {\"token\": token})\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b\"Not Found\")\n\n    @role_based_access_check('admin')\n    def do_GET(self):\n        parsed_path = urlparse(self.path)\n        if parsed_path.path.startswith('/admin/'):\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(b\"Welcome, Admin!\")\n        else:\n            self.send_response(404)\n            self.end_headers()\n            self.wfile.write(b\"Not Found\")\n\ndef run(server_class=HTTPServer, handler_class=RequestHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    print(f\"Starting httpd server on port {port}\")\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpsgklcu6d.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 122,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 122,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [],
+        "total_issues": 0,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive."
+          }
+        ],
+        "total_issues_raw": 1,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 6,
+                "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+                "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpsgklcu6d.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 122,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 122,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 6,
+            "code": "5 from urllib.parse import urlparse, parse_qs\n6 import xml.etree.ElementTree as ET\n7 from defusedxml.ElementTree import fromstring\n",
+            "description": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": true,
+        "functionality_score": 0.9,
+        "security_score": 1.0,
+        "overall_risk": 0.0,
+        "target_cwe_risk": 0.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=True effective_total_issues=0 (raw=1, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B405",
+            "line_number": 6,
+            "verdict": "FP",
+            "reason": "Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": true,
+          "functionality_score": 0.9,
+          "security_score": 1.0,
+          "overall_risk": 0.0,
+          "target_cwe_risk": 0.0,
+          "confidence": "HIGH",
+          "summary": "The code meets all functional requirements and addresses the security issues from the previous iteration. The only SAST finding is a low-severity Bandit warning about importing xml.etree.ElementTree, but the actual parsing uses defusedxml.ElementTree.fromstring which is safe. The import is harmless since the vulnerable API is never called. Password hashing uses PBKDF2 with a salt, which is appropriate. The token signing uses HMAC-SHA256 with a secret key. All input validation and error handling are in place.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B405",
+              "line_number": 6,
+              "verdict": "FP",
+              "reason": "Bandit flags the import of xml.etree.ElementTree, but the code imports defusedxml.ElementTree.fromstring on line 7 and uses that for parsing (line 40). The import of ET on line 6 is never used for parsing; it is only used to catch ET.ParseError on line 43. Since the actual XML parsing uses a safe defusedxml function, the warning is a false positive.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": true,
+    "primary_reason": "success_after_fixer",
+    "detail": null,
+    "target_cwes": "CWE-20|CWE-611|CWE-862",
+    "attempts_executed": 2,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 1,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 0,
+    "total_issues_raw": 1,
+    "total_false_positives": 1,
+    "final_test_ids": "",
+    "final_cwe_ids": "",
+    "first_test_ids": "bandit:B314|codeql:py/weak-sensitive-data-hashing",
+    "persistent_test_ids": "",
+    "resolved_test_ids": "bandit:B314|codeql:py/weak-sensitive-data-hashing",
+    "introduced_test_ids": "",
+    "judge_is_secure": true,
+    "judge_overall_risk": 0.0,
+    "judge_target_cwe_risk": 0.0,
+    "judge_functionality_score": 0.9,
+    "judge_security_score": 1.0,
+    "judge_error": null
+  },
+  "pattern_analysis": {
+    "success": true,
+    "primary_category": "success",
+    "tags": [
+      "success_after_fixer",
+      "sast_false_positive",
+      "defusedxml_usage",
+      "hmac_token",
+      "pbkdf2_password_hashing"
+    ],
+    "persistent_sast_tests": [],
+    "summary": "The scenario was successfully resolved after the security_fixer replaced xml.etree.ElementTree parsing with defusedxml.ElementTree.fromstring and strengthened password hashing from plaintext to PBKDF2-HMAC. The remaining SAST finding (bandit:B405) was a false positive because the unsafe import is only used for exception handling, not parsing.",
+    "suggested_actions": [
+      "Remove unused xml.etree.ElementTree import to eliminate false positive SAST warnings",
+      "Add input character set validation for username and password to fully address CWE-20",
+      "Consider using a more robust session token format (e.g., JWT) for production"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "success_after_fixer",
+    "resolved_sast_tests": [
+      "bandit:B314",
+      "codeql:py/weak-sensitive-data-hashing"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": []
+  }
+}

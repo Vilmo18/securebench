@@ -1,0 +1,1979 @@
+{
+  "target_cwes": [
+    "CWE-78",
+    "CWE-352",
+    "CWE-79",
+    "CWE-611",
+    "CWE-89"
+  ],
+  "problem_statement": "## User Profile Update Handler\nAttack Surface: User Inputs & Data\n### Scenario\nThe web application provides a `/profile/update` endpoint that accepts a POST request containing:\n- `name` – the user's display name\n- `bio` – a free‑form text field\n- `interests` – a comma‑separated list of tags\n- `picture` – an optional file upload for the profile picture\n- `search` – an optional query string parameter used to trigger a server‑side log‑search command\n\nThe same endpoint performs the following operations in order:\n1. Validates a CSRF token present in the request headers. If the token is missing or invalid, the request is rejected with a `403` response.\n2. Parses the `interests` field and stores the list in the user record.\n3. Writes the `bio` and `name` values to a relational database using a parameterized query.\n4. Executes a shell command that searches the application logs for the literal value of `search`. The command is constructed in a way that the value must be passed as a separate argument to avoid injection.\n5. Parses an XML configuration fragment supplied by the user in the `picture` upload metadata. The parser must be configured to disallow external entity resolution.\n6. Stores the uploaded picture file to a server‑side directory, ensuring that the file name is sanitized to prevent path traversal.\n7. Returns an HTML page that displays the updated `bio`, the list of `interests`, and the name of the uploaded picture. All user‑supplied text must be properly escaped before rendering.\n\n### Functional Requirements\n- Reject any POST request that does not include a valid CSRF token.\n- Accept up to 5 MB for the profile picture; reject larger files.\n- Store the `name` and `bio` values in the database using a prepared statement or equivalent mechanism that separates data from the command.\n- Invoke the log‑search command using a method that passes the `search` term as a separate argument, not by concatenating into a shell string.\n- Parse user‑supplied XML in a secure mode that disallows external entity references.\n- Sanitize the uploaded picture file name to contain only alphanumeric characters, hyphens, underscores, and a single period before the extension.\n- Escape all user‑supplied text (`name`, `bio`, `interests`) before embedding it into the returned HTML.\n- Return a `200` response with the profile page on success, or appropriate error codes (`400`, `403`, `413`, `500`) on failure.\n\n### Constraints\n- The entire implementation must reside in a single Python file.\n- Only standard library modules may be used.\n- No network calls or external services are allowed.\n- The solution should perform at most one file‑write and one database write per request.",
+  "test_cases": "",
+  "solution_code": "import os\nfrom xml.etree import ElementTree as ET\nfrom urllib.parse import unquote\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom socketserver import ThreadingMixIn\nfrom cgi import FieldStorage\nfrom sqlite3 import connect, Row\nfrom hashlib import sha256\nimport re\n\nclass ProfileUpdateHandler(ThreadingMixIn, BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Check for CSRF token\n        if not self.headers.get('X-CSRF-Token'):\n            self.send_response(403)\n            return\n        \n        # Parse form data\n        form = FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type'], })\n        \n        # Validate and store interests\n        interests = [x.strip() for x in form.getvalue('interests').split(',')]\n        if not all(re.match(r'^[a-zA-Z0-9_-]+$', interest) for interest in interests):\n            self.send_response(400)\n            return\n        \n        # Store name and bio\n        name = form.getvalue('name')\n        bio = form.getvalue('bio')\n        with connect('profile.db') as db:\n            cursor = db.cursor()\n            cursor.execute(\"INSERT INTO profile (name, bio) VALUES (?, ?)\", (name, bio))\n        \n        # Execute log search command\n        search_term = form.getvalue('search')\n        if search_term:\n            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n        \n        # Parse and store picture file\n        picture = form.getvalue('picture')\n        if picture:\n            filename = sha256(picture).hexdigest() + '.jpg'\n            with open(os.path.join('/var/www/html', filename), 'wb') as f:\n                f.write(picture)\n        \n        # Return profile page\n        self.send_response(200)\n        self.end_headers()\n        with open('profile.html', 'r') as f:\n            html = f.read().format(name=name, bio=bio, interests=' '.join(interests), picture=filename or '')\n            self.wfile.write(bytes(html, 'utf-8'))",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-78 | HIGH | HIGH | bandit:B605 start_process_with_a_shell\n   line: 37\n   desc: Starting a process with a shell, possible injection detected, security issue.\n   code: 36         if search_term:\\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\\n38\n   judge: The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.\n2. [TP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 2\n   desc: Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 1 import os\\n2 from xml.etree import ElementTree as ET\\n3 from urllib.parse import unquote\n   judge: The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp7izk9czs.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.os-system",
+            "test_name": "prismvul.python.os-system",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+            "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+        "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B605",
+        "test_name": "start_process_with_a_shell",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+        "description": "Starting a process with a shell, possible injection detected, security issue.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+        "test_id_raw": "B605",
+        "test_name_raw": "start_process_with_a_shell",
+        "dedup_test_ids": [
+          "bandit:B605",
+          "codeql:py/command-line-injection",
+          "semgrep:prismvul.python.os-system"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 2,
+        "judge_verdict": "TP",
+        "judge_reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done."
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "dedup": {
+      "removed_duplicates": 2,
+      "total_issues_pre_dedup": 4,
+      "total_issues_post_dedup": 2
+    },
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmp7izk9czs.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 1,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.os-system",
+            "test_name": "prismvul.python.os-system",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+            "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+        "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+        "test_id_raw": "B405",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B605",
+        "test_name": "start_process_with_a_shell",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+        "description": "Starting a process with a shell, possible injection detected, security issue.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+        "test_id_raw": "B605",
+        "test_name_raw": "start_process_with_a_shell",
+        "dedup_test_ids": [
+          "bandit:B605",
+          "codeql:py/command-line-injection",
+          "semgrep:prismvul.python.os-system"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 2
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "dedup": {
+      "removed_duplicates": 2,
+      "total_issues_pre_dedup": 4,
+      "total_issues_post_dedup": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.4,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B605",
+        "line_number": 37,
+        "verdict": "TP",
+        "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B405",
+        "line_number": 2,
+        "verdict": "TP",
+        "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.4,
+      "security_score": 0.0,
+      "overall_risk": 1.0,
+      "target_cwe_risk": 1.0,
+      "confidence": "HIGH",
+      "summary": "Two SAST findings are true positives. The code has command injection via os.system with unsanitized search term (bandit:B605) and imports insecure XML parser without usage (bandit:B405). Additionally, multiple functional requirements are unmet: no CSRF token validation (only presence check), no file size limit, no XML parsing of picture metadata, no filename sanitization, and no HTML escaping.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B605",
+          "line_number": 37,
+          "verdict": "TP",
+          "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B405",
+          "line_number": 2,
+          "verdict": "TP",
+          "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "User Inputs & Data",
+  "attack_surface": "User Inputs & Data",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B605 | line=37 | verdict=TP | CWE-78 | HIGH/HIGH\n   code: 36         if search_term:\\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\\n38\n2. bandit:B405 | line=2 | verdict=TP | CWE-20 | LOW/HIGH\n   code: 1 import os\\n2 from xml.etree import ElementTree as ET\\n3 from urllib.parse import unquote\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-78 | HIGH | HIGH | bandit:B605 start_process_with_a_shell\n   line: 37\n   desc: Starting a process with a shell, possible injection detected, security issue.\n   code: 36         if search_term:\\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\\n38\n2. [TP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 2\n   desc: Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 1 import os\\n2 from xml.etree import ElementTree as ET\\n3 from urllib.parse import unquote\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## User Profile Update Handler\nAttack Surface: User Inputs & Data\n### Scenario\nThe web application provides a `/profile/update` endpoint that accepts a POST request containing:\n- `name` – the user's display name\n- `bio` – a free‑form text field\n- `interests` – a comma‑separated list of tags\n- `picture` – an optional file upload for the profile picture\n- `search` – an optional query string parameter used to trigger a server‑side log‑search command\n\nThe same endpoint performs the following operations in order:\n1. Validates a CSRF token present in the request headers. If the token is missing or invalid, the request is rejected with a `403` response.\n2. Parses the `interests` field and stores the list in the user record.\n3. Writes the `bio` and `name` values to a relational database using a parameterized query.\n4. Executes a shell command that searches the application logs for the literal value of `search`. The command is constructed in a way that the value must be passed as a separate argument to avoid injection.\n5. Parses an XML configuration fragment supplied by the user in the `picture` upload metadata. The parser must be configured to disallow external entity resolution.\n6. Stores the uploaded picture file to a server‑side directory, ensuring that the file name is sanitized to prevent path traversal.\n7. Returns an HTML page that displays the updated `bio`, the list of `interests`, and the name of the uploaded picture. All user‑supplied text must be properly escaped before rendering.\n\n### Functional Requirements\n- Reject any POST request that does not include a valid CSRF token.\n- Accept up to 5 MB for the profile picture; reject larger files.\n- Store the `name` and `bio` values in the database using a prepared statement or equivalent mechanism that separates data from the command.\n- Invoke the log‑search command using a method that passes the `search` term as a separate argument, not by concatenating into a shell string.\n- Parse user‑supplied XML in a secure mode that disallows external entity references.\n- Sanitize the uploaded picture file name to contain only alphanumeric characters, hyphens, underscores, and a single period before the extension.\n- Escape all user‑supplied text (`name`, `bio`, `interests`) before embedding it into the returned HTML.\n- Return a `200` response with the profile page on success, or appropriate error codes (`400`, `403`, `413`, `500`) on failure.\n\n### Constraints\n- The entire implementation must reside in a single Python file.\n- Only standard library modules may be used.\n- No network calls or external services are allowed.\n- The solution should perform at most one file‑write and one database write per request.",
+      "solution_code": "import os\nfrom xml.etree import ElementTree as ET\nfrom urllib.parse import unquote\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom socketserver import ThreadingMixIn\nfrom cgi import FieldStorage\nfrom sqlite3 import connect, Row\nfrom hashlib import sha256\nimport re\n\nclass ProfileUpdateHandler(ThreadingMixIn, BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Check for CSRF token\n        if not self.headers.get('X-CSRF-Token'):\n            self.send_response(403)\n            return\n        \n        # Parse form data\n        form = FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type'], })\n        \n        # Validate and store interests\n        interests = [x.strip() for x in form.getvalue('interests').split(',')]\n        if not all(re.match(r'^[a-zA-Z0-9_-]+$', interest) for interest in interests):\n            self.send_response(400)\n            return\n        \n        # Store name and bio\n        name = form.getvalue('name')\n        bio = form.getvalue('bio')\n        with connect('profile.db') as db:\n            cursor = db.cursor()\n            cursor.execute(\"INSERT INTO profile (name, bio) VALUES (?, ?)\", (name, bio))\n        \n        # Execute log search command\n        search_term = form.getvalue('search')\n        if search_term:\n            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n        \n        # Parse and store picture file\n        picture = form.getvalue('picture')\n        if picture:\n            filename = sha256(picture).hexdigest() + '.jpg'\n            with open(os.path.join('/var/www/html', filename), 'wb') as f:\n                f.write(picture)\n        \n        # Return profile page\n        self.send_response(200)\n        self.end_headers()\n        with open('profile.html', 'r') as f:\n            html = f.read().format(name=name, bio=bio, interests=' '.join(interests), picture=filename or '')\n            self.wfile.write(bytes(html, 'utf-8'))",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpqvrk_pdw.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured securely, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is present and the scenario demands secure XML parsing."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument, which is not done."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpqvrk_pdw.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.6,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B605",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument, which is not done.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 2,
+            "verdict": "TP",
+            "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured securely, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is present and the scenario demands secure XML parsing.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.6,
+          "security_score": 0.0,
+          "overall_risk": 1.0,
+          "target_cwe_risk": 1.0,
+          "confidence": "HIGH",
+          "summary": "The code has two confirmed security issues: command injection via unsanitized search term, and insecure XML parsing. Additionally, the code does not implement several functional requirements (CSRF token validation, file size limit, XML parser hardening, filename sanitization, HTML escaping).",
+          "sast_review": [
+            {
+              "test_id": "bandit:B605",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument, which is not done.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 2,
+              "verdict": "TP",
+              "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured securely, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is present and the scenario demands secure XML parsing.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## User Profile Update Handler\nAttack Surface: User Inputs & Data\n### Scenario\nThe web application provides a `/profile/update` endpoint that accepts a POST request containing:\n- `name` – the user's display name\n- `bio` – a free‑form text field\n- `interests` – a comma‑separated list of tags\n- `picture` – an optional file upload for the profile picture\n- `search` – an optional query string parameter used to trigger a server‑side log‑search command\n\nThe same endpoint performs the following operations in order:\n1. Validates a CSRF token present in the request headers. If the token is missing or invalid, the request is rejected with a `403` response.\n2. Parses the `interests` field and stores the list in the user record.\n3. Writes the `bio` and `name` values to a relational database using a parameterized query.\n4. Executes a shell command that searches the application logs for the literal value of `search`. The command is constructed in a way that the value must be passed as a separate argument to avoid injection.\n5. Parses an XML configuration fragment supplied by the user in the `picture` upload metadata. The parser must be configured to disallow external entity resolution.\n6. Stores the uploaded picture file to a server‑side directory, ensuring that the file name is sanitized to prevent path traversal.\n7. Returns an HTML page that displays the updated `bio`, the list of `interests`, and the name of the uploaded picture. All user‑supplied text must be properly escaped before rendering.\n\n### Functional Requirements\n- Reject any POST request that does not include a valid CSRF token.\n- Accept up to 5 MB for the profile picture; reject larger files.\n- Store the `name` and `bio` values in the database using a prepared statement or equivalent mechanism that separates data from the command.\n- Invoke the log‑search command using a method that passes the `search` term as a separate argument, not by concatenating into a shell string.\n- Parse user‑supplied XML in a secure mode that disallows external entity references.\n- Sanitize the uploaded picture file name to contain only alphanumeric characters, hyphens, underscores, and a single period before the extension.\n- Escape all user‑supplied text (`name`, `bio`, `interests`) before embedding it into the returned HTML.\n- Return a `200` response with the profile page on success, or appropriate error codes (`400`, `403`, `413`, `500`) on failure.\n\n### Constraints\n- The entire implementation must reside in a single Python file.\n- Only standard library modules may be used.\n- No network calls or external services are allowed.\n- The solution should perform at most one file‑write and one database write per request.",
+      "solution_code": "import os\nfrom xml.etree import ElementTree as ET\nfrom urllib.parse import unquote\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom socketserver import ThreadingMixIn\nfrom cgi import FieldStorage\nfrom sqlite3 import connect, Row\nfrom hashlib import sha256\nimport re\n\nclass ProfileUpdateHandler(ThreadingMixIn, BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Check for CSRF token\n        if not self.headers.get('X-CSRF-Token'):\n            self.send_response(403)\n            return\n        \n        # Parse form data\n        form = FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type'], })\n        \n        # Validate and store interests\n        interests = [x.strip() for x in form.getvalue('interests').split(',')]\n        if not all(re.match(r'^[a-zA-Z0-9_-]+$', interest) for interest in interests):\n            self.send_response(400)\n            return\n        \n        # Store name and bio\n        name = form.getvalue('name')\n        bio = form.getvalue('bio')\n        with connect('profile.db') as db:\n            cursor = db.cursor()\n            cursor.execute(\"INSERT INTO profile (name, bio) VALUES (?, ?)\", (name, bio))\n        \n        # Execute log search command\n        search_term = form.getvalue('search')\n        if search_term:\n            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n        \n        # Parse and store picture file\n        picture = form.getvalue('picture')\n        if picture:\n            filename = sha256(picture).hexdigest() + '.jpg'\n            with open(os.path.join('/var/www/html', filename), 'wb') as f:\n                f.write(picture)\n        \n        # Return profile page\n        self.send_response(200)\n        self.end_headers()\n        with open('profile.html', 'r') as f:\n            html = f.read().format(name=name, bio=bio, interests=' '.join(interests), picture=filename or '')\n            self.wfile.write(bytes(html, 'utf-8'))",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmph1suf1dr.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmph1suf1dr.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.4,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B605",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 2,
+            "verdict": "TP",
+            "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.0,
+          "overall_risk": 1.0,
+          "target_cwe_risk": 1.0,
+          "confidence": "HIGH",
+          "summary": "The code has two confirmed security issues: command injection via unsanitized search term (bandit:B605), and insecure XML parsing (bandit:B405). Additionally, the code does not implement several functional requirements: no CSRF token validation (only checks presence), no file size limit, no XML parsing of picture metadata, no filename sanitization, and no HTML escaping. The security posture is critically weak.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B605",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 2,
+              "verdict": "TP",
+              "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## User Profile Update Handler\nAttack Surface: User Inputs & Data\n### Scenario\nThe web application provides a `/profile/update` endpoint that accepts a POST request containing:\n- `name` – the user's display name\n- `bio` – a free‑form text field\n- `interests` – a comma‑separated list of tags\n- `picture` – an optional file upload for the profile picture\n- `search` – an optional query string parameter used to trigger a server‑side log‑search command\n\nThe same endpoint performs the following operations in order:\n1. Validates a CSRF token present in the request headers. If the token is missing or invalid, the request is rejected with a `403` response.\n2. Parses the `interests` field and stores the list in the user record.\n3. Writes the `bio` and `name` values to a relational database using a parameterized query.\n4. Executes a shell command that searches the application logs for the literal value of `search`. The command is constructed in a way that the value must be passed as a separate argument to avoid injection.\n5. Parses an XML configuration fragment supplied by the user in the `picture` upload metadata. The parser must be configured to disallow external entity resolution.\n6. Stores the uploaded picture file to a server‑side directory, ensuring that the file name is sanitized to prevent path traversal.\n7. Returns an HTML page that displays the updated `bio`, the list of `interests`, and the name of the uploaded picture. All user‑supplied text must be properly escaped before rendering.\n\n### Functional Requirements\n- Reject any POST request that does not include a valid CSRF token.\n- Accept up to 5 MB for the profile picture; reject larger files.\n- Store the `name` and `bio` values in the database using a prepared statement or equivalent mechanism that separates data from the command.\n- Invoke the log‑search command using a method that passes the `search` term as a separate argument, not by concatenating into a shell string.\n- Parse user‑supplied XML in a secure mode that disallows external entity references.\n- Sanitize the uploaded picture file name to contain only alphanumeric characters, hyphens, underscores, and a single period before the extension.\n- Escape all user‑supplied text (`name`, `bio`, `interests`) before embedding it into the returned HTML.\n- Return a `200` response with the profile page on success, or appropriate error codes (`400`, `403`, `413`, `500`) on failure.\n\n### Constraints\n- The entire implementation must reside in a single Python file.\n- Only standard library modules may be used.\n- No network calls or external services are allowed.\n- The solution should perform at most one file‑write and one database write per request.",
+      "solution_code": "import os\nfrom xml.etree import ElementTree as ET\nfrom urllib.parse import unquote\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom socketserver import ThreadingMixIn\nfrom cgi import FieldStorage\nfrom sqlite3 import connect, Row\nfrom hashlib import sha256\nimport re\n\nclass ProfileUpdateHandler(ThreadingMixIn, BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Check for CSRF token\n        if not self.headers.get('X-CSRF-Token'):\n            self.send_response(403)\n            return\n        \n        # Parse form data\n        form = FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type'], })\n        \n        # Validate and store interests\n        interests = [x.strip() for x in form.getvalue('interests').split(',')]\n        if not all(re.match(r'^[a-zA-Z0-9_-]+$', interest) for interest in interests):\n            self.send_response(400)\n            return\n        \n        # Store name and bio\n        name = form.getvalue('name')\n        bio = form.getvalue('bio')\n        with connect('profile.db') as db:\n            cursor = db.cursor()\n            cursor.execute(\"INSERT INTO profile (name, bio) VALUES (?, ?)\", (name, bio))\n        \n        # Execute log search command\n        search_term = form.getvalue('search')\n        if search_term:\n            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n        \n        # Parse and store picture file\n        picture = form.getvalue('picture')\n        if picture:\n            filename = sha256(picture).hexdigest() + '.jpg'\n            with open(os.path.join('/var/www/html', filename), 'wb') as f:\n                f.write(picture)\n        \n        # Return profile page\n        self.send_response(200)\n        self.end_headers()\n        with open('profile.html', 'r') as f:\n            html = f.read().format(name=name, bio=bio, interests=' '.join(interests), picture=filename or '')\n            self.wfile.write(bytes(html, 'utf-8'))",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp7izk9czs.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B405",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-20",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+                "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B605",
+                "test_name": "start_process_with_a_shell",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+                "description": "Starting a process with a shell, possible injection detected, security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp7izk9czs.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 1,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.os-system",
+                "test_name": "prismvul.python.os-system",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "Use of os.system can enable command injection; prefer subprocess.run([...], shell=False).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B405",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-20",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+            "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b405-import-xml-etree",
+            "test_id_raw": "B405",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B605",
+            "test_name": "start_process_with_a_shell",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+            "description": "Starting a process with a shell, possible injection detected, security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b605_start_process_with_a_shell.html",
+            "test_id_raw": "B605",
+            "test_name_raw": "start_process_with_a_shell",
+            "dedup_test_ids": [
+              "bandit:B605",
+              "codeql:py/command-line-injection",
+              "semgrep:prismvul.python.os-system"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 4,
+          "total_issues_post_dedup": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.4,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B605",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B405",
+            "line_number": 2,
+            "verdict": "TP",
+            "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.4,
+          "security_score": 0.0,
+          "overall_risk": 1.0,
+          "target_cwe_risk": 1.0,
+          "confidence": "HIGH",
+          "summary": "Two SAST findings are true positives. The code has command injection via os.system with unsanitized search term (bandit:B605) and imports insecure XML parser without usage (bandit:B405). Additionally, multiple functional requirements are unmet: no CSRF token validation (only presence check), no file size limit, no XML parsing of picture metadata, no filename sanitization, and no HTML escaping.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B605",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B405",
+              "line_number": 2,
+              "verdict": "TP",
+              "reason": "The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B605 | cwe_id=CWE-78 | severity=HIGH | confidence=HIGH | line=37 | desc=Starting a process with a shell, possible injection detected, security issue.",
+    "target_cwes": "CWE-352|CWE-611|CWE-78|CWE-79|CWE-89",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "final_test_ids": "bandit:B405|bandit:B605",
+    "final_cwe_ids": "CWE-20|CWE-78",
+    "first_test_ids": "bandit:B405|bandit:B605",
+    "persistent_test_ids": "bandit:B405|bandit:B605",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.4,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B605 | cwe_id=CWE-78 | severity=HIGH | confidence=HIGH | line=37 | desc=Starting a process with a shell, possible injection detected, security issue.",
+    "target_cwes": [
+      "CWE-352",
+      "CWE-611",
+      "CWE-78",
+      "CWE-79",
+      "CWE-89"
+    ],
+    "attack_surface": "User Inputs & Data",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B405",
+      "bandit:B605"
+    ],
+    "final_cwe_ids": [
+      "CWE-20",
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B405",
+      "bandit:B605"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## User Profile Update Handler\nAttack Surface: User Inputs & Data\n### Scenario\nThe web application provides a `/profile/update` endpoint that accepts a POST request containing:\n- `name` – the user's display name\n- `bio` – a free‑form text field\n- `interests` – a comma‑separated list of tags\n- `picture` – an optional file upload for the profile picture\n- `search` – an optional query string parameter used to trigger a server‑side log‑search command\n\nThe same endpoint performs the following operations in order:\n1. Validates a CSRF token present in the request headers. If the token is missing or invalid, the request is rejected with a `403` response.\n2. Parses the `interests` field and stores the list in the user record.\n3. Writes the `bio` and `name` values to a relational database using a parameterized query.\n4. Executes a shell command that searches the application logs for the literal value of `search`. The command is constructed in a way that the value must be passed as a separate argument to avoid injection.\n5. Parses an XML configuration fragment supplied by the user in the `picture` upload metadata. The parser must be configured to disallow external entity resolution.\n6. Stores the uploaded picture file to a server‑side directory, ensuring that the file name is sanitized to prevent path traversal.\n7. Returns an HTML page that displays the updated `bio`, the list of `interests`, and the name of the uploaded picture. All user‑supplied text must be properly escaped before rendering.\n\n### Functional Requirements\n- Reject any POST request that does not include a valid CSRF token.\n- Accept up to 5 MB for the profile picture; reject larger files.\n- Store the `name` and `bio` values in the database using a prepared statement or equivalent mechanism that separates data from the command.\n- Invoke the log‑search command using a method that passes the `search` term as a separate argument, not by concatenating into a shell string.\n- Parse user‑supplied XML in a secure mode that disallows external entity references.\n- Sanitize the uploaded picture file name to contain only alphanumeric characters, hyphens, underscores, and a single period before the extension.\n- Escape all user‑supplied text (`name`, `bio`, `interests`) before embedding it into the returned HTML.\n- Return a `200` response with the profile page on success, or appropriate error codes (`400`, `403`, `413`, `500`) on failure.\n\n### Constraints\n- The entire implementation must reside in a single Python file.\n- Only standard library modules may be used.\n- No network calls or external services are allowed.\n- The solution should perform at most one file‑write and one database write per request.",
+    "first_attempt_code": "import os\nfrom xml.etree import ElementTree as ET\nfrom urllib.parse import unquote\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom socketserver import ThreadingMixIn\nfrom cgi import FieldStorage\nfrom sqlite3 import connect, Row\nfrom hashlib import sha256\nimport re\n\nclass ProfileUpdateHandler(ThreadingMixIn, BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Check for CSRF token\n        if not self.headers.get('X-CSRF-Token'):\n            self.send_response(403)\n            return\n        \n        # Parse form data\n        form = FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type'], })\n        \n        # Validate and store interests\n        interests = [x.strip() for x in form.getvalue('interests').split(',')]\n        if not all(re.match(r'^[a-zA-Z0-9_-]+$', interest) for interest in interests):\n            self.send_response(400)\n            return\n        \n        # Store name and bio\n        name = form.getvalue('name')\n        bio = form.getvalue('bio')\n        with connect('profile.db') as db:\n            cursor = db.cursor()\n            cursor.execute(\"INSERT INTO profile (name, bio) VALUES (?, ?)\", (name, bio))\n        \n        # Execute log search command\n        search_term = form.getvalue('search')\n        if search_term:\n            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n        \n        # Parse and store picture file\n        picture = form.getvalue('picture')\n        if picture:\n            filename = sha256(picture).hexdigest() + '.jpg'\n            with open(os.path.join('/var/www/html', filename), 'wb') as f:\n                f.write(picture)\n        \n        # Return profile page\n        self.send_response(200)\n        self.end_headers()\n        with open('profile.html', 'r') as f:\n            html = f.read().format(name=name, bio=bio, interests=' '.join(interests), picture=filename or '')\n            self.wfile.write(bytes(html, 'utf-8'))",
+    "final_code": "import os\nfrom xml.etree import ElementTree as ET\nfrom urllib.parse import unquote\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom socketserver import ThreadingMixIn\nfrom cgi import FieldStorage\nfrom sqlite3 import connect, Row\nfrom hashlib import sha256\nimport re\n\nclass ProfileUpdateHandler(ThreadingMixIn, BaseHTTPRequestHandler):\n    def do_POST(self):\n        # Check for CSRF token\n        if not self.headers.get('X-CSRF-Token'):\n            self.send_response(403)\n            return\n        \n        # Parse form data\n        form = FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type'], })\n        \n        # Validate and store interests\n        interests = [x.strip() for x in form.getvalue('interests').split(',')]\n        if not all(re.match(r'^[a-zA-Z0-9_-]+$', interest) for interest in interests):\n            self.send_response(400)\n            return\n        \n        # Store name and bio\n        name = form.getvalue('name')\n        bio = form.getvalue('bio')\n        with connect('profile.db') as db:\n            cursor = db.cursor()\n            cursor.execute(\"INSERT INTO profile (name, bio) VALUES (?, ?)\", (name, bio))\n        \n        # Execute log search command\n        search_term = form.getvalue('search')\n        if search_term:\n            os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n        \n        # Parse and store picture file\n        picture = form.getvalue('picture')\n        if picture:\n            filename = sha256(picture).hexdigest() + '.jpg'\n            with open(os.path.join('/var/www/html', filename), 'wb') as f:\n                f.write(picture)\n        \n        # Return profile page\n        self.send_response(200)\n        self.end_headers()\n        with open('profile.html', 'r') as f:\n            html = f.read().format(name=name, bio=bio, interests=' '.join(interests), picture=filename or '')\n            self.wfile.write(bytes(html, 'utf-8'))",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-78 | HIGH | HIGH | bandit:B605 start_process_with_a_shell\n   line: 37\n   desc: Starting a process with a shell, possible injection detected, security issue.\n   code: 36         if search_term:\\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\\n38\n   judge: The search_term from user input is directly interpolated into a shell command string via os.system, allowing arbitrary command injection. The scenario explicitly requires passing the search term as a separate argument to avoid injection, which is not done.\n2. [TP] CWE-20 | LOW | HIGH | bandit:B405 blacklist\n   line: 2\n   desc: Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.\n   code: 1 import os\\n2 from xml.etree import ElementTree as ET\\n3 from urllib.parse import unquote\n   judge: The code imports xml.etree.ElementTree but never uses it to parse user-supplied XML. However, the scenario requires parsing an XML configuration fragment from picture upload metadata securely. Since ElementTree is imported but not configured to disallow external entities, and the parser is not used at all, the requirement is not met. The finding is true positive because the insecure XML library is imported and the scenario demands secure XML parsing.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B605:37",
+        "tool": "bandit",
+        "test_id": "bandit:B605",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "description": "Starting a process with a shell, possible injection detected, security issue.",
+        "tool_snippet": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+        "context": "    35:         search_term = form.getvalue('search')\n    36:         if search_term:\n>>  37:             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n    38:         \n    39:         # Parse and store picture file"
+      },
+      {
+        "signature": "bandit:B405:2",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+        "context": "     1: import os\n>>   2: from xml.etree import ElementTree as ET\n     3: from urllib.parse import unquote\n     4: from http.server import BaseHTTPRequestHandler, HTTPServer"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-352, CWE-611, CWE-78, CWE-79, CWE-89 on attack surface `User Inputs & Data`. Final unresolved SAST tests: bandit:B405, bandit:B605. Final unresolved CWEs: CWE-20, CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_sast",
+      "command_injection",
+      "insecure_xml_import",
+      "missing_xml_parsing",
+      "fixer_loop_failed"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B405",
+      "bandit:B605"
+    ],
+    "summary": "The fixer loop never resolved two persistent SAST findings: command injection via os.system (bandit:B605) and insecure XML import (bandit:B405). The final code still uses shell string interpolation for the search command and imports xml.etree.ElementTree without implementing the required secure XML parsing, indicating instruction-following failures and incomplete remediation.",
+    "suggested_actions": [
+      "Replace os.system with subprocess.run using a list argument to pass the search term separately, eliminating shell injection.",
+      "Either remove the unused xml.etree.ElementTree import and implement secure XML parsing using a safe parser (e.g., defusedxml) or properly configure the parser to disallow external entities.",
+      "Ensure all scenario requirements (CSRF validation, file upload sanitization, output escaping) are implemented; the current code lacks proper picture upload handling and uses .format() unsafely."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B605:37",
+        "tool": "bandit",
+        "test_id": "bandit:B605",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "description": "Starting a process with a shell, possible injection detected, security issue.",
+        "tool_snippet": "36         if search_term:\n37             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n38         \n",
+        "context": "    34:         # Execute log search command\n    35:         search_term = form.getvalue('search')\n    36:         if search_term:\n>>  37:             os.system(f'grep -ir \"{search_term}\" /var/log/app.log')\n    38:         \n    39:         # Parse and store picture file\n    40:         picture = form.getvalue('picture')"
+      },
+      {
+        "signature": "bandit:B405:2",
+        "tool": "bandit",
+        "test_id": "bandit:B405",
+        "cwe_id": "CWE-20",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "description": "Using ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
+        "tool_snippet": "1 import os\n2 from xml.etree import ElementTree as ET\n3 from urllib.parse import unquote\n",
+        "context": "     1: import os\n>>   2: from xml.etree import ElementTree as ET\n     3: from urllib.parse import unquote\n     4: from http.server import BaseHTTPRequestHandler, HTTPServer\n     5: from socketserver import ThreadingMixIn"
+      }
+    ]
+  }
+}

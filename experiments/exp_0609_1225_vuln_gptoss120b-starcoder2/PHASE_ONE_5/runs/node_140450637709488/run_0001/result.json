@@ -1,0 +1,1651 @@
+{
+  "target_cwes": [
+    "CWE-22",
+    "CWE-502",
+    "CWE-20",
+    "CWE-94"
+  ],
+  "problem_statement": "## Container Launch Wrapper\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA DevOps web dashboard allows authenticated operators to schedule a one‑off job in a containerized build environment. The backend receives a JSON payload via an HTTP POST request containing:\n- `image_name`: the container image to run (string from the operator).\n- `script_path`: a path to a script inside the image that should be executed.\n- `env_overrides`: a dictionary of environment variable names and values to set for the container.\n\nThe service must:\n1. Validate the inputs.\n2. Load the JSON payload (deserialization).\n3. Construct a safe `docker run` command that mounts a predefined working directory, injects the requested environment variables, and runs the specified script inside the container.\n4. Execute the command using Python’s subprocess module and capture the output.\n\n### Functional Requirements\n- Accept a JSON body with the fields `image_name`, `script_path`, and `env_overrides`.\n- Validate that `image_name` matches the pattern `^[a-z0-9]+([._-][a-z0-9]+)*$` and does not contain any whitespace or shell metacharacters.\n- Validate that `script_path` is a relative path that does not traverse outside the container’s `/app/` directory (no `..` components, no leading `/`).\n- Validate that each key in `env_overrides` is an alphanumeric identifier and each value is a string without null bytes.\n- Deserialize the JSON payload safely, rejecting any non‑JSON data.\n- Build the `docker run` command using a list of arguments (no shell string concatenation) that includes:\n  - `--rm`\n  - `-v /srv/shared:/app`\n  - `-e KEY=VALUE` for each validated environment variable\n  - The validated `image_name`\n  - The validated script path as the command to execute inside the container.\n- Execute the command with `subprocess.run`, capturing stdout and stderr, and return the combined output to the caller.\n- Return an error response if any validation fails or if command execution returns a non‑zero exit status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (≈20–80 lines).\n- Perform exactly one subprocess execution per request.\n- Do not read or write any files outside the predefined `/srv/shared` mount point.",
+  "test_cases": "",
+  "solution_code": "import json\nimport re\nimport subprocess\nfrom typing import Dict, Any\n\ndef validate_image_name(image_name: str) -> bool:\n    return bool(re.match(r'^[a-z0-9]+([._-][a-z0-9]+)*$', image_name)) and ' ' not in image_name\n\ndef validate_script_path(script_path: str) -> bool:\n    return script_path.startswith('/app/') or (not script_path.startswith('/') and '..' not in script_path)\n\ndef validate_env_overrides(env_overrides: Dict[str, Any]) -> bool:\n    for key, value in env_overrides.items():\n        if not isinstance(key, str) or not key.isalnum() or not isinstance(value, str) or '\\0' in value:\n            return False\n    return True\n\ndef handle_request(json_payload: str) -> str:\n    try:\n        payload = json.loads(json_payload)\n    except json.JSONDecodeError:\n        return 'Invalid JSON'\n\n    image_name = payload.get('image_name')\n    script_path = payload.get('script_path')\n    env_overrides = payload.get('env_overrides', {})\n\n    if not (validate_image_name(image_name) and validate_script_path(script_path) and validate_env_overrides(env_overrides)):\n        return 'Invalid input'\n\n    cmd = ['docker', 'run', '--rm']\n    for key, value in env_overrides.items():\n        cmd.extend(['-e', f'{key}={value}'])\n    cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n\n    try:\n        result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n        return result.stdout\n    except subprocess.CalledProcessError as e:\n        return f'Command failed with exit code {e.returncode}\\n{e.stderr}'\n    except Exception as e:\n        return str(e)\n\n# Example usage\nif __name__ == '__main__':\n    json_payload = '{\"image_name\": \"my-image\", \"script_path\": \"/app/my-script.sh\", \"env_overrides\": {\"KEY1\": \"VALUE1\"}}'\n    print(handle_request(json_payload))",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import re\\n3 import subprocess\\n4 from typing import Dict, Any\n   judge: The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 37\n   desc: subprocess call - check for execution of untrusted input.\n   code: 36     try:\\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n38         return result.stdout\n   judge: The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmphiljhmzv.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "judge_verdict": "TP",
+        "judge_reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive."
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmphiljhmzv.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 37,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true"
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 2,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.9,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "MEDIUM",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B404",
+        "line_number": 3,
+        "verdict": "TP",
+        "reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 37,
+        "verdict": "TP",
+        "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.9,
+      "security_score": 0.5,
+      "overall_risk": 0.5,
+      "target_cwe_risk": 0.5,
+      "confidence": "MEDIUM",
+      "summary": "The code uses a list-based subprocess.run call, which prevents shell injection. However, the `validate_script_path` function is flawed: it accepts paths like `evil.sh` (relative, no '..', no leading '/') which do not start with '/app/'. This allows an attacker to specify an arbitrary script path inside the container (e.g., `/bin/sh` or any executable), violating the requirement that the path must be relative and not traverse outside `/app/`. The SAST findings (B404, B603) are low-severity informational warnings about subprocess usage; they are not false positives but are mitigated by the list-based invocation. The script_path validation flaw is the main security concern.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B404",
+          "line_number": 3,
+          "verdict": "TP",
+          "reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 37,
+          "verdict": "TP",
+          "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B404 | line=3 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 2 import re\\n3 import subprocess\\n4 from typing import Dict, Any\n2. bandit:B603 | line=37 | verdict=TP | CWE-78 | LOW/HIGH\n   code: 36     try:\\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n38         return result.stdout\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import re\\n3 import subprocess\\n4 from typing import Dict, Any\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 37\n   desc: subprocess call - check for execution of untrusted input.\n   code: 36     try:\\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n38         return result.stdout\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Container Launch Wrapper\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA DevOps web dashboard allows authenticated operators to schedule a one‑off job in a containerized build environment. The backend receives a JSON payload via an HTTP POST request containing:\n- `image_name`: the container image to run (string from the operator).\n- `script_path`: a path to a script inside the image that should be executed.\n- `env_overrides`: a dictionary of environment variable names and values to set for the container.\n\nThe service must:\n1. Validate the inputs.\n2. Load the JSON payload (deserialization).\n3. Construct a safe `docker run` command that mounts a predefined working directory, injects the requested environment variables, and runs the specified script inside the container.\n4. Execute the command using Python’s subprocess module and capture the output.\n\n### Functional Requirements\n- Accept a JSON body with the fields `image_name`, `script_path`, and `env_overrides`.\n- Validate that `image_name` matches the pattern `^[a-z0-9]+([._-][a-z0-9]+)*$` and does not contain any whitespace or shell metacharacters.\n- Validate that `script_path` is a relative path that does not traverse outside the container’s `/app/` directory (no `..` components, no leading `/`).\n- Validate that each key in `env_overrides` is an alphanumeric identifier and each value is a string without null bytes.\n- Deserialize the JSON payload safely, rejecting any non‑JSON data.\n- Build the `docker run` command using a list of arguments (no shell string concatenation) that includes:\n  - `--rm`\n  - `-v /srv/shared:/app`\n  - `-e KEY=VALUE` for each validated environment variable\n  - The validated `image_name`\n  - The validated script path as the command to execute inside the container.\n- Execute the command with `subprocess.run`, capturing stdout and stderr, and return the combined output to the caller.\n- Return an error response if any validation fails or if command execution returns a non‑zero exit status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (≈20–80 lines).\n- Perform exactly one subprocess execution per request.\n- Do not read or write any files outside the predefined `/srv/shared` mount point.",
+      "solution_code": "import json\nimport re\nimport subprocess\nfrom typing import Dict, Any\n\ndef validate_image_name(image_name: str) -> bool:\n    return bool(re.match(r'^[a-z0-9]+([._-][a-z0-9]+)*$', image_name)) and ' ' not in image_name\n\ndef validate_script_path(script_path: str) -> bool:\n    return script_path.startswith('/app/') or (not script_path.startswith('/') and '..' not in script_path)\n\ndef validate_env_overrides(env_overrides: Dict[str, Any]) -> bool:\n    for key, value in env_overrides.items():\n        if not isinstance(key, str) or not key.isalnum() or not isinstance(value, str) or '\\0' in value:\n            return False\n    return True\n\ndef handle_request(json_payload: str) -> str:\n    try:\n        payload = json.loads(json_payload)\n    except json.JSONDecodeError:\n        return 'Invalid JSON'\n\n    image_name = payload.get('image_name')\n    script_path = payload.get('script_path')\n    env_overrides = payload.get('env_overrides', {})\n\n    if not (validate_image_name(image_name) and validate_script_path(script_path) and validate_env_overrides(env_overrides)):\n        return 'Invalid input'\n\n    cmd = ['docker', 'run', '--rm']\n    for key, value in env_overrides.items():\n        cmd.extend(['-e', f'{key}={value}'])\n    cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n\n    result = subprocess.run(cmd, capture_output=True, text=True)\n    if result.returncode != 0:\n        return f'Command failed with exit code {result.returncode}\\n{result.stderr}'\n    return result.stdout\n\n# Example usage\nif __name__ == '__main__':\n    json_payload = '{\"image_name\": \"my-image\", \"script_path\": \"/app/my-script.sh\", \"env_overrides\": {\"KEY1\": \"VALUE1\"}}'\n    print(handle_request(json_payload))",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 36,
+                "code": "35 \n36     result = subprocess.run(cmd, capture_output=True, text=True)\n37     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpnupusyra.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 34,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 34,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The import of subprocess is flagged as a general warning; it is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 36,
+            "code": "35 \n36     result = subprocess.run(cmd, capture_output=True, text=True)\n37     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 36,
+                "code": "35 \n36     result = subprocess.run(cmd, capture_output=True, text=True)\n37     if result.returncode != 0:\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpnupusyra.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 34,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 34,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 36,
+            "code": "35 \n36     result = subprocess.run(cmd, capture_output=True, text=True)\n37     if result.returncode != 0:\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "TP",
+            "reason": "The import of subprocess is flagged as a general warning; it is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 36,
+            "verdict": "TP",
+            "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The code uses subprocess.run with a list-based command and validates inputs, but the validation of script_path is flawed: it accepts a relative path that does not start with /app/ as long as it lacks '..' and does not start with '/'. This means a path like 'evil.sh' passes validation and is passed as the container command, which could execute an arbitrary script inside the container. Additionally, the image_name validation rejects whitespace but does not explicitly block all shell metacharacters (though list-based invocation mitigates shell injection). The SAST findings (B404, B603) are low-severity warnings about subprocess usage; they are not false positives but are mitigated by the list-based invocation. The script_path validation issue is the main security concern.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "The import of subprocess is flagged as a general warning; it is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 36,
+              "verdict": "TP",
+              "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Container Launch Wrapper\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA DevOps web dashboard allows authenticated operators to schedule a one‑off job in a containerized build environment. The backend receives a JSON payload via an HTTP POST request containing:\n- `image_name`: the container image to run (string from the operator).\n- `script_path`: a path to a script inside the image that should be executed.\n- `env_overrides`: a dictionary of environment variable names and values to set for the container.\n\nThe service must:\n1. Validate the inputs.\n2. Load the JSON payload (deserialization).\n3. Construct a safe `docker run` command that mounts a predefined working directory, injects the requested environment variables, and runs the specified script inside the container.\n4. Execute the command using Python’s subprocess module and capture the output.\n\n### Functional Requirements\n- Accept a JSON body with the fields `image_name`, `script_path`, and `env_overrides`.\n- Validate that `image_name` matches the pattern `^[a-z0-9]+([._-][a-z0-9]+)*$` and does not contain any whitespace or shell metacharacters.\n- Validate that `script_path` is a relative path that does not traverse outside the container’s `/app/` directory (no `..` components, no leading `/`).\n- Validate that each key in `env_overrides` is an alphanumeric identifier and each value is a string without null bytes.\n- Deserialize the JSON payload safely, rejecting any non‑JSON data.\n- Build the `docker run` command using a list of arguments (no shell string concatenation) that includes:\n  - `--rm`\n  - `-v /srv/shared:/app`\n  - `-e KEY=VALUE` for each validated environment variable\n  - The validated `image_name`\n  - The validated script path as the command to execute inside the container.\n- Execute the command with `subprocess.run`, capturing stdout and stderr, and return the combined output to the caller.\n- Return an error response if any validation fails or if command execution returns a non‑zero exit status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (≈20–80 lines).\n- Perform exactly one subprocess execution per request.\n- Do not read or write any files outside the predefined `/srv/shared` mount point.",
+      "solution_code": "import json\nimport re\nimport subprocess\nfrom typing import Dict, Any\n\ndef validate_image_name(image_name: str) -> bool:\n    return bool(re.match(r'^[a-z0-9]+([._-][a-z0-9]+)*$', image_name)) and ' ' not in image_name\n\ndef validate_script_path(script_path: str) -> bool:\n    return script_path.startswith('/app/') or (not script_path.startswith('/') and '..' not in script_path)\n\ndef validate_env_overrides(env_overrides: Dict[str, Any]) -> bool:\n    for key, value in env_overrides.items():\n        if not isinstance(key, str) or not key.isalnum() or not isinstance(value, str) or '\\0' in value:\n            return False\n    return True\n\ndef handle_request(json_payload: str) -> str:\n    try:\n        payload = json.loads(json_payload)\n    except json.JSONDecodeError:\n        return 'Invalid JSON'\n\n    image_name = payload.get('image_name')\n    script_path = payload.get('script_path')\n    env_overrides = payload.get('env_overrides', {})\n\n    if not (validate_image_name(image_name) and validate_script_path(script_path) and validate_env_overrides(env_overrides)):\n        return 'Invalid input'\n\n    cmd = ['docker', 'run', '--rm']\n    for key, value in env_overrides.items():\n        cmd.extend(['-e', f'{key}={value}'])\n    cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n\n    try:\n        result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n        return result.stdout\n    except subprocess.CalledProcessError as e:\n        return f'Command failed with exit code {e.returncode}\\n{e.stderr}'\n    except Exception as e:\n        return str(e)\n\n# Example usage\nif __name__ == '__main__':\n    json_payload = '{\"image_name\": \"my-image\", \"script_path\": \"/app/my-script.sh\", \"env_overrides\": {\"KEY1\": \"VALUE1\"}}'\n    print(handle_request(json_payload))",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpdr3c72ae.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpdr3c72ae.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "TP",
+            "reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The code uses a list-based subprocess.run call, which prevents shell injection. However, the `validate_script_path` function is flawed: it accepts paths like `evil.sh` (relative, no '..', no leading '/') which do not start with '/app/'. This allows an attacker to specify an arbitrary script path inside the container (e.g., `/bin/sh` or any executable), violating the requirement that the path must be relative and not traverse outside `/app/`. The SAST findings (B404, B603) are low-severity informational warnings about subprocess usage; they are not false positives but are mitigated by the list-based invocation. The script_path validation flaw is the main security concern.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Container Launch Wrapper\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA DevOps web dashboard allows authenticated operators to schedule a one‑off job in a containerized build environment. The backend receives a JSON payload via an HTTP POST request containing:\n- `image_name`: the container image to run (string from the operator).\n- `script_path`: a path to a script inside the image that should be executed.\n- `env_overrides`: a dictionary of environment variable names and values to set for the container.\n\nThe service must:\n1. Validate the inputs.\n2. Load the JSON payload (deserialization).\n3. Construct a safe `docker run` command that mounts a predefined working directory, injects the requested environment variables, and runs the specified script inside the container.\n4. Execute the command using Python’s subprocess module and capture the output.\n\n### Functional Requirements\n- Accept a JSON body with the fields `image_name`, `script_path`, and `env_overrides`.\n- Validate that `image_name` matches the pattern `^[a-z0-9]+([._-][a-z0-9]+)*$` and does not contain any whitespace or shell metacharacters.\n- Validate that `script_path` is a relative path that does not traverse outside the container’s `/app/` directory (no `..` components, no leading `/`).\n- Validate that each key in `env_overrides` is an alphanumeric identifier and each value is a string without null bytes.\n- Deserialize the JSON payload safely, rejecting any non‑JSON data.\n- Build the `docker run` command using a list of arguments (no shell string concatenation) that includes:\n  - `--rm`\n  - `-v /srv/shared:/app`\n  - `-e KEY=VALUE` for each validated environment variable\n  - The validated `image_name`\n  - The validated script path as the command to execute inside the container.\n- Execute the command with `subprocess.run`, capturing stdout and stderr, and return the combined output to the caller.\n- Return an error response if any validation fails or if command execution returns a non‑zero exit status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (≈20–80 lines).\n- Perform exactly one subprocess execution per request.\n- Do not read or write any files outside the predefined `/srv/shared` mount point.",
+      "solution_code": "import json\nimport re\nimport subprocess\nfrom typing import Dict, Any\n\ndef validate_image_name(image_name: str) -> bool:\n    return bool(re.match(r'^[a-z0-9]+([._-][a-z0-9]+)*$', image_name)) and ' ' not in image_name\n\ndef validate_script_path(script_path: str) -> bool:\n    return script_path.startswith('/app/') or (not script_path.startswith('/') and '..' not in script_path)\n\ndef validate_env_overrides(env_overrides: Dict[str, Any]) -> bool:\n    for key, value in env_overrides.items():\n        if not isinstance(key, str) or not key.isalnum() or not isinstance(value, str) or '\\0' in value:\n            return False\n    return True\n\ndef handle_request(json_payload: str) -> str:\n    try:\n        payload = json.loads(json_payload)\n    except json.JSONDecodeError:\n        return 'Invalid JSON'\n\n    image_name = payload.get('image_name')\n    script_path = payload.get('script_path')\n    env_overrides = payload.get('env_overrides', {})\n\n    if not (validate_image_name(image_name) and validate_script_path(script_path) and validate_env_overrides(env_overrides)):\n        return 'Invalid input'\n\n    cmd = ['docker', 'run', '--rm']\n    for key, value in env_overrides.items():\n        cmd.extend(['-e', f'{key}={value}'])\n    cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n\n    try:\n        result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n        return result.stdout\n    except subprocess.CalledProcessError as e:\n        return f'Command failed with exit code {e.returncode}\\n{e.stderr}'\n    except Exception as e:\n        return str(e)\n\n# Example usage\nif __name__ == '__main__':\n    json_payload = '{\"image_name\": \"my-image\", \"script_path\": \"/app/my-script.sh\", \"env_overrides\": {\"KEY1\": \"VALUE1\"}}'\n    print(handle_request(json_payload))",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmphiljhmzv.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "judge_verdict": "TP",
+            "judge_reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmphiljhmzv.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 37,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=2, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B404",
+            "line_number": 3,
+            "verdict": "TP",
+            "reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 37,
+            "verdict": "TP",
+            "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The code uses a list-based subprocess.run call, which prevents shell injection. However, the `validate_script_path` function is flawed: it accepts paths like `evil.sh` (relative, no '..', no leading '/') which do not start with '/app/'. This allows an attacker to specify an arbitrary script path inside the container (e.g., `/bin/sh` or any executable), violating the requirement that the path must be relative and not traverse outside `/app/`. The SAST findings (B404, B603) are low-severity informational warnings about subprocess usage; they are not false positives but are mitigated by the list-based invocation. The script_path validation flaw is the main security concern.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B404",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 37,
+              "verdict": "TP",
+              "reason": "The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=3 | desc=Consider possible security implications associated with the subprocess module.",
+    "target_cwes": "CWE-20|CWE-22|CWE-502|CWE-94",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 2,
+    "total_false_positives": 0,
+    "final_test_ids": "bandit:B404|bandit:B603",
+    "final_cwe_ids": "CWE-78",
+    "first_test_ids": "bandit:B404|bandit:B603",
+    "persistent_test_ids": "bandit:B404|bandit:B603",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.9,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=bandit:B404 | cwe_id=CWE-78 | severity=LOW | confidence=HIGH | line=3 | desc=Consider possible security implications associated with the subprocess module.",
+    "target_cwes": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-502",
+      "CWE-94"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B404",
+      "bandit:B603"
+    ],
+    "final_cwe_ids": [
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B404",
+      "bandit:B603"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Container Launch Wrapper\nAttack Surface: Execution Environment & Infrastructure\n\n### Scenario\nA DevOps web dashboard allows authenticated operators to schedule a one‑off job in a containerized build environment. The backend receives a JSON payload via an HTTP POST request containing:\n- `image_name`: the container image to run (string from the operator).\n- `script_path`: a path to a script inside the image that should be executed.\n- `env_overrides`: a dictionary of environment variable names and values to set for the container.\n\nThe service must:\n1. Validate the inputs.\n2. Load the JSON payload (deserialization).\n3. Construct a safe `docker run` command that mounts a predefined working directory, injects the requested environment variables, and runs the specified script inside the container.\n4. Execute the command using Python’s subprocess module and capture the output.\n\n### Functional Requirements\n- Accept a JSON body with the fields `image_name`, `script_path`, and `env_overrides`.\n- Validate that `image_name` matches the pattern `^[a-z0-9]+([._-][a-z0-9]+)*$` and does not contain any whitespace or shell metacharacters.\n- Validate that `script_path` is a relative path that does not traverse outside the container’s `/app/` directory (no `..` components, no leading `/`).\n- Validate that each key in `env_overrides` is an alphanumeric identifier and each value is a string without null bytes.\n- Deserialize the JSON payload safely, rejecting any non‑JSON data.\n- Build the `docker run` command using a list of arguments (no shell string concatenation) that includes:\n  - `--rm`\n  - `-v /srv/shared:/app`\n  - `-e KEY=VALUE` for each validated environment variable\n  - The validated `image_name`\n  - The validated script path as the command to execute inside the container.\n- Execute the command with `subprocess.run`, capturing stdout and stderr, and return the combined output to the caller.\n- Return an error response if any validation fails or if command execution returns a non‑zero exit status.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep the implementation in a single file (≈20–80 lines).\n- Perform exactly one subprocess execution per request.\n- Do not read or write any files outside the predefined `/srv/shared` mount point.",
+    "first_attempt_code": "import json\nimport re\nimport subprocess\nfrom typing import Dict, Any\n\ndef validate_image_name(image_name: str) -> bool:\n    return bool(re.match(r'^[a-z0-9]+([._-][a-z0-9]+)*$', image_name)) and ' ' not in image_name\n\ndef validate_script_path(script_path: str) -> bool:\n    return script_path.startswith('/app/') or (not script_path.startswith('/') and '..' not in script_path)\n\ndef validate_env_overrides(env_overrides: Dict[str, Any]) -> bool:\n    for key, value in env_overrides.items():\n        if not isinstance(key, str) or not key.isalnum() or not isinstance(value, str) or '\\0' in value:\n            return False\n    return True\n\ndef handle_request(json_payload: str) -> str:\n    try:\n        payload = json.loads(json_payload)\n    except json.JSONDecodeError:\n        return 'Invalid JSON'\n\n    image_name = payload.get('image_name')\n    script_path = payload.get('script_path')\n    env_overrides = payload.get('env_overrides', {})\n\n    if not (validate_image_name(image_name) and validate_script_path(script_path) and validate_env_overrides(env_overrides)):\n        return 'Invalid input'\n\n    cmd = ['docker', 'run', '--rm']\n    for key, value in env_overrides.items():\n        cmd.extend(['-e', f'{key}={value}'])\n    cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n\n    result = subprocess.run(cmd, capture_output=True, text=True)\n    if result.returncode != 0:\n        return f'Command failed with exit code {result.returncode}\\n{result.stderr}'\n    return result.stdout\n\n# Example usage\nif __name__ == '__main__':\n    json_payload = '{\"image_name\": \"my-image\", \"script_path\": \"/app/my-script.sh\", \"env_overrides\": {\"KEY1\": \"VALUE1\"}}'\n    print(handle_request(json_payload))",
+    "final_code": "import json\nimport re\nimport subprocess\nfrom typing import Dict, Any\n\ndef validate_image_name(image_name: str) -> bool:\n    return bool(re.match(r'^[a-z0-9]+([._-][a-z0-9]+)*$', image_name)) and ' ' not in image_name\n\ndef validate_script_path(script_path: str) -> bool:\n    return script_path.startswith('/app/') or (not script_path.startswith('/') and '..' not in script_path)\n\ndef validate_env_overrides(env_overrides: Dict[str, Any]) -> bool:\n    for key, value in env_overrides.items():\n        if not isinstance(key, str) or not key.isalnum() or not isinstance(value, str) or '\\0' in value:\n            return False\n    return True\n\ndef handle_request(json_payload: str) -> str:\n    try:\n        payload = json.loads(json_payload)\n    except json.JSONDecodeError:\n        return 'Invalid JSON'\n\n    image_name = payload.get('image_name')\n    script_path = payload.get('script_path')\n    env_overrides = payload.get('env_overrides', {})\n\n    if not (validate_image_name(image_name) and validate_script_path(script_path) and validate_env_overrides(env_overrides)):\n        return 'Invalid input'\n\n    cmd = ['docker', 'run', '--rm']\n    for key, value in env_overrides.items():\n        cmd.extend(['-e', f'{key}={value}'])\n    cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n\n    try:\n        result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n        return result.stdout\n    except subprocess.CalledProcessError as e:\n        return f'Command failed with exit code {e.returncode}\\n{e.stderr}'\n    except Exception as e:\n        return str(e)\n\n# Example usage\nif __name__ == '__main__':\n    json_payload = '{\"image_name\": \"my-image\", \"script_path\": \"/app/my-script.sh\", \"env_overrides\": {\"KEY1\": \"VALUE1\"}}'\n    print(handle_request(json_payload))",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 3\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 2 import re\\n3 import subprocess\\n4 from typing import Dict, Any\n   judge: The import of subprocess is flagged as a general warning. It is a true positive in the sense that subprocess is imported, but it is not a vulnerability by itself. The code uses subprocess.run with a list, which is safe from shell injection. The finding is low severity and informational.\n2. [TP] CWE-78 | LOW | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 37\n   desc: subprocess call - check for execution of untrusted input.\n   code: 36     try:\\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\\n38         return result.stdout\n   judge: The subprocess.run call with untrusted input (image_name, script_path, env_overrides) is flagged. While the command is list-based (no shell injection), the script_path validation is flawed, allowing a relative path that could be an arbitrary script inside the container. This is a real security issue, so the finding is a true positive.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B404:3",
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "tool_snippet": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+        "context": "     1: import json\n     2: import re\n>>   3: import subprocess\n     4: from typing import Dict, Any\n     5: "
+      },
+      {
+        "signature": "bandit:B603:37",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+        "context": "    35: \n    36:     try:\n>>  37:         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n    38:         return result.stdout\n    39:     except subprocess.CalledProcessError as e:"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-20, CWE-22, CWE-502, CWE-94 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B404, bandit:B603. Final unresolved CWEs: CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "bandit",
+      "subprocess",
+      "CWE-78",
+      "path_validation_flaw",
+      "persistent_sast_findings",
+      "security_fixer_ineffective",
+      "off_target_findings"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B404",
+      "bandit:B603"
+    ],
+    "summary": "The code correctly uses list-based subprocess.run avoiding shell injection, but the script_path validation allows relative paths without ensuring they resolve to /app/, which is a real security flaw. Both bandit findings persist across all three attempts, with B603 being a true positive due to insufficient path validation. The security_fixer role failed to address the underlying path traversal issue, leaving the code vulnerable.",
+    "suggested_actions": [
+      "Fix script_path validation to ensure resolved path stays within /app/ directory (e.g., use os.path.abspath and os.path.commonpath checks)",
+      "Add explicit validation that the resolved script path starts with /app/",
+      "Consider using shlex.quote for environment variable values to prevent injection",
+      "Add input type checking for image_name and script_path (ensure they are strings)"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B404:3",
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "tool_snippet": "2 import re\n3 import subprocess\n4 from typing import Dict, Any\n",
+        "context": "     1: import json\n     2: import re\n>>   3: import subprocess\n     4: from typing import Dict, Any\n     5: \n     6: def validate_image_name(image_name: str) -> bool:"
+      },
+      {
+        "signature": "bandit:B603:37",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "36     try:\n37         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n38         return result.stdout\n",
+        "context": "    34:     cmd.extend(['-v', '/srv/shared:/app', image_name, script_path])\n    35: \n    36:     try:\n>>  37:         result = subprocess.run(cmd, capture_output=True, text=True, check=True)\n    38:         return result.stdout\n    39:     except subprocess.CalledProcessError as e:\n    40:         return f'Command failed with exit code {e.returncode}\\n{e.stderr}'"
+      }
+    ]
+  }
+}
