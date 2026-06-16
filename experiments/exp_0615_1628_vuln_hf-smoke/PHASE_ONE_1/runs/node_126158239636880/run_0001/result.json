@@ -1,0 +1,1338 @@
+{
+  "target_cwes": [
+    "CWE-79",
+    "CWE-352"
+  ],
+  "problem_statement": "## Secure File Management System Attack Surface: Storage & Filesystem  \n### Scenario  \nAn internal web portal allows authenticated staff to upload, list, and delete project documents.  \n- **Upload**: Users submit a `filename`, an optional `description`, and the file content.  \n- **Listing**: A page displays all stored documents, showing each file’s name and description.  \n- **Delete**: Users can delete a document by specifying its `file_id`.  \nThe application stores all documents in a server‑managed `files/` directory and keeps metadata in a SQLite database. The implementation must ensure that file handling remains within the designated directory and that all user‑supplied data is safely processed.\n\n### Functional Requirements  \n- **Upload Endpoint**  \n  - Accept `filename`, `description`, and binary `file`.  \n  - Reject empty filenames or names containing path separators or null bytes.  \n  - Store the file under the `files/` directory using a sanitized, unique storage name.  \n  - Insert a record into a SQLite table (`files`) with columns `id`, `original_name`, `description`, `path` via a parameterized INSERT.  \n  - Return a success response with the new `file_id`.  \n\n- **Listing Endpoint**  \n  - Retrieve all records from the `files` table with a parameterless SELECT.  \n  - Render an HTML page that lists each document’s `original_name` and `description`.  \n  - Escape all user‑supplied fields before embedding them in the page to prevent XSS.  \n  - Provide a delete link for each document that includes its `file_id` and a CSRF token.  \n\n- **Delete Endpoint**  \n  - Accept a `file_id` and a `csrf_token`.  \n  - Verify that the provided `csrf_token` matches the token stored in the user’s session.  \n  - Use a parameterized SELECT to retrieve the record.  \n  - Resolve the stored file path, ensuring it remains within the `files/` directory; reject any path that would escape this directory.  \n  - Delete the file from the filesystem and remove the corresponding database record.  \n  - Return a success response.  \n\n### Constraints  \n- Use only Python standard library modules (`http.server`, `sqlite3`, `os`, `html`, etc.).  \n- Implement all logic in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Assume the application runs in a trusted environment; no external network access is required.  \n- All database interactions must be parameterized.  \n- All user‑supplied data must be properly escaped before rendering in HTML.  \n- CSRF protection must be enforced for the delete operation.",
+  "test_cases": "",
+  "solution_code": "import http.server\nimport sqlite3\nimport os\nimport html\nimport secrets\n\nclass SecureFileManagementSystem(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            self.handle_upload()\n        elif self.path == '/delete':\n            self.handle_delete()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_upload(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('=')[1].encode()\n        parts = post_data.split(boundary)\n\n        filename = None\n        description = ''\n        file_content = None\n\n        for part in parts:\n            lines = part.splitlines()\n            for line in lines:\n                if b'filename=' in line:\n                    filename = line.decode().split('filename=')[1].strip('\"')\n                elif b'name=\"description\"' in line:\n                    description = lines[lines.index(line) + 2].decode()\n                elif b'name=\"file\"' in line:\n                    file_content = lines[lines.index(line) + 2]\n\n        if not filename or any(char in filename for char in ('/', '\\\\', '\\0')):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        unique_storage_name = f\"{secrets.token_hex(8)}_{os.path.basename(filename)}\"\n        file_path = os.path.join('files', unique_storage_name)\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        with open(file_path, 'wb') as f:\n            f.write(file_content)\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute('''CREATE TABLE IF NOT EXISTS files\n                     (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                      original_name TEXT NOT NULL,\n                      description TEXT,\n                      path TEXT NOT NULL)''')\n        c.execute(\"INSERT INTO files (original_name, description, path) VALUES (?, ?, ?)\",\n                  (filename, description, file_path))\n        conn.commit()\n        file_id = c.lastrowid\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(f\"File uploaded successfully with ID: {file_id}\".encode())\n\n    def handle_delete(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        post_data = post_data.decode().split('&')\n        file_id = None\n        csrf_token = None\n\n        for item in post_data:\n            key, value = item.split('=')\n            if key == 'file_id':\n                file_id = value\n            elif key == 'csrf_token':\n                csrf_token = value\n\n        if not file_id or not csrf_token:\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        session_csrf_token = self.get_session_csrf_token()\n        if csrf_token != session_csrf_token:\n            self.send_response(403)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT path FROM files WHERE id=?\", (file_id,))\n        row = c.fetchone()\n        conn.close()\n\n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        file_path = row[0]\n        if not file_path.startswith(os.path.abspath('files') + os.sep):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        try:\n            os.remove(file_path)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"DELETE FROM files WHERE id=?\", (file_id,))\n        conn.commit()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b\"File deleted successfully\")\n\n    def do_GET(self):\n        if self.path == '/list':\n            self.handle_list()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_list(self):\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT original_name, description, id FROM files\")\n        rows = c.fetchall()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/html')\n        self.end_headers()\n\n        csrf_token = self.get_session_csrf_token()\n        html_content = \"<html><body><h1>Files</h1><ul>\"\n        for row in rows:\n            original_name = html.escape(row[0])\n            description = html.escape(row[1])\n            file_id = row[2]\n            html_content += f\"<li>{original_name} - {description} <a href='/delete?file_id={file_id}&csrf_token={csrf_token}'>Delete</a></li>\"\n        html_content += \"</ul></body></html>\"\n\n        self.wfile.write(html_content.encode())\n\n    def get_session_csrf_token(self):\n        if 'csrf_token' not in self.server.session:\n            self.server.session['csrf_token'] = secrets.token_urlsafe(16)\n        return self.server.session['csrf_token']\n\ndef run(server_class=http.server.HTTPServer, handler_class=SecureFileManagementSystem, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.session = {}\n    print(f'Starting httpd on port {port}...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 51\n   desc: This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).\n   code: with open(file_path, 'wb') as f:\n   judge: A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {
+          "/tmp/tmph1vvmhb0.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 149,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 149,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "        with open(file_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "total_issues_raw": 1,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {
+          "/tmp/tmph1vvmhb0.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 149,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 149,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "code": "        with open(file_path, 'wb') as f:",
+        "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.8,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "MEDIUM",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 51,
+        "verdict": "UNCERTAIN",
+        "reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.8,
+      "security_score": 0.5,
+      "overall_risk": 0.5,
+      "target_cwe_risk": 0.5,
+      "confidence": "MEDIUM",
+      "summary": "The SAST finding (CWE-22 path injection) on line 51 is marked as UNCERTAIN. The code added a path traversal check using os.path.commonpath before the open() call, but the check is performed after file_path is already constructed and may not fully prevent all traversal variants (e.g., symlinks, unnormalized paths). Additionally, the delete handler's path check using startswith on an absolute path is flawed and could be bypassed. The CSRF mechanism uses a per-server-instance shared session, not per-user, violating the scenario's requirement for CSRF protection.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 51,
+          "verdict": "UNCERTAIN",
+          "reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 1,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=51 | verdict=UNCERTAIN | CWE-22 | HIGH/HIGH\n   code: with open(file_path, 'wb') as f:\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 51\n   desc: This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).\n   code: with open(file_path, 'wb') as f:\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure File Management System Attack Surface: Storage & Filesystem  \n### Scenario  \nAn internal web portal allows authenticated staff to upload, list, and delete project documents.  \n- **Upload**: Users submit a `filename`, an optional `description`, and the file content.  \n- **Listing**: A page displays all stored documents, showing each file’s name and description.  \n- **Delete**: Users can delete a document by specifying its `file_id`.  \nThe application stores all documents in a server‑managed `files/` directory and keeps metadata in a SQLite database. The implementation must ensure that file handling remains within the designated directory and that all user‑supplied data is safely processed.\n\n### Functional Requirements  \n- **Upload Endpoint**  \n  - Accept `filename`, `description`, and binary `file`.  \n  - Reject empty filenames or names containing path separators or null bytes.  \n  - Store the file under the `files/` directory using a sanitized, unique storage name.  \n  - Insert a record into a SQLite table (`files`) with columns `id`, `original_name`, `description`, `path` via a parameterized INSERT.  \n  - Return a success response with the new `file_id`.  \n\n- **Listing Endpoint**  \n  - Retrieve all records from the `files` table with a parameterless SELECT.  \n  - Render an HTML page that lists each document’s `original_name` and `description`.  \n  - Escape all user‑supplied fields before embedding them in the page to prevent XSS.  \n  - Provide a delete link for each document that includes its `file_id` and a CSRF token.  \n\n- **Delete Endpoint**  \n  - Accept a `file_id` and a `csrf_token`.  \n  - Verify that the provided `csrf_token` matches the token stored in the user’s session.  \n  - Use a parameterized SELECT to retrieve the record.  \n  - Resolve the stored file path, ensuring it remains within the `files/` directory; reject any path that would escape this directory.  \n  - Delete the file from the filesystem and remove the corresponding database record.  \n  - Return a success response.  \n\n### Constraints  \n- Use only Python standard library modules (`http.server`, `sqlite3`, `os`, `html`, etc.).  \n- Implement all logic in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Assume the application runs in a trusted environment; no external network access is required.  \n- All database interactions must be parameterized.  \n- All user‑supplied data must be properly escaped before rendering in HTML.  \n- CSRF protection must be enforced for the delete operation.",
+      "solution_code": "import http.server\nimport sqlite3\nimport os\nimport html\nimport secrets\n\nclass SecureFileManagementSystem(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            self.handle_upload()\n        elif self.path == '/delete':\n            self.handle_delete()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_upload(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('=')[1].encode()\n        parts = post_data.split(boundary)\n\n        filename = None\n        description = ''\n        file_content = None\n\n        for part in parts:\n            lines = part.splitlines()\n            for line in lines:\n                if b'filename=' in line:\n                    filename = line.decode().split('filename=')[1].strip('\"')\n                elif b'name=\"description\"' in line:\n                    description = lines[lines.index(line) + 2].decode()\n                elif b'name=\"file\"' in line:\n                    file_content = lines[lines.index(line) + 2]\n\n        if not filename or any(char in filename for char in ('/', '\\\\', '\\0')):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        unique_storage_name = f\"{secrets.token_hex(8)}_{os.path.basename(filename)}\"\n        file_path = os.path.join('files', unique_storage_name)\n\n        with open(file_path, 'wb') as f:\n            f.write(file_content)\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute('''CREATE TABLE IF NOT EXISTS files\n                     (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                      original_name TEXT NOT NULL,\n                      description TEXT,\n                      path TEXT NOT NULL)''')\n        c.execute(\"INSERT INTO files (original_name, description, path) VALUES (?, ?, ?)\",\n                  (filename, description, file_path))\n        conn.commit()\n        file_id = c.lastrowid\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(f\"File uploaded successfully with ID: {file_id}\".encode())\n\n    def handle_delete(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        post_data = post_data.decode().split('&')\n        file_id = None\n        csrf_token = None\n\n        for item in post_data:\n            key, value = item.split('=')\n            if key == 'file_id':\n                file_id = value\n            elif key == 'csrf_token':\n                csrf_token = value\n\n        if not file_id or not csrf_token:\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        session_csrf_token = self.get_session_csrf_token()\n        if csrf_token != session_csrf_token:\n            self.send_response(403)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT path FROM files WHERE id=?\", (file_id,))\n        row = c.fetchone()\n        conn.close()\n\n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        file_path = row[0]\n        if not file_path.startswith(os.path.abspath('files') + os.sep):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        try:\n            os.remove(file_path)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"DELETE FROM files WHERE id=?\", (file_id,))\n        conn.commit()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b\"File deleted successfully\")\n\n    def do_GET(self):\n        if self.path == '/list':\n            self.handle_list()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_list(self):\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT original_name, description, id FROM files\")\n        rows = c.fetchall()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/html')\n        self.end_headers()\n\n        csrf_token = self.get_session_csrf_token()\n        html_content = \"<html><body><h1>Files</h1><ul>\"\n        for row in rows:\n            original_name = html.escape(row[0])\n            description = html.escape(row[1])\n            file_id = row[2]\n            html_content += f\"<li>{original_name} - {description} <a href='/delete?file_id={file_id}&csrf_token={csrf_token}'>Delete</a></li>\"\n        html_content += \"</ul></body></html>\"\n\n        self.wfile.write(html_content.encode())\n\n    def get_session_csrf_token(self):\n        if 'csrf_token' not in self.server.session:\n            self.server.session['csrf_token'] = secrets.token_urlsafe(16)\n        return self.server.session['csrf_token']\n\ndef run(server_class=http.server.HTTPServer, handler_class=SecureFileManagementSystem, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.session = {}\n    print(f'Starting httpd on port {port}...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmpyrucb110.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 141,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 141,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "        with open(file_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The file_path is constructed by joining 'files' with a storage name derived from user-supplied filename. The sanitization only rejects '/', '\\\\', and null bytes, but does not prevent path traversal via '..' or absolute path components. For example, filename='../../etc/passwd' would become 'files/../../etc/passwd' after basename removal (basename removes path separators but not '..' sequences), allowing directory escape."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmpyrucb110.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 141,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 141,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 45,
+                "code": "        with open(file_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 45,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.8,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 45,
+            "verdict": "TP",
+            "reason": "The file_path is constructed by joining 'files' with a storage name derived from user-supplied filename. The sanitization only rejects '/', '\\\\', and null bytes, but does not prevent path traversal via '..' or absolute path components. For example, filename='../../etc/passwd' would become 'files/../../etc/passwd' after basename removal (basename removes path separators but not '..' sequences), allowing directory escape.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.8,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The SAST finding (CWE-22 path injection) is a true positive. The upload handler constructs file_path using os.path.join with a user-controlled filename after a basename call, but the sanitization only rejects path separators and null bytes, not sequences like '..' or absolute paths. Additionally, the delete handler's path traversal check is flawed because it compares against os.path.abspath('files') which may not match the stored relative path. The code also does not create the 'files' directory, lacks session handling for CSRF, and uses a shared session dict per server instance.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 45,
+              "verdict": "TP",
+              "reason": "The file_path is constructed by joining 'files' with a storage name derived from user-supplied filename. The sanitization only rejects '/', '\\\\', and null bytes, but does not prevent path traversal via '..' or absolute path components. For example, filename='../../etc/passwd' would become 'files/../../etc/passwd' after basename removal (basename removes path separators but not '..' sequences), allowing directory escape.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure File Management System Attack Surface: Storage & Filesystem  \n### Scenario  \nAn internal web portal allows authenticated staff to upload, list, and delete project documents.  \n- **Upload**: Users submit a `filename`, an optional `description`, and the file content.  \n- **Listing**: A page displays all stored documents, showing each file’s name and description.  \n- **Delete**: Users can delete a document by specifying its `file_id`.  \nThe application stores all documents in a server‑managed `files/` directory and keeps metadata in a SQLite database. The implementation must ensure that file handling remains within the designated directory and that all user‑supplied data is safely processed.\n\n### Functional Requirements  \n- **Upload Endpoint**  \n  - Accept `filename`, `description`, and binary `file`.  \n  - Reject empty filenames or names containing path separators or null bytes.  \n  - Store the file under the `files/` directory using a sanitized, unique storage name.  \n  - Insert a record into a SQLite table (`files`) with columns `id`, `original_name`, `description`, `path` via a parameterized INSERT.  \n  - Return a success response with the new `file_id`.  \n\n- **Listing Endpoint**  \n  - Retrieve all records from the `files` table with a parameterless SELECT.  \n  - Render an HTML page that lists each document’s `original_name` and `description`.  \n  - Escape all user‑supplied fields before embedding them in the page to prevent XSS.  \n  - Provide a delete link for each document that includes its `file_id` and a CSRF token.  \n\n- **Delete Endpoint**  \n  - Accept a `file_id` and a `csrf_token`.  \n  - Verify that the provided `csrf_token` matches the token stored in the user’s session.  \n  - Use a parameterized SELECT to retrieve the record.  \n  - Resolve the stored file path, ensuring it remains within the `files/` directory; reject any path that would escape this directory.  \n  - Delete the file from the filesystem and remove the corresponding database record.  \n  - Return a success response.  \n\n### Constraints  \n- Use only Python standard library modules (`http.server`, `sqlite3`, `os`, `html`, etc.).  \n- Implement all logic in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Assume the application runs in a trusted environment; no external network access is required.  \n- All database interactions must be parameterized.  \n- All user‑supplied data must be properly escaped before rendering in HTML.  \n- CSRF protection must be enforced for the delete operation.",
+      "solution_code": "import http.server\nimport sqlite3\nimport os\nimport html\nimport secrets\n\nclass SecureFileManagementSystem(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            self.handle_upload()\n        elif self.path == '/delete':\n            self.handle_delete()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_upload(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('=')[1].encode()\n        parts = post_data.split(boundary)\n\n        filename = None\n        description = ''\n        file_content = None\n\n        for part in parts:\n            lines = part.splitlines()\n            for line in lines:\n                if b'filename=' in line:\n                    filename = line.decode().split('filename=')[1].strip('\"')\n                elif b'name=\"description\"' in line:\n                    description = lines[lines.index(line) + 2].decode()\n                elif b'name=\"file\"' in line:\n                    file_content = lines[lines.index(line) + 2]\n\n        if not filename or any(char in filename for char in ('/', '\\\\', '\\0')):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        unique_storage_name = f\"{secrets.token_hex(8)}_{os.path.basename(filename)}\"\n        file_path = os.path.join('files', unique_storage_name)\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        with open(file_path, 'wb') as f:\n            f.write(file_content)\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute('''CREATE TABLE IF NOT EXISTS files\n                     (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                      original_name TEXT NOT NULL,\n                      description TEXT,\n                      path TEXT NOT NULL)''')\n        c.execute(\"INSERT INTO files (original_name, description, path) VALUES (?, ?, ?)\",\n                  (filename, description, file_path))\n        conn.commit()\n        file_id = c.lastrowid\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(f\"File uploaded successfully with ID: {file_id}\".encode())\n\n    def handle_delete(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        post_data = post_data.decode().split('&')\n        file_id = None\n        csrf_token = None\n\n        for item in post_data:\n            key, value = item.split('=')\n            if key == 'file_id':\n                file_id = value\n            elif key == 'csrf_token':\n                csrf_token = value\n\n        if not file_id or not csrf_token:\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        session_csrf_token = self.get_session_csrf_token()\n        if csrf_token != session_csrf_token:\n            self.send_response(403)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT path FROM files WHERE id=?\", (file_id,))\n        row = c.fetchone()\n        conn.close()\n\n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        file_path = row[0]\n        if not file_path.startswith(os.path.abspath('files') + os.sep):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        try:\n            os.remove(file_path)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"DELETE FROM files WHERE id=?\", (file_id,))\n        conn.commit()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b\"File deleted successfully\")\n\n    def do_GET(self):\n        if self.path == '/list':\n            self.handle_list()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_list(self):\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT original_name, description, id FROM files\")\n        rows = c.fetchall()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/html')\n        self.end_headers()\n\n        csrf_token = self.get_session_csrf_token()\n        html_content = \"<html><body><h1>Files</h1><ul>\"\n        for row in rows:\n            original_name = html.escape(row[0])\n            description = html.escape(row[1])\n            file_id = row[2]\n            html_content += f\"<li>{original_name} - {description} <a href='/delete?file_id={file_id}&csrf_token={csrf_token}'>Delete</a></li>\"\n        html_content += \"</ul></body></html>\"\n\n        self.wfile.write(html_content.encode())\n\n    def get_session_csrf_token(self):\n        if 'csrf_token' not in self.server.session:\n            self.server.session['csrf_token'] = secrets.token_urlsafe(16)\n        return self.server.session['csrf_token']\n\ndef run(server_class=http.server.HTTPServer, handler_class=SecureFileManagementSystem, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.session = {}\n    print(f'Starting httpd on port {port}...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmprb35gayk.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "        with open(file_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmprb35gayk.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "        with open(file_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.8,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 51,
+            "verdict": "UNCERTAIN",
+            "reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.8,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The SAST finding (CWE-22 path injection) on line 51 is marked as UNCERTAIN because the code added a path traversal check using `os.path.commonpath` before the open() call. However, the check is performed after `file_path` is already constructed (which may still contain '..' sequences), and the effective behavior depends on the exact OS path resolution. Additionally, the delete handler still has a flawed path check using `startswith` on an absolute path, and the overall CSRF/session mechanism is per-server-instance (shared), not per-user. The upload check may prevent simple traversal but the SAST tool flags the sink as still reachable with user-influenced input, and the fix is not fully proven safe.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 51,
+              "verdict": "UNCERTAIN",
+              "reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure File Management System Attack Surface: Storage & Filesystem  \n### Scenario  \nAn internal web portal allows authenticated staff to upload, list, and delete project documents.  \n- **Upload**: Users submit a `filename`, an optional `description`, and the file content.  \n- **Listing**: A page displays all stored documents, showing each file’s name and description.  \n- **Delete**: Users can delete a document by specifying its `file_id`.  \nThe application stores all documents in a server‑managed `files/` directory and keeps metadata in a SQLite database. The implementation must ensure that file handling remains within the designated directory and that all user‑supplied data is safely processed.\n\n### Functional Requirements  \n- **Upload Endpoint**  \n  - Accept `filename`, `description`, and binary `file`.  \n  - Reject empty filenames or names containing path separators or null bytes.  \n  - Store the file under the `files/` directory using a sanitized, unique storage name.  \n  - Insert a record into a SQLite table (`files`) with columns `id`, `original_name`, `description`, `path` via a parameterized INSERT.  \n  - Return a success response with the new `file_id`.  \n\n- **Listing Endpoint**  \n  - Retrieve all records from the `files` table with a parameterless SELECT.  \n  - Render an HTML page that lists each document’s `original_name` and `description`.  \n  - Escape all user‑supplied fields before embedding them in the page to prevent XSS.  \n  - Provide a delete link for each document that includes its `file_id` and a CSRF token.  \n\n- **Delete Endpoint**  \n  - Accept a `file_id` and a `csrf_token`.  \n  - Verify that the provided `csrf_token` matches the token stored in the user’s session.  \n  - Use a parameterized SELECT to retrieve the record.  \n  - Resolve the stored file path, ensuring it remains within the `files/` directory; reject any path that would escape this directory.  \n  - Delete the file from the filesystem and remove the corresponding database record.  \n  - Return a success response.  \n\n### Constraints  \n- Use only Python standard library modules (`http.server`, `sqlite3`, `os`, `html`, etc.).  \n- Implement all logic in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Assume the application runs in a trusted environment; no external network access is required.  \n- All database interactions must be parameterized.  \n- All user‑supplied data must be properly escaped before rendering in HTML.  \n- CSRF protection must be enforced for the delete operation.",
+      "solution_code": "import http.server\nimport sqlite3\nimport os\nimport html\nimport secrets\n\nclass SecureFileManagementSystem(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            self.handle_upload()\n        elif self.path == '/delete':\n            self.handle_delete()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_upload(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('=')[1].encode()\n        parts = post_data.split(boundary)\n\n        filename = None\n        description = ''\n        file_content = None\n\n        for part in parts:\n            lines = part.splitlines()\n            for line in lines:\n                if b'filename=' in line:\n                    filename = line.decode().split('filename=')[1].strip('\"')\n                elif b'name=\"description\"' in line:\n                    description = lines[lines.index(line) + 2].decode()\n                elif b'name=\"file\"' in line:\n                    file_content = lines[lines.index(line) + 2]\n\n        if not filename or any(char in filename for char in ('/', '\\\\', '\\0')):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        unique_storage_name = f\"{secrets.token_hex(8)}_{os.path.basename(filename)}\"\n        file_path = os.path.join('files', unique_storage_name)\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        with open(file_path, 'wb') as f:\n            f.write(file_content)\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute('''CREATE TABLE IF NOT EXISTS files\n                     (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                      original_name TEXT NOT NULL,\n                      description TEXT,\n                      path TEXT NOT NULL)''')\n        c.execute(\"INSERT INTO files (original_name, description, path) VALUES (?, ?, ?)\",\n                  (filename, description, file_path))\n        conn.commit()\n        file_id = c.lastrowid\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(f\"File uploaded successfully with ID: {file_id}\".encode())\n\n    def handle_delete(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        post_data = post_data.decode().split('&')\n        file_id = None\n        csrf_token = None\n\n        for item in post_data:\n            key, value = item.split('=')\n            if key == 'file_id':\n                file_id = value\n            elif key == 'csrf_token':\n                csrf_token = value\n\n        if not file_id or not csrf_token:\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        session_csrf_token = self.get_session_csrf_token()\n        if csrf_token != session_csrf_token:\n            self.send_response(403)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT path FROM files WHERE id=?\", (file_id,))\n        row = c.fetchone()\n        conn.close()\n\n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        file_path = row[0]\n        if not file_path.startswith(os.path.abspath('files') + os.sep):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        try:\n            os.remove(file_path)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"DELETE FROM files WHERE id=?\", (file_id,))\n        conn.commit()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b\"File deleted successfully\")\n\n    def do_GET(self):\n        if self.path == '/list':\n            self.handle_list()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_list(self):\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT original_name, description, id FROM files\")\n        rows = c.fetchall()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/html')\n        self.end_headers()\n\n        csrf_token = self.get_session_csrf_token()\n        html_content = \"<html><body><h1>Files</h1><ul>\"\n        for row in rows:\n            original_name = html.escape(row[0])\n            description = html.escape(row[1])\n            file_id = row[2]\n            html_content += f\"<li>{original_name} - {description} <a href='/delete?file_id={file_id}&csrf_token={csrf_token}'>Delete</a></li>\"\n        html_content += \"</ul></body></html>\"\n\n        self.wfile.write(html_content.encode())\n\n    def get_session_csrf_token(self):\n        if 'csrf_token' not in self.server.session:\n            self.server.session['csrf_token'] = secrets.token_urlsafe(16)\n        return self.server.session['csrf_token']\n\ndef run(server_class=http.server.HTTPServer, handler_class=SecureFileManagementSystem, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.session = {}\n    print(f'Starting httpd on port {port}...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmph1vvmhb0.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "        with open(file_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmph1vvmhb0.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 149,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "        with open(file_path, 'wb') as f:",
+                "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        with open(file_path, 'wb') as f:",
+            "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.8,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "MEDIUM",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 51,
+            "verdict": "UNCERTAIN",
+            "reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.8,
+          "security_score": 0.5,
+          "overall_risk": 0.5,
+          "target_cwe_risk": 0.5,
+          "confidence": "MEDIUM",
+          "summary": "The SAST finding (CWE-22 path injection) on line 51 is marked as UNCERTAIN. The code added a path traversal check using os.path.commonpath before the open() call, but the check is performed after file_path is already constructed and may not fully prevent all traversal variants (e.g., symlinks, unnormalized paths). Additionally, the delete handler's path check using startswith on an absolute path is flawed and could be bypassed. The CSRF mechanism uses a per-server-instance shared session, not per-user, violating the scenario's requirement for CSRF protection.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 51,
+              "verdict": "UNCERTAIN",
+              "reason": "A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=51 | desc=This path depends on a [user-provided value](1). This path depends on a [user-provided value](2).",
+    "target_cwes": "CWE-352|CWE-79",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 1,
+    "total_false_positives": 0,
+    "final_test_ids": "codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22",
+    "first_test_ids": "codeql:py/path-injection",
+    "persistent_test_ids": "codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.8,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_off_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=51 | desc=This path depends on a [user-provided value](1). This path depends on a [user-provided value](2).",
+    "target_cwes": [
+      "CWE-352",
+      "CWE-79"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure File Management System Attack Surface: Storage & Filesystem  \n### Scenario  \nAn internal web portal allows authenticated staff to upload, list, and delete project documents.  \n- **Upload**: Users submit a `filename`, an optional `description`, and the file content.  \n- **Listing**: A page displays all stored documents, showing each file’s name and description.  \n- **Delete**: Users can delete a document by specifying its `file_id`.  \nThe application stores all documents in a server‑managed `files/` directory and keeps metadata in a SQLite database. The implementation must ensure that file handling remains within the designated directory and that all user‑supplied data is safely processed.\n\n### Functional Requirements  \n- **Upload Endpoint**  \n  - Accept `filename`, `description`, and binary `file`.  \n  - Reject empty filenames or names containing path separators or null bytes.  \n  - Store the file under the `files/` directory using a sanitized, unique storage name.  \n  - Insert a record into a SQLite table (`files`) with columns `id`, `original_name`, `description`, `path` via a parameterized INSERT.  \n  - Return a success response with the new `file_id`.  \n\n- **Listing Endpoint**  \n  - Retrieve all records from the `files` table with a parameterless SELECT.  \n  - Render an HTML page that lists each document’s `original_name` and `description`.  \n  - Escape all user‑supplied fields before embedding them in the page to prevent XSS.  \n  - Provide a delete link for each document that includes its `file_id` and a CSRF token.  \n\n- **Delete Endpoint**  \n  - Accept a `file_id` and a `csrf_token`.  \n  - Verify that the provided `csrf_token` matches the token stored in the user’s session.  \n  - Use a parameterized SELECT to retrieve the record.  \n  - Resolve the stored file path, ensuring it remains within the `files/` directory; reject any path that would escape this directory.  \n  - Delete the file from the filesystem and remove the corresponding database record.  \n  - Return a success response.  \n\n### Constraints  \n- Use only Python standard library modules (`http.server`, `sqlite3`, `os`, `html`, etc.).  \n- Implement all logic in a single `.py` file.  \n- Perform at most one file‑read or file‑write operation per request.  \n- Assume the application runs in a trusted environment; no external network access is required.  \n- All database interactions must be parameterized.  \n- All user‑supplied data must be properly escaped before rendering in HTML.  \n- CSRF protection must be enforced for the delete operation.",
+    "first_attempt_code": "import http.server\nimport sqlite3\nimport os\nimport html\nimport secrets\n\nclass SecureFileManagementSystem(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            self.handle_upload()\n        elif self.path == '/delete':\n            self.handle_delete()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_upload(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('=')[1].encode()\n        parts = post_data.split(boundary)\n\n        filename = None\n        description = ''\n        file_content = None\n\n        for part in parts:\n            lines = part.splitlines()\n            for line in lines:\n                if b'filename=' in line:\n                    filename = line.decode().split('filename=')[1].strip('\"')\n                elif b'name=\"description\"' in line:\n                    description = lines[lines.index(line) + 2].decode()\n                elif b'name=\"file\"' in line:\n                    file_content = lines[lines.index(line) + 2]\n\n        if not filename or any(char in filename for char in ('/', '\\\\', '\\0')):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        unique_storage_name = f\"{secrets.token_hex(8)}_{os.path.basename(filename)}\"\n        file_path = os.path.join('files', unique_storage_name)\n\n        with open(file_path, 'wb') as f:\n            f.write(file_content)\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute('''CREATE TABLE IF NOT EXISTS files\n                     (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                      original_name TEXT NOT NULL,\n                      description TEXT,\n                      path TEXT NOT NULL)''')\n        c.execute(\"INSERT INTO files (original_name, description, path) VALUES (?, ?, ?)\",\n                  (filename, description, file_path))\n        conn.commit()\n        file_id = c.lastrowid\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(f\"File uploaded successfully with ID: {file_id}\".encode())\n\n    def handle_delete(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        post_data = post_data.decode().split('&')\n        file_id = None\n        csrf_token = None\n\n        for item in post_data:\n            key, value = item.split('=')\n            if key == 'file_id':\n                file_id = value\n            elif key == 'csrf_token':\n                csrf_token = value\n\n        if not file_id or not csrf_token:\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        session_csrf_token = self.get_session_csrf_token()\n        if csrf_token != session_csrf_token:\n            self.send_response(403)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT path FROM files WHERE id=?\", (file_id,))\n        row = c.fetchone()\n        conn.close()\n\n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        file_path = row[0]\n        if not file_path.startswith(os.path.abspath('files') + os.sep):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        try:\n            os.remove(file_path)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"DELETE FROM files WHERE id=?\", (file_id,))\n        conn.commit()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b\"File deleted successfully\")\n\n    def do_GET(self):\n        if self.path == '/list':\n            self.handle_list()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_list(self):\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT original_name, description, id FROM files\")\n        rows = c.fetchall()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/html')\n        self.end_headers()\n\n        csrf_token = self.get_session_csrf_token()\n        html_content = \"<html><body><h1>Files</h1><ul>\"\n        for row in rows:\n            original_name = html.escape(row[0])\n            description = html.escape(row[1])\n            file_id = row[2]\n            html_content += f\"<li>{original_name} - {description} <a href='/delete?file_id={file_id}&csrf_token={csrf_token}'>Delete</a></li>\"\n        html_content += \"</ul></body></html>\"\n\n        self.wfile.write(html_content.encode())\n\n    def get_session_csrf_token(self):\n        if 'csrf_token' not in self.server.session:\n            self.server.session['csrf_token'] = secrets.token_urlsafe(16)\n        return self.server.session['csrf_token']\n\ndef run(server_class=http.server.HTTPServer, handler_class=SecureFileManagementSystem, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.session = {}\n    print(f'Starting httpd on port {port}...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import http.server\nimport sqlite3\nimport os\nimport html\nimport secrets\n\nclass SecureFileManagementSystem(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path == '/upload':\n            self.handle_upload()\n        elif self.path == '/delete':\n            self.handle_delete()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_upload(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers['Content-Type'].split('=')[1].encode()\n        parts = post_data.split(boundary)\n\n        filename = None\n        description = ''\n        file_content = None\n\n        for part in parts:\n            lines = part.splitlines()\n            for line in lines:\n                if b'filename=' in line:\n                    filename = line.decode().split('filename=')[1].strip('\"')\n                elif b'name=\"description\"' in line:\n                    description = lines[lines.index(line) + 2].decode()\n                elif b'name=\"file\"' in line:\n                    file_content = lines[lines.index(line) + 2]\n\n        if not filename or any(char in filename for char in ('/', '\\\\', '\\0')):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        unique_storage_name = f\"{secrets.token_hex(8)}_{os.path.basename(filename)}\"\n        file_path = os.path.join('files', unique_storage_name)\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        with open(file_path, 'wb') as f:\n            f.write(file_content)\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute('''CREATE TABLE IF NOT EXISTS files\n                     (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                      original_name TEXT NOT NULL,\n                      description TEXT,\n                      path TEXT NOT NULL)''')\n        c.execute(\"INSERT INTO files (original_name, description, path) VALUES (?, ?, ?)\",\n                  (filename, description, file_path))\n        conn.commit()\n        file_id = c.lastrowid\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(f\"File uploaded successfully with ID: {file_id}\".encode())\n\n    def handle_delete(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        post_data = post_data.decode().split('&')\n        file_id = None\n        csrf_token = None\n\n        for item in post_data:\n            key, value = item.split('=')\n            if key == 'file_id':\n                file_id = value\n            elif key == 'csrf_token':\n                csrf_token = value\n\n        if not file_id or not csrf_token:\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        session_csrf_token = self.get_session_csrf_token()\n        if csrf_token != session_csrf_token:\n            self.send_response(403)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT path FROM files WHERE id=?\", (file_id,))\n        row = c.fetchone()\n        conn.close()\n\n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        file_path = row[0]\n        if not file_path.startswith(os.path.abspath('files') + os.sep):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        # Ensure the file path is within the designated directory\n        if not os.path.commonpath([os.path.abspath('files'), os.path.abspath(file_path)]) == os.path.abspath('files'):\n            self.send_response(400)\n            self.end_headers()\n            return\n\n        try:\n            os.remove(file_path)\n        except FileNotFoundError:\n            self.send_response(404)\n            self.end_headers()\n            return\n\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"DELETE FROM files WHERE id=?\", (file_id,))\n        conn.commit()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b\"File deleted successfully\")\n\n    def do_GET(self):\n        if self.path == '/list':\n            self.handle_list()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_list(self):\n        conn = sqlite3.connect('files.db')\n        c = conn.cursor()\n        c.execute(\"SELECT original_name, description, id FROM files\")\n        rows = c.fetchall()\n        conn.close()\n\n        self.send_response(200)\n        self.send_header('Content-type', 'text/html')\n        self.end_headers()\n\n        csrf_token = self.get_session_csrf_token()\n        html_content = \"<html><body><h1>Files</h1><ul>\"\n        for row in rows:\n            original_name = html.escape(row[0])\n            description = html.escape(row[1])\n            file_id = row[2]\n            html_content += f\"<li>{original_name} - {description} <a href='/delete?file_id={file_id}&csrf_token={csrf_token}'>Delete</a></li>\"\n        html_content += \"</ul></body></html>\"\n\n        self.wfile.write(html_content.encode())\n\n    def get_session_csrf_token(self):\n        if 'csrf_token' not in self.server.session:\n            self.server.session['csrf_token'] = secrets.token_urlsafe(16)\n        return self.server.session['csrf_token']\n\ndef run(server_class=http.server.HTTPServer, handler_class=SecureFileManagementSystem, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.session = {}\n    print(f'Starting httpd on port {port}...')\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 51\n   desc: This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).\n   code: with open(file_path, 'wb') as f:\n   judge: A path traversal check using os.path.commonpath was added before the open() call. This check compares the absolute path of 'files' against the absolute path of the constructed file_path. However, the check is performed AFTER file_path is already constructed (line 49), which may contain '..' sequences. The check may reject some traversals, but it is not a robust canonicalization-based guard (e.g., symlinks, unnormalized paths). Since the SAST tool still flags the sink as user-influenced and the guard's effectiveness is not fully provable, I mark this as UNCERTAIN rather than FP.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:51",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+        "tool_snippet": "        with open(file_path, 'wb') as f:",
+        "context": "    49:             return\n    50: \n>>  51:         with open(file_path, 'wb') as f:\n    52:             f.write(file_content)\n    53: "
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_off_target_findings` while targeting CWE-352, CWE-79 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: codeql:py/path-injection. Final unresolved CWEs: CWE-22."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "persistent_codeql_path_injection",
+      "incomplete_path_sanitization",
+      "missing_canonicalization",
+      "fixer_loop_no_resolution",
+      "sast_finding_persisted_across_attempts"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/path-injection"
+    ],
+    "summary": "The code attempted to mitigate path traversal by using os.path.commonpath, but the check is applied after file_path construction and does not canonicalize the path (e.g., via os.path.realpath), leaving the SAST tool unconvinced. The same finding persisted across all three attempts with no resolution, indicating a fixer loop where the developer added a guard that was deemed insufficient by the SAST judge.",
+    "suggested_actions": [
+      "Canonicalize the file path using os.path.realpath before the commonpath check to eliminate '..' sequences and symlinks.",
+      "Ensure the path check is performed on the fully resolved (real) path and that the base directory is also resolved.",
+      "Consider using a whitelist-based approach or a dedicated path validation function that strictly confines files to the intended directory.",
+      "If the SAST tool continues to flag after proper canonicalization, document the rationale and request a false positive review with supporting evidence."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_off_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:51",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 51,
+        "description": "This path depends on a [user-provided value](1).\nThis path depends on a [user-provided value](2).",
+        "tool_snippet": "        with open(file_path, 'wb') as f:",
+        "context": "    48:             self.end_headers()\n    49:             return\n    50: \n>>  51:         with open(file_path, 'wb') as f:\n    52:             f.write(file_content)\n    53: \n    54:         conn = sqlite3.connect('files.db')"
+      }
+    ]
+  }
+}

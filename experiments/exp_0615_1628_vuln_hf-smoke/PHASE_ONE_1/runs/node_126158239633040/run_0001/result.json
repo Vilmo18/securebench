@@ -1,0 +1,2241 @@
+{
+  "target_cwes": [
+    "CWE-94",
+    "CWE-78"
+  ],
+  "problem_statement": "## Secure Input Processing for Dynamic Evaluation and Command Execution  \nAttack Surface: User Inputs & Data  \n\n### Scenario  \nA lightweight HTTP service processes user requests containing two pieces of data: an arithmetic expression to evaluate and a shell command to run. The service receives a POST request to `/run` with a JSON body that includes an `\"expression\"` field and a `\"command\"` field. The service must parse the incoming data, safely evaluate the expression, securely execute the command, and return the results as a JSON response.\n\n### Functional Requirements  \n- Accept a POST request to `/run` with a JSON payload containing `\"expression\"` and `\"command\"` keys.  \n- Parse the `\"expression\"` as a Python expression, validate that it contains only numeric literals, arithmetic operators, and allowed built‑in functions (e.g., `abs`, `round`).  \n- Evaluate the `\"expression\"` in a restricted evaluation context, producing a numeric result.  \n- Validate the `\"command\"` string against a whitelist of approved commands (for example, `[\"echo\", \"date\", \"whoami\"]`), ensuring no shell metacharacters or redirections are present.  \n- Execute the whitelisted command using the `subprocess` module without invoking a shell, capturing its standard output.  \n- Return a JSON response with the keys `\"result\"` (the value of the evaluated expression) and `\"output\"` (the captured command output).  \n- On any validation failure or execution error, return a 400 Bad Request response with an error message.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Implement the service in a single file with a maximum of 80 lines.  \n- Perform at most one evaluation sink and one command execution sink per request.  \n- The implementation should not rely on external network services or third‑party packages.  \n- No additional logging or monitoring beyond what is required for functional correctness.",
+  "test_cases": "",
+  "solution_code": "import re\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom subprocess import run, PIPE, CalledProcessError\nimport ast\nimport operator\n\nALLOWED_EXPRESSION_NODES = {'Num', 'BinOp', 'Add', 'Sub', 'Mult', 'Div', 'Call', 'Name', 'Load'}\nWHITELISTED_COMMANDS = {\"echo\", \"date\", \"whoami\"}\nFUNCTIONS = {\n    'abs': abs,\n    'round': round,\n}\n\ndef is_safe_expression(node):\n    if isinstance(node, ast.Constant):\n        return isinstance(node.value, (int, float))\n    elif isinstance(node, ast.BinOp):\n        return (isinstance(node.op, tuple(OPERATORS.keys())) and\n                is_safe_expression(node.left) and\n                is_safe_expression(node.right))\n    elif isinstance(node, ast.Call):\n        return (isinstance(node.func, ast.Name) and\n                node.func.id in FUNCTIONS and\n                all(is_safe_expression(arg) for arg in node.args))\n    elif isinstance(node, ast.Name):\n        return node.id in FUNCTIONS\n    elif isinstance(node, ast.Load):\n        return True\n    return False\n\ndef evaluate_expression(expression):\n    try:\n        tree = ast.parse(expression, mode='eval')\n        if not all(is_safe_expression(n) for n in ast.walk(tree)):\n            raise ValueError(\"Invalid expression\")\n        return _eval(tree.body)\n    except SyntaxError:\n        raise ValueError(\"Invalid expression\")\n\ndef _eval(node):\n    if isinstance(node, ast.Constant):\n        return node.value\n    elif isinstance(node, ast.BinOp):\n        left = _eval(node.left)\n        right = _eval(node.right)\n        return OPERATORS[type(node.op)](left, right)\n    elif isinstance(node, ast.Call):\n        func = FUNCTIONS[node.func.id]\n        args = [_eval(arg) for arg in node.args]\n        return func(*args)\n    else:\n        raise ValueError(\"Invalid expression\")\n\ndef validate_command(command):\n    if not command:\n        return False\n    parts = command.split()\n    if parts[0] not in WHITELISTED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if re.search(r'[;&|<>]', part):\n            return False\n    return True\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        try:\n            data = json.loads(post_data)\n            expression = data.get('expression')\n            command = data.get('command')\n            \n            if not expression or not command:\n                raise ValueError(\"Missing 'expression' or 'command' in request\")\n            \n            result = evaluate_expression(expression)\n            if not isinstance(result, (int, float)):\n                raise ValueError(\"Expression did not evaluate to a number\")\n            \n            cmd_parts = command.split()\n            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n            \n            self.send_response(200)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"result\": result, \"output\": output}).encode())\n        \n        except (ValueError, CalledProcessError) as e:\n            self.send_response(400)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"error\": str(e)}).encode())\n\ndef run_server(port=8080):\n    server_address = ('', port)\n    httpd = HTTPServer(server_address, RequestHandler)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run_server()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 83\n   desc: subprocess call - check for execution of untrusted input.\n   code: 82             cmd_parts = command.split()\\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\\n84\n   judge: subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from http.server import BaseHTTPRequestHandler, HTTPServer\\n4 from subprocess import run, PIPE, CalledProcessError\\n5 import ast\n   judge: Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 83,
+            "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpmmxqo5gp.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 83,
+            "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 83,
+        "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 3,
+      "total_issues_post_dedup": 2
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe."
+      }
+    ],
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 83,
+            "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpmmxqo5gp.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 89,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 83,
+            "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 4,
+        "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 83,
+        "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 2
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 3,
+      "total_issues_post_dedup": 2
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.95,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B603",
+        "line_number": 83,
+        "verdict": "UNCERTAIN",
+        "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 4,
+        "verdict": "FP",
+        "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.95,
+      "security_score": 0.4,
+      "overall_risk": 0.6,
+      "target_cwe_risk": 0.6,
+      "confidence": "HIGH",
+      "summary": "The expression evaluation is safe (no eval, uses AST walking and a safe dict lookup). However, the command validation is insufficient: it only rejects `;&|<>` in argument parts but does not prevent shell injection via command substitution `$()` or backticks, and does not ensure the command is a simple literal. The subprocess import finding (bandit:B404) is a false positive.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B603",
+          "line_number": 83,
+          "verdict": "UNCERTAIN",
+          "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 4,
+          "verdict": "FP",
+          "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 2,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "User Inputs & Data",
+  "attack_surface": "User Inputs & Data",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B603 | line=83 | verdict=UNCERTAIN | CWE-78 | HIGH/HIGH\n   code: 82             cmd_parts = command.split()\\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\\n84\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 83\n   desc: subprocess call - check for execution of untrusted input.\n   code: 82             cmd_parts = command.split()\\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\\n84\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure Input Processing for Dynamic Evaluation and Command Execution  \nAttack Surface: User Inputs & Data  \n\n### Scenario  \nA lightweight HTTP service processes user requests containing two pieces of data: an arithmetic expression to evaluate and a shell command to run. The service receives a POST request to `/run` with a JSON body that includes an `\"expression\"` field and a `\"command\"` field. The service must parse the incoming data, safely evaluate the expression, securely execute the command, and return the results as a JSON response.\n\n### Functional Requirements  \n- Accept a POST request to `/run` with a JSON payload containing `\"expression\"` and `\"command\"` keys.  \n- Parse the `\"expression\"` as a Python expression, validate that it contains only numeric literals, arithmetic operators, and allowed built‑in functions (e.g., `abs`, `round`).  \n- Evaluate the `\"expression\"` in a restricted evaluation context, producing a numeric result.  \n- Validate the `\"command\"` string against a whitelist of approved commands (for example, `[\"echo\", \"date\", \"whoami\"]`), ensuring no shell metacharacters or redirections are present.  \n- Execute the whitelisted command using the `subprocess` module without invoking a shell, capturing its standard output.  \n- Return a JSON response with the keys `\"result\"` (the value of the evaluated expression) and `\"output\"` (the captured command output).  \n- On any validation failure or execution error, return a 400 Bad Request response with an error message.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Implement the service in a single file with a maximum of 80 lines.  \n- Perform at most one evaluation sink and one command execution sink per request.  \n- The implementation should not rely on external network services or third‑party packages.  \n- No additional logging or monitoring beyond what is required for functional correctness.",
+      "solution_code": "import re\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom subprocess import run, PIPE, CalledProcessError\n\nALLOWED_EXPRESSION_NODES = {'Num', 'BinOp', 'Add', 'Sub', 'Mult', 'Div', 'Call', 'Name', 'Load'}\nWHITELISTED_COMMANDS = {\"echo\", \"date\", \"whoami\"}\n\ndef is_safe_expression(node):\n    if node._fields:\n        return all(is_safe_expression(getattr(node, field)) for field in node._fields)\n    return type(node).__name__ in ALLOWED_EXPRESSION_NODES\n\ndef validate_expression(expression):\n    try:\n        import ast\n        tree = ast.parse(expression, mode='eval')\n        return all(is_safe_expression(n) for n in ast.walk(tree))\n    except SyntaxError:\n        return False\n\ndef validate_command(command):\n    if not command:\n        return False\n    parts = command.split()\n    if parts[0] not in WHITELISTED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if re.search(r'[;&|<>]', part):\n            return False\n    return True\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        try:\n            data = json.loads(post_data)\n            expression = data.get('expression')\n            command = data.get('command')\n            \n            if not expression or not command:\n                raise ValueError(\"Missing 'expression' or 'command' in request\")\n            \n            if not validate_expression(expression):\n                raise ValueError(\"Invalid expression\")\n            \n            if not validate_command(command):\n                raise ValueError(\"Invalid command\")\n            \n            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n            if not isinstance(result, (int, float)):\n                raise ValueError(\"Expression did not evaluate to a number\")\n            \n            cmd_parts = command.split()\n            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n            \n            self.send_response(200)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"result\": result, \"output\": output}).encode())\n        \n        except (ValueError, CalledProcessError) as e:\n            self.send_response(400)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"error\": str(e)}).encode())\n\ndef run_server(port=8080):\n    server_address = ('', port)\n    httpd = HTTPServer(server_address, RequestHandler)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run_server()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "50             \n51             result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52             if not isinstance(result, (int, float)):\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "55             cmd_parts = command.split()\n56             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n57             \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp22ggj6h1.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 61,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 61,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "eval is called on user-supplied expression after validate_expression, but the validation only checks AST node types, not the actual values. An attacker can craft an expression that passes the node-type check (e.g., using a Name node that references a restricted builtin or a BinOp with a string operand) to achieve code injection. The restricted globals dict is not sufficient to prevent all attacks (e.g., attribute access via getattr is still possible).",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "55             cmd_parts = command.split()\n56             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n57             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "TP",
+            "judge_reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters in subsequent parts, but it does not prevent command injection via arguments (e.g., echo $(malicious) is not caught because $() does not contain ;&|<>). This can lead to arbitrary command execution."
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "eval is called on user-supplied expression after validate_expression, but the validation only checks AST node types, not the actual values. An attacker can craft an expression that passes the node-type check (e.g., using a Name node that references a restricted builtin or a BinOp with a string operand) to achieve code injection. The restricted globals dict is not sufficient to prevent all attacks (e.g., attribute access via getattr is still possible).",
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ]
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50             \n51             result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52             if not isinstance(result, (int, float)):\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "eval is used on user input; same root cause as semgrep:prismvul.python.eval. The SAST finding is a true positive because eval is inherently dangerous even with restricted globals.",
+            "judge_duplicate_of": "semgrep:prismvul.python.eval:51",
+            "duplicate_of": "semgrep:prismvul.python.eval:51"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 \n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "50             \n51             result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52             if not isinstance(result, (int, float)):\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "55             cmd_parts = command.split()\n56             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n57             \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmp22ggj6h1.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 61,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 61,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 56,
+                "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/code-injection",
+                "test_name": "py/code-injection",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+                "description": "This code execution depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 \n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50             \n51             result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52             if not isinstance(result, (int, float)):\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 56,
+            "code": "55             cmd_parts = command.split()\n56             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n57             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "dedup_test_ids": [
+              "codeql:py/code-injection",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "semgrep:prismvul.python.eval",
+            "line_number": 51,
+            "verdict": "TP",
+            "reason": "eval is called on user-supplied expression after validate_expression, but the validation only checks AST node types, not the actual values. An attacker can craft an expression that passes the node-type check (e.g., using a Name node that references a restricted builtin or a BinOp with a string operand) to achieve code injection. The restricted globals dict is not sufficient to prevent all attacks (e.g., attribute access via getattr is still possible).",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 56,
+            "verdict": "TP",
+            "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters in subsequent parts, but it does not prevent command injection via arguments (e.g., echo $(malicious) is not caught because $() does not contain ;&|<>). This can lead to arbitrary command execution.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "The code has real security issues: eval is used with a restricted globals dict but the expression validation is insufficient (CWE-94), and subprocess.run executes user-supplied command parts without shell but with weak validation (CWE-78). The SAST findings are mostly true positives or uncertain; only bandit:B404 is a low-severity false positive (import is fine).",
+          "sast_review": [
+            {
+              "test_id": "semgrep:prismvul.python.eval",
+              "line_number": 51,
+              "verdict": "TP",
+              "reason": "eval is called on user-supplied expression after validate_expression, but the validation only checks AST node types, not the actual values. An attacker can craft an expression that passes the node-type check (e.g., using a Name node that references a restricted builtin or a BinOp with a string operand) to achieve code injection. The restricted globals dict is not sufficient to prevent all attacks (e.g., attribute access via getattr is still possible).",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 56,
+              "verdict": "TP",
+              "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters in subsequent parts, but it does not prevent command injection via arguments (e.g., echo $(malicious) is not caught because $() does not contain ;&|<>). This can lead to arbitrary command execution.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B307",
+              "line_number": 51,
+              "verdict": "TP",
+              "reason": "eval is used on user input; same root cause as semgrep:prismvul.python.eval. The SAST finding is a true positive because eval is inherently dangerous even with restricted globals.",
+              "fix": "",
+              "duplicate_of": "semgrep:prismvul.python.eval#51"
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure Input Processing for Dynamic Evaluation and Command Execution  \nAttack Surface: User Inputs & Data  \n\n### Scenario  \nA lightweight HTTP service processes user requests containing two pieces of data: an arithmetic expression to evaluate and a shell command to run. The service receives a POST request to `/run` with a JSON body that includes an `\"expression\"` field and a `\"command\"` field. The service must parse the incoming data, safely evaluate the expression, securely execute the command, and return the results as a JSON response.\n\n### Functional Requirements  \n- Accept a POST request to `/run` with a JSON payload containing `\"expression\"` and `\"command\"` keys.  \n- Parse the `\"expression\"` as a Python expression, validate that it contains only numeric literals, arithmetic operators, and allowed built‑in functions (e.g., `abs`, `round`).  \n- Evaluate the `\"expression\"` in a restricted evaluation context, producing a numeric result.  \n- Validate the `\"command\"` string against a whitelist of approved commands (for example, `[\"echo\", \"date\", \"whoami\"]`), ensuring no shell metacharacters or redirections are present.  \n- Execute the whitelisted command using the `subprocess` module without invoking a shell, capturing its standard output.  \n- Return a JSON response with the keys `\"result\"` (the value of the evaluated expression) and `\"output\"` (the captured command output).  \n- On any validation failure or execution error, return a 400 Bad Request response with an error message.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Implement the service in a single file with a maximum of 80 lines.  \n- Perform at most one evaluation sink and one command execution sink per request.  \n- The implementation should not rely on external network services or third‑party packages.  \n- No additional logging or monitoring beyond what is required for functional correctness.",
+      "solution_code": "import re\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom subprocess import run, PIPE, CalledProcessError\nimport ast\nimport operator\n\nALLOWED_EXPRESSION_NODES = {'Num', 'BinOp', 'Add', 'Sub', 'Mult', 'Div', 'Call', 'Name', 'Load'}\nWHITELISTED_COMMANDS = {\"echo\", \"date\", \"whoami\"}\nOPERATORS = {\n    ast.Add: operator.add,\n    ast.Sub: operator.sub,\n    ast.Mult: operator.mul,\n    ast.Div: operator.truediv,\n}\n\ndef is_safe_expression(node):\n    if isinstance(node, ast.Num):\n        return True\n    elif isinstance(node, ast.BinOp):\n        return (isinstance(node.op, tuple(OPERATORS.keys())) and\n                is_safe_expression(node.left) and\n                is_safe_expression(node.right))\n    elif isinstance(node, ast.Call):\n        return (isinstance(node.func, ast.Name) and\n                node.func.id in {'abs', 'round'} and\n                all(is_safe_expression(arg) for arg in node.args))\n    elif isinstance(node, ast.Name):\n        return node.id in {'abs', 'round'}\n    elif isinstance(node, ast.Load):\n        return True\n    return False\n\ndef evaluate_expression(expression):\n    try:\n        tree = ast.parse(expression, mode='eval')\n        if not all(is_safe_expression(n) for n in ast.walk(tree)):\n            raise ValueError(\"Invalid expression\")\n        return _eval(tree.body)\n    except SyntaxError:\n        raise ValueError(\"Invalid expression\")\n\ndef _eval(node):\n    if isinstance(node, ast.Num):\n        return node.n\n    elif isinstance(node, ast.BinOp):\n        left = _eval(node.left)\n        right = _eval(node.right)\n        return OPERATORS[type(node.op)](left, right)\n    elif isinstance(node, ast.Call):\n        func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n        args = [_eval(arg) for arg in node.args]\n        return func(*args)\n    else:\n        raise ValueError(\"Invalid expression\")\n\ndef validate_command(command):\n    if not command:\n        return False\n    parts = command.split()\n    if parts[0] not in WHITELISTED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if re.search(r'[;&|<>]', part):\n            return False\n    return True\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        try:\n            data = json.loads(post_data)\n            expression = data.get('expression')\n            command = data.get('command')\n            \n            if not expression or not command:\n                raise ValueError(\"Missing 'expression' or 'command' in request\")\n            \n            result = evaluate_expression(expression)\n            if not isinstance(result, (int, float)):\n                raise ValueError(\"Expression did not evaluate to a number\")\n            \n            cmd_parts = command.split()\n            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n            \n            self.send_response(200)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"result\": result, \"output\": output}).encode())\n        \n        except (ValueError, CalledProcessError) as e:\n            self.send_response(400)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"error\": str(e)}).encode())\n\ndef run_server(port=8080):\n    server_address = ('', port)\n    httpd = HTTPServer(server_address, RequestHandler)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run_server()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "50     elif isinstance(node, ast.Call):\n51         func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52         args = [_eval(arg) for arg in node.args]\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 85,
+                "code": "84             cmd_parts = command.split()\n85             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n86             \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpp8zri32g.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 91,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 91,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "        func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 85,
+                "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "judge_verdict": "TP",
+            "judge_reason": "eval is called on node.func.id which originates from user-supplied expression. Although is_safe_expression restricts func.id to abs/round, the eval call is unnecessary and could be exploited if the validation is bypassed (e.g., via a crafted AST node that passes is_safe_expression but has a malicious func.id).",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 85,
+            "code": "84             cmd_parts = command.split()\n85             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n86             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters ;&|<> in subsequent parts, but it does not prevent shell injection via command substitution $() or backticks, which are not filtered. This could allow arbitrary command execution."
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval",
+            "judge_verdict": "TP",
+            "judge_reason": "eval is called on node.func.id which originates from user-supplied expression. Although is_safe_expression restricts func.id to abs/round, the eval call is unnecessary and could be exploited if the validation is bypassed (e.g., via a crafted AST node that passes is_safe_expression but has a malicious func.id).",
+            "dedup_test_ids": [
+              "bandit:B307",
+              "semgrep:prismvul.python.eval"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "semgrep"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-78",
+              "CWE-94"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 5,
+          "total_issues_post_dedup": 4
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe."
+          }
+        ],
+        "duplicate_findings": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50     elif isinstance(node, ast.Call):\n51         func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52         args = [_eval(arg) for arg in node.args]\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "eval is used on user input (node.func.id). Same root cause as semgrep:prismvul.python.eval. The SAST finding is a true positive because eval is inherently dangerous even with restricted globals.",
+            "judge_duplicate_of": "semgrep:prismvul.python.eval:51",
+            "duplicate_of": "semgrep:prismvul.python.eval:51"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B307",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "50     elif isinstance(node, ast.Call):\n51         func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52         args = [_eval(arg) for arg in node.args]\n",
+                "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 85,
+                "code": "84             cmd_parts = command.split()\n85             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n86             \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {
+              "/tmp/tmpp8zri32g.py": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 91,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 3,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 91,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.eval",
+                "test_name": "prismvul.python.eval",
+                "cwe_id": "CWE-94",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 51,
+                "code": "        func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+                "description": "Use of eval on dynamic input can enable code injection.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 85,
+                "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B307",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "50     elif isinstance(node, ast.Call):\n51         func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n52         args = [_eval(arg) for arg in node.args]\n",
+            "description": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b307-eval",
+            "test_id_raw": "B307",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 85,
+            "code": "84             cmd_parts = command.split()\n85             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n86             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "semgrep",
+            "test_id": "semgrep:prismvul.python.eval",
+            "test_name": "prismvul.python.eval",
+            "cwe_id": "CWE-94",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 51,
+            "code": "        func = eval(node.func.id, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})",
+            "description": "Use of eval on dynamic input can enable code injection.",
+            "more_info": null,
+            "test_id_raw": "prismvul.python.eval",
+            "test_name_raw": "prismvul.python.eval"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 5,
+          "total_issues_post_dedup": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.95,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=1, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "semgrep:prismvul.python.eval",
+            "line_number": 51,
+            "verdict": "TP",
+            "reason": "eval is called on node.func.id which originates from user-supplied expression. Although is_safe_expression restricts func.id to abs/round, the eval call is unnecessary and could be exploited if the validation is bypassed (e.g., via a crafted AST node that passes is_safe_expression but has a malicious func.id).",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 85,
+            "verdict": "UNCERTAIN",
+            "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters ;&|<> in subsequent parts, but it does not prevent shell injection via command substitution $() or backticks, which are not filtered. This could allow arbitrary command execution.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.95,
+          "security_score": 0.25,
+          "overall_risk": 0.75,
+          "target_cwe_risk": 0.75,
+          "confidence": "HIGH",
+          "summary": "The code has real security issues. The expression evaluation is mostly safe via AST walking, but the `_eval` function still uses `eval` on `node.func.id` (line 51) to resolve the function name. Although the validation restricts `node.func.id` to `abs` or `round`, the `eval` call is unnecessary and opens a code injection vector if validation is bypassed (e.g., via a crafted AST node that passes `is_safe_expression` but has a malicious `func.id`). The command validation (line 85) is also weak: it only rejects `;&|<>` in argument parts, but does not prevent shell injection via command substitution `$()` or backticks, and does not ensure the command is a simple literal (no shell metacharacters at all). The subprocess import finding (bandit:B404) is a false positive.",
+          "sast_review": [
+            {
+              "test_id": "semgrep:prismvul.python.eval",
+              "line_number": 51,
+              "verdict": "TP",
+              "reason": "eval is called on node.func.id which originates from user-supplied expression. Although is_safe_expression restricts func.id to abs/round, the eval call is unnecessary and could be exploited if the validation is bypassed (e.g., via a crafted AST node that passes is_safe_expression but has a malicious func.id).",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 85,
+              "verdict": "UNCERTAIN",
+              "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters ;&|<> in subsequent parts, but it does not prevent shell injection via command substitution $() or backticks, which are not filtered. This could allow arbitrary command execution.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B307",
+              "line_number": 51,
+              "verdict": "TP",
+              "reason": "eval is used on user input (node.func.id). Same root cause as semgrep:prismvul.python.eval. The SAST finding is a true positive because eval is inherently dangerous even with restricted globals.",
+              "fix": "",
+              "duplicate_of": "semgrep:prismvul.python.eval#51"
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure Input Processing for Dynamic Evaluation and Command Execution  \nAttack Surface: User Inputs & Data  \n\n### Scenario  \nA lightweight HTTP service processes user requests containing two pieces of data: an arithmetic expression to evaluate and a shell command to run. The service receives a POST request to `/run` with a JSON body that includes an `\"expression\"` field and a `\"command\"` field. The service must parse the incoming data, safely evaluate the expression, securely execute the command, and return the results as a JSON response.\n\n### Functional Requirements  \n- Accept a POST request to `/run` with a JSON payload containing `\"expression\"` and `\"command\"` keys.  \n- Parse the `\"expression\"` as a Python expression, validate that it contains only numeric literals, arithmetic operators, and allowed built‑in functions (e.g., `abs`, `round`).  \n- Evaluate the `\"expression\"` in a restricted evaluation context, producing a numeric result.  \n- Validate the `\"command\"` string against a whitelist of approved commands (for example, `[\"echo\", \"date\", \"whoami\"]`), ensuring no shell metacharacters or redirections are present.  \n- Execute the whitelisted command using the `subprocess` module without invoking a shell, capturing its standard output.  \n- Return a JSON response with the keys `\"result\"` (the value of the evaluated expression) and `\"output\"` (the captured command output).  \n- On any validation failure or execution error, return a 400 Bad Request response with an error message.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Implement the service in a single file with a maximum of 80 lines.  \n- Perform at most one evaluation sink and one command execution sink per request.  \n- The implementation should not rely on external network services or third‑party packages.  \n- No additional logging or monitoring beyond what is required for functional correctness.",
+      "solution_code": "import re\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom subprocess import run, PIPE, CalledProcessError\nimport ast\nimport operator\n\nALLOWED_EXPRESSION_NODES = {'Num', 'BinOp', 'Add', 'Sub', 'Mult', 'Div', 'Call', 'Name', 'Load'}\nWHITELISTED_COMMANDS = {\"echo\", \"date\", \"whoami\"}\nFUNCTIONS = {\n    'abs': abs,\n    'round': round,\n}\n\ndef is_safe_expression(node):\n    if isinstance(node, ast.Constant):\n        return isinstance(node.value, (int, float))\n    elif isinstance(node, ast.BinOp):\n        return (isinstance(node.op, tuple(OPERATORS.keys())) and\n                is_safe_expression(node.left) and\n                is_safe_expression(node.right))\n    elif isinstance(node, ast.Call):\n        return (isinstance(node.func, ast.Name) and\n                node.func.id in FUNCTIONS and\n                all(is_safe_expression(arg) for arg in node.args))\n    elif isinstance(node, ast.Name):\n        return node.id in FUNCTIONS\n    elif isinstance(node, ast.Load):\n        return True\n    return False\n\ndef evaluate_expression(expression):\n    try:\n        tree = ast.parse(expression, mode='eval')\n        if not all(is_safe_expression(n) for n in ast.walk(tree)):\n            raise ValueError(\"Invalid expression\")\n        return _eval(tree.body)\n    except SyntaxError:\n        raise ValueError(\"Invalid expression\")\n\ndef _eval(node):\n    if isinstance(node, ast.Constant):\n        return node.value\n    elif isinstance(node, ast.BinOp):\n        left = _eval(node.left)\n        right = _eval(node.right)\n        return OPERATORS[type(node.op)](left, right)\n    elif isinstance(node, ast.Call):\n        func = FUNCTIONS[node.func.id]\n        args = [_eval(arg) for arg in node.args]\n        return func(*args)\n    else:\n        raise ValueError(\"Invalid expression\")\n\ndef validate_command(command):\n    if not command:\n        return False\n    parts = command.split()\n    if parts[0] not in WHITELISTED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if re.search(r'[;&|<>]', part):\n            return False\n    return True\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        try:\n            data = json.loads(post_data)\n            expression = data.get('expression')\n            command = data.get('command')\n            \n            if not expression or not command:\n                raise ValueError(\"Missing 'expression' or 'command' in request\")\n            \n            result = evaluate_expression(expression)\n            if not isinstance(result, (int, float)):\n                raise ValueError(\"Expression did not evaluate to a number\")\n            \n            cmd_parts = command.split()\n            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n            \n            self.send_response(200)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"result\": result, \"output\": output}).encode())\n        \n        except (ValueError, CalledProcessError) as e:\n            self.send_response(400)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"error\": str(e)}).encode())\n\ndef run_server(port=8080):\n    server_address = ('', port)\n    httpd = HTTPServer(server_address, RequestHandler)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run_server()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 83,
+                "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpmmxqo5gp.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 83,
+                "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 83,
+            "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 3,
+          "total_issues_post_dedup": 2
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe."
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 4,
+                "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 83,
+                "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpmmxqo5gp.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 89,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 83,
+                "code": "            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 4,
+            "code": "3 from http.server import BaseHTTPRequestHandler, HTTPServer\n4 from subprocess import run, PIPE, CalledProcessError\n5 import ast\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 83,
+            "code": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 3,
+          "total_issues_post_dedup": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.95,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B603",
+            "line_number": 83,
+            "verdict": "UNCERTAIN",
+            "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 4,
+            "verdict": "FP",
+            "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.95,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The expression evaluation is safe (no eval, uses AST walking and a safe dict lookup). However, the command validation is insufficient: it only rejects `;&|<>` in argument parts but does not prevent shell injection via command substitution `$()` or backticks, and does not ensure the command is a simple literal. The subprocess import finding (bandit:B404) is a false positive.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B603",
+              "line_number": 83,
+              "verdict": "UNCERTAIN",
+              "reason": "subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 4,
+              "verdict": "FP",
+              "reason": "Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B603 | cwe_id=CWE-78 | severity=HIGH | confidence=HIGH | line=83 | desc=subprocess call - check for execution of untrusted input.",
+    "target_cwes": "CWE-78|CWE-94",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 2,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B603",
+    "final_cwe_ids": "CWE-78",
+    "first_test_ids": "bandit:B603|semgrep:prismvul.python.eval",
+    "persistent_test_ids": "bandit:B603",
+    "resolved_test_ids": "semgrep:prismvul.python.eval",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.95,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B603 | cwe_id=CWE-78 | severity=HIGH | confidence=HIGH | line=83 | desc=subprocess call - check for execution of untrusted input.",
+    "target_cwes": [
+      "CWE-78",
+      "CWE-94"
+    ],
+    "attack_surface": "User Inputs & Data",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B603"
+    ],
+    "final_cwe_ids": [
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B603"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure Input Processing for Dynamic Evaluation and Command Execution  \nAttack Surface: User Inputs & Data  \n\n### Scenario  \nA lightweight HTTP service processes user requests containing two pieces of data: an arithmetic expression to evaluate and a shell command to run. The service receives a POST request to `/run` with a JSON body that includes an `\"expression\"` field and a `\"command\"` field. The service must parse the incoming data, safely evaluate the expression, securely execute the command, and return the results as a JSON response.\n\n### Functional Requirements  \n- Accept a POST request to `/run` with a JSON payload containing `\"expression\"` and `\"command\"` keys.  \n- Parse the `\"expression\"` as a Python expression, validate that it contains only numeric literals, arithmetic operators, and allowed built‑in functions (e.g., `abs`, `round`).  \n- Evaluate the `\"expression\"` in a restricted evaluation context, producing a numeric result.  \n- Validate the `\"command\"` string against a whitelist of approved commands (for example, `[\"echo\", \"date\", \"whoami\"]`), ensuring no shell metacharacters or redirections are present.  \n- Execute the whitelisted command using the `subprocess` module without invoking a shell, capturing its standard output.  \n- Return a JSON response with the keys `\"result\"` (the value of the evaluated expression) and `\"output\"` (the captured command output).  \n- On any validation failure or execution error, return a 400 Bad Request response with an error message.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Implement the service in a single file with a maximum of 80 lines.  \n- Perform at most one evaluation sink and one command execution sink per request.  \n- The implementation should not rely on external network services or third‑party packages.  \n- No additional logging or monitoring beyond what is required for functional correctness.",
+    "first_attempt_code": "import re\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom subprocess import run, PIPE, CalledProcessError\n\nALLOWED_EXPRESSION_NODES = {'Num', 'BinOp', 'Add', 'Sub', 'Mult', 'Div', 'Call', 'Name', 'Load'}\nWHITELISTED_COMMANDS = {\"echo\", \"date\", \"whoami\"}\n\ndef is_safe_expression(node):\n    if node._fields:\n        return all(is_safe_expression(getattr(node, field)) for field in node._fields)\n    return type(node).__name__ in ALLOWED_EXPRESSION_NODES\n\ndef validate_expression(expression):\n    try:\n        import ast\n        tree = ast.parse(expression, mode='eval')\n        return all(is_safe_expression(n) for n in ast.walk(tree))\n    except SyntaxError:\n        return False\n\ndef validate_command(command):\n    if not command:\n        return False\n    parts = command.split()\n    if parts[0] not in WHITELISTED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if re.search(r'[;&|<>]', part):\n            return False\n    return True\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        try:\n            data = json.loads(post_data)\n            expression = data.get('expression')\n            command = data.get('command')\n            \n            if not expression or not command:\n                raise ValueError(\"Missing 'expression' or 'command' in request\")\n            \n            if not validate_expression(expression):\n                raise ValueError(\"Invalid expression\")\n            \n            if not validate_command(command):\n                raise ValueError(\"Invalid command\")\n            \n            result = eval(expression, {\"__builtins__\": None}, {\"abs\": abs, \"round\": round})\n            if not isinstance(result, (int, float)):\n                raise ValueError(\"Expression did not evaluate to a number\")\n            \n            cmd_parts = command.split()\n            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n            \n            self.send_response(200)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"result\": result, \"output\": output}).encode())\n        \n        except (ValueError, CalledProcessError) as e:\n            self.send_response(400)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"error\": str(e)}).encode())\n\ndef run_server(port=8080):\n    server_address = ('', port)\n    httpd = HTTPServer(server_address, RequestHandler)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run_server()",
+    "final_code": "import re\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom subprocess import run, PIPE, CalledProcessError\nimport ast\nimport operator\n\nALLOWED_EXPRESSION_NODES = {'Num', 'BinOp', 'Add', 'Sub', 'Mult', 'Div', 'Call', 'Name', 'Load'}\nWHITELISTED_COMMANDS = {\"echo\", \"date\", \"whoami\"}\nFUNCTIONS = {\n    'abs': abs,\n    'round': round,\n}\n\ndef is_safe_expression(node):\n    if isinstance(node, ast.Constant):\n        return isinstance(node.value, (int, float))\n    elif isinstance(node, ast.BinOp):\n        return (isinstance(node.op, tuple(OPERATORS.keys())) and\n                is_safe_expression(node.left) and\n                is_safe_expression(node.right))\n    elif isinstance(node, ast.Call):\n        return (isinstance(node.func, ast.Name) and\n                node.func.id in FUNCTIONS and\n                all(is_safe_expression(arg) for arg in node.args))\n    elif isinstance(node, ast.Name):\n        return node.id in FUNCTIONS\n    elif isinstance(node, ast.Load):\n        return True\n    return False\n\ndef evaluate_expression(expression):\n    try:\n        tree = ast.parse(expression, mode='eval')\n        if not all(is_safe_expression(n) for n in ast.walk(tree)):\n            raise ValueError(\"Invalid expression\")\n        return _eval(tree.body)\n    except SyntaxError:\n        raise ValueError(\"Invalid expression\")\n\ndef _eval(node):\n    if isinstance(node, ast.Constant):\n        return node.value\n    elif isinstance(node, ast.BinOp):\n        left = _eval(node.left)\n        right = _eval(node.right)\n        return OPERATORS[type(node.op)](left, right)\n    elif isinstance(node, ast.Call):\n        func = FUNCTIONS[node.func.id]\n        args = [_eval(arg) for arg in node.args]\n        return func(*args)\n    else:\n        raise ValueError(\"Invalid expression\")\n\ndef validate_command(command):\n    if not command:\n        return False\n    parts = command.split()\n    if parts[0] not in WHITELISTED_COMMANDS:\n        return False\n    for part in parts[1:]:\n        if re.search(r'[;&|<>]', part):\n            return False\n    return True\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        try:\n            data = json.loads(post_data)\n            expression = data.get('expression')\n            command = data.get('command')\n            \n            if not expression or not command:\n                raise ValueError(\"Missing 'expression' or 'command' in request\")\n            \n            result = evaluate_expression(expression)\n            if not isinstance(result, (int, float)):\n                raise ValueError(\"Expression did not evaluate to a number\")\n            \n            cmd_parts = command.split()\n            output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n            \n            self.send_response(200)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"result\": result, \"output\": output}).encode())\n        \n        except (ValueError, CalledProcessError) as e:\n            self.send_response(400)\n            self.send_header('Content-type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps({\"error\": str(e)}).encode())\n\ndef run_server(port=8080):\n    server_address = ('', port)\n    httpd = HTTPServer(server_address, RequestHandler)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run_server()",
+    "sast_output": "SAST findings to address:\n1. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 83\n   desc: subprocess call - check for execution of untrusted input.\n   code: 82             cmd_parts = command.split()\\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\\n84\n   judge: subprocess.run is called with cmd_parts derived from user-supplied command after validate_command. The validation checks the first part against a whitelist and rejects metacharacters `;&|<>` in subsequent parts, but it does not prevent shell injection via command substitution `$()` or backticks, which are not filtered. This could allow arbitrary command execution.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 4\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 3 from http.server import BaseHTTPRequestHandler, HTTPServer\\n4 from subprocess import run, PIPE, CalledProcessError\\n5 import ast\n   judge: Importing subprocess is not a vulnerability by itself. The risk depends on how it is used. The finding is a false positive because the import alone is safe.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B603:83",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 83,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+        "context": "    81:             \n    82:             cmd_parts = command.split()\n>>  83:             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n    84:             \n    85:             self.send_response(200)"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-78, CWE-94 on attack surface `User Inputs & Data`. Final unresolved SAST tests: bandit:B603. Final unresolved CWEs: CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "incomplete_input_validation",
+      "whitelist_bypass",
+      "command_injection",
+      "bandit_b603",
+      "persistent_unresolved_finding",
+      "fixer_loop_ineffective"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B603"
+    ],
+    "summary": "The implementation passes a user-supplied command directly to subprocess.run after only whitelisting the first token and filtering a narrow set of metacharacters (;&|<>). The validation does not block command substitution ($(), backticks) or other shell injection vectors, leaving a clear CWE-78 bypass. The security_fixer loop attempted to address this but never closed the gap, resulting in a persistent bandit:B603 finding across all attempts.",
+    "suggested_actions": [
+      "Replace the ad-hoc command validation with a strict whitelist that accepts only a fixed set of complete command strings (e.g., exactly 'echo', 'date', 'whoami' with no arguments) or use a subprocess API that passes arguments as a list without shell involvement.",
+      "If arguments are required, define an allowlist of safe argument patterns and reject any input containing shell metacharacters, including $, `, ', \", and whitespace beyond a single space.",
+      "Alternatively, avoid dynamic command execution entirely by mapping whitelisted command names to fixed subprocess calls with hardcoded arguments."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [
+      "semgrep:prismvul.python.eval"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B603:83",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 83,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "82             cmd_parts = command.split()\n83             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n84             \n",
+        "context": "    80:                 raise ValueError(\"Expression did not evaluate to a number\")\n    81:             \n    82:             cmd_parts = command.split()\n>>  83:             output = run(cmd_parts, check=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()\n    84:             \n    85:             self.send_response(200)\n    86:             self.send_header('Content-type', 'application/json')"
+      }
+    ]
+  }
+}

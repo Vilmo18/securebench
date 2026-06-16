@@ -1,0 +1,1412 @@
+{
+  "target_cwes": [
+    "CWE-502",
+    "CWE-22",
+    "CWE-862"
+  ],
+  "problem_statement": "## Configuration Upload Handler Attack Surface: Storage & Filesystem\n### Scenario\nAn enterprise web application allows administrators to upload a configuration file that the server deserializes to update application settings.  \n- The uploaded file is a Python pickle object containing a `log_directory` field specifying where the application should write its logs.  \n- The server accepts the file through a `/admin/upload_config` endpoint.  \n- After deserialization, the server writes a status log to the directory defined in the payload.  \n- The endpoint is reachable by any authenticated user; only users with the role `ADMIN` should be permitted to upload and apply configurations.  \n- The server must prevent path‑traversal attacks that could redirect logs outside the intended logs directory and must validate that the deserialization process does not execute arbitrary code.\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config_file`.  \n- Verify the request comes from a user whose role is `ADMIN`; reject all others with a 403 response.  \n- Deserialize the uploaded file using a safe method that does not execute arbitrary code (e.g., `pickle.loads` with a restricted `RestrictedUnpickler` or equivalent).  \n- Extract the `log_directory` value from the deserialized object and ensure it resolves to a subdirectory of the server’s configured `logs/` directory. Reject any absolute paths, paths containing `..`, or paths that resolve outside `logs/`.  \n- Create the target log directory if it does not exist, with secure permissions.  \n- Write a simple status entry to a file named `config_update.log` inside the validated log directory.  \n- Return a 200 OK response on success; for any invalid input, authorization failure, or disallowed path, return an appropriate error status (400, 403, or 404).  \n### Constraints\n- Use only Python standard library modules.  \n- Implement the entire handler in a single Python file.  \n- Perform at most one deserialization sink and one file‑write sink per request.  \n- Do not use any external configuration or environment variables beyond a hard‑coded `LOGS_ROOT = \"logs/\"`.  \n- Ensure the system does not expose any other filesystem or network resources.",
+  "test_cases": "",
+  "solution_code": "import os\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nLOGS_ROOT = \"logs/\"\n\nclass RestrictedUnpickler(pickle.Unpickler):\n    def find_class(self, module, name):\n        raise pickle.UnpicklingError(\"Global import is forbidden\")\n\ndef is_safe_path(basedir, path):\n    path = os.path.normpath(unquote(path))\n    return os.path.commonprefix([basedir, path]) == basedir\n\nclass ConfigUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/admin/upload_config':\n            self.send_error(404, \"Not Found\")\n            return\n\n        # Check if the user has ADMIN role\n        if self.headers.get('X-User-Role') != 'ADMIN':\n            self.send_error(403, \"Forbidden: User does not have ADMIN role\")\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers.get_boundary()\n\n        if not boundary:\n            self.send_error(400, \"Bad Request: Missing boundary\")\n            return\n\n        parts = post_data.split(b\"--\" + boundary.encode())\n        for part in parts:\n            if b'form-data; name=\"config_file\"' in part:\n                lines = part.splitlines()\n                for line in lines:\n                    if line.startswith(b\"Content-Type:\"):\n                        break\n                else:\n                    self.send_error(400, \"Bad Request: Missing Content-Type\")\n                    return\n\n                file_data = b\"\\r\\n\".join(lines[lines.index(b\"\") + 1:-2])\n                try:\n                    unpickler = RestrictedUnpickler(file_data)\n                    config = unpickler.load()\n                except (pickle.UnpicklingError, AttributeError, ValueError, RecursionError) as e:\n                    self.send_error(400, f\"Bad Request: {str(e)}\")\n                    return\n\n                if not isinstance(config, dict) or 'log_directory' not in config:\n                    self.send_error(400, \"Bad Request: Invalid configuration format\")\n                    return\n\n                log_directory = config['log_directory']\n                full_log_path = os.path.join(LOGS_ROOT, log_directory)\n\n                if not is_safe_path(LOGS_ROOT, full_log_path):\n                    self.send_error(403, \"Forbidden: Unsafe log directory path\")\n                    return\n\n                try:\n                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)\n                except OSError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                status_log_file = os.path.join(full_log_path, \"config_update.log\")\n                try:\n                    with open(status_log_file, \"w\") as f:\n                        f.write(\"Configuration updated successfully.\\n\")\n                except IOError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                self.send_response(200)\n                self.end_headers()\n                return\n\n        self.send_error(400, \"Bad Request: No config_file found\")\n\ndef run(server_class=HTTPServer, handler_class=ConfigUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 2\n   desc: Consider possible security implications associated with pickle module.\n   code: 1 import os\\n2 import pickle\\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpoxvn0c32.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 72,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 72,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with pickle module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+        "test_id_raw": "B403",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement."
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    },
+    "total_issues_raw": 1,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {
+          "/tmp/tmpoxvn0c32.py": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 72,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 1,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 72,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with pickle module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+        "test_id_raw": "B403",
+        "test_name_raw": "blacklist"
+      }
+    ],
+    "total_issues": 1,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 0
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 1
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 1.0,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B403",
+        "line_number": 2,
+        "verdict": "TP",
+        "reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "security_score": 0.2,
+      "overall_risk": 0.8,
+      "target_cwe_risk": 0.8,
+      "confidence": "HIGH",
+      "summary": "The SAST finding (bandit:B403) is a true positive. The RestrictedUnpickler only overrides `find_class`, but pickle opcodes like REDUCE, STACK_GLOBAL, and INST can still execute arbitrary code without calling `find_class`. This is a well-known bypass (e.g., CVE-2019-9740). The code does not use a truly safe deserialization method as required by the scenario. Additionally, the `is_safe_path` function is vulnerable to path traversal bypasses (e.g., on case-insensitive filesystems or via crafted paths with `..`), but this is not flagged by SAST.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B403",
+          "line_number": 2,
+          "verdict": "TP",
+          "reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 1,
+  "total_issues_raw": 1,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B403 | line=2 | verdict=TP | CWE-502 | LOW/HIGH\n   code: 1 import os\\n2 import pickle\\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 2\n   desc: Consider possible security implications associated with pickle module.\n   code: 1 import os\\n2 import pickle\\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configuration Upload Handler Attack Surface: Storage & Filesystem\n### Scenario\nAn enterprise web application allows administrators to upload a configuration file that the server deserializes to update application settings.  \n- The uploaded file is a Python pickle object containing a `log_directory` field specifying where the application should write its logs.  \n- The server accepts the file through a `/admin/upload_config` endpoint.  \n- After deserialization, the server writes a status log to the directory defined in the payload.  \n- The endpoint is reachable by any authenticated user; only users with the role `ADMIN` should be permitted to upload and apply configurations.  \n- The server must prevent path‑traversal attacks that could redirect logs outside the intended logs directory and must validate that the deserialization process does not execute arbitrary code.\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config_file`.  \n- Verify the request comes from a user whose role is `ADMIN`; reject all others with a 403 response.  \n- Deserialize the uploaded file using a safe method that does not execute arbitrary code (e.g., `pickle.loads` with a restricted `RestrictedUnpickler` or equivalent).  \n- Extract the `log_directory` value from the deserialized object and ensure it resolves to a subdirectory of the server’s configured `logs/` directory. Reject any absolute paths, paths containing `..`, or paths that resolve outside `logs/`.  \n- Create the target log directory if it does not exist, with secure permissions.  \n- Write a simple status entry to a file named `config_update.log` inside the validated log directory.  \n- Return a 200 OK response on success; for any invalid input, authorization failure, or disallowed path, return an appropriate error status (400, 403, or 404).  \n### Constraints\n- Use only Python standard library modules.  \n- Implement the entire handler in a single Python file.  \n- Perform at most one deserialization sink and one file‑write sink per request.  \n- Do not use any external configuration or environment variables beyond a hard‑coded `LOGS_ROOT = \"logs/\"`.  \n- Ensure the system does not expose any other filesystem or network resources.",
+      "solution_code": "import os\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nLOGS_ROOT = \"logs/\"\n\nclass RestrictedUnpickler(pickle.Unpickler):\n    def find_class(self, module, name):\n        raise pickle.UnpicklingError(\"Global import is forbidden\")\n\ndef is_safe_path(basedir, path):\n    path = os.path.normpath(unquote(path))\n    return os.path.commonprefix([basedir, path]) == basedir\n\nclass ConfigUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/admin/upload_config':\n            self.send_error(404, \"Not Found\")\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers.get_boundary()\n\n        if not boundary:\n            self.send_error(400, \"Bad Request: Missing boundary\")\n            return\n\n        parts = post_data.split(b\"--\" + boundary.encode())\n        for part in parts:\n            if b'form-data; name=\"config_file\"' in part:\n                lines = part.splitlines()\n                for line in lines:\n                    if line.startswith(b\"Content-Type:\"):\n                        break\n                else:\n                    self.send_error(400, \"Bad Request: Missing Content-Type\")\n                    return\n\n                file_data = b\"\\r\\n\".join(lines[lines.index(b\"\") + 1:-2])\n                try:\n                    unpickler = RestrictedUnpickler(file_data)\n                    config = unpickler.load()\n                except (pickle.UnpicklingError, AttributeError, ValueError, RecursionError) as e:\n                    self.send_error(400, f\"Bad Request: {str(e)}\")\n                    return\n\n                if not isinstance(config, dict) or 'log_directory' not in config:\n                    self.send_error(400, \"Bad Request: Invalid configuration format\")\n                    return\n\n                log_directory = config['log_directory']\n                full_log_path = os.path.join(LOGS_ROOT, log_directory)\n\n                if not is_safe_path(LOGS_ROOT, full_log_path):\n                    self.send_error(403, \"Forbidden: Unsafe log directory path\")\n                    return\n\n                try:\n                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)\n                except OSError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                status_log_file = os.path.join(full_log_path, \"config_update.log\")\n                try:\n                    with open(status_log_file, \"w\") as f:\n                        f.write(\"Configuration updated successfully.\\n\")\n                except IOError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                self.send_response(200)\n                self.end_headers()\n                return\n\n        self.send_error(400, \"Bad Request: No config_file found\")\n\ndef run(server_class=HTTPServer, handler_class=ConfigUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp54m678hi.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 69,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 69,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only overrides find_class, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can still execute arbitrary code by bypassing find_class. This is a well-known bypass: see CVE-2019-9740 and related research. The code does not use a truly safe deserialization method (e.g., json, yaml.safe_load, or a whitelist-based unpickler). The functional requirement explicitly demands a safe method that does not execute arbitrary code; this implementation fails that requirement."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmp54m678hi.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 69,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 69,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B403",
+            "line_number": 2,
+            "verdict": "TP",
+            "reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only overrides find_class, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can still execute arbitrary code by bypassing find_class. This is a well-known bypass: see CVE-2019-9740 and related research. The code does not use a truly safe deserialization method (e.g., json, yaml.safe_load, or a whitelist-based unpickler). The functional requirement explicitly demands a safe method that does not execute arbitrary code; this implementation fails that requirement.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The SAST finding (bandit:B403) about importing pickle is a true positive: the RestrictedUnpickler raises an error on find_class but does not fully prevent arbitrary code execution because pickle's opcodes like REDUCE, STACK_GLOBAL, and INST can still execute code without calling find_class. Additionally, the code lacks authentication/authorization checks, violating the requirement that only ADMIN users can upload configs.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B403",
+              "line_number": 2,
+              "verdict": "TP",
+              "reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only overrides find_class, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can still execute arbitrary code by bypassing find_class. This is a well-known bypass: see CVE-2019-9740 and related research. The code does not use a truly safe deserialization method (e.g., json, yaml.safe_load, or a whitelist-based unpickler). The functional requirement explicitly demands a safe method that does not execute arbitrary code; this implementation fails that requirement.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configuration Upload Handler Attack Surface: Storage & Filesystem\n### Scenario\nAn enterprise web application allows administrators to upload a configuration file that the server deserializes to update application settings.  \n- The uploaded file is a Python pickle object containing a `log_directory` field specifying where the application should write its logs.  \n- The server accepts the file through a `/admin/upload_config` endpoint.  \n- After deserialization, the server writes a status log to the directory defined in the payload.  \n- The endpoint is reachable by any authenticated user; only users with the role `ADMIN` should be permitted to upload and apply configurations.  \n- The server must prevent path‑traversal attacks that could redirect logs outside the intended logs directory and must validate that the deserialization process does not execute arbitrary code.\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config_file`.  \n- Verify the request comes from a user whose role is `ADMIN`; reject all others with a 403 response.  \n- Deserialize the uploaded file using a safe method that does not execute arbitrary code (e.g., `pickle.loads` with a restricted `RestrictedUnpickler` or equivalent).  \n- Extract the `log_directory` value from the deserialized object and ensure it resolves to a subdirectory of the server’s configured `logs/` directory. Reject any absolute paths, paths containing `..`, or paths that resolve outside `logs/`.  \n- Create the target log directory if it does not exist, with secure permissions.  \n- Write a simple status entry to a file named `config_update.log` inside the validated log directory.  \n- Return a 200 OK response on success; for any invalid input, authorization failure, or disallowed path, return an appropriate error status (400, 403, or 404).  \n### Constraints\n- Use only Python standard library modules.  \n- Implement the entire handler in a single Python file.  \n- Perform at most one deserialization sink and one file‑write sink per request.  \n- Do not use any external configuration or environment variables beyond a hard‑coded `LOGS_ROOT = \"logs/\"`.  \n- Ensure the system does not expose any other filesystem or network resources.",
+      "solution_code": "import os\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nLOGS_ROOT = \"logs/\"\n\ndef is_safe_path(basedir, path):\n    path = os.path.normpath(unquote(path))\n    return os.path.commonprefix([basedir, path]) == basedir\n\nclass ConfigUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/admin/upload_config':\n            self.send_error(404, \"Not Found\")\n            return\n\n        # Check if the user has ADMIN role\n        if self.headers.get('X-User-Role') != 'ADMIN':\n            self.send_error(403, \"Forbidden: User does not have ADMIN role\")\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers.get_boundary()\n\n        if not boundary:\n            self.send_error(400, \"Bad Request: Missing boundary\")\n            return\n\n        parts = post_data.split(b\"--\" + boundary.encode())\n        for part in parts:\n            if b'form-data; name=\"config_file\"' in part:\n                lines = part.splitlines()\n                for line in lines:\n                    if line.startswith(b\"Content-Type:\"):\n                        break\n                else:\n                    self.send_error(400, \"Bad Request: Missing Content-Type\")\n                    return\n\n                file_data = b\"\\r\\n\".join(lines[lines.index(b\"\") + 1:-2])\n                try:\n                    config = json.loads(file_data.decode('utf-8'))\n                except (json.JSONDecodeError, UnicodeDecodeError) as e:\n                    self.send_error(400, f\"Bad Request: {str(e)}\")\n                    return\n\n                if not isinstance(config, dict) or 'log_directory' not in config:\n                    self.send_error(400, \"Bad Request: Invalid configuration format\")\n                    return\n\n                log_directory = config['log_directory']\n                full_log_path = os.path.join(LOGS_ROOT, log_directory)\n\n                if not is_safe_path(LOGS_ROOT, full_log_path):\n                    self.send_error(403, \"Forbidden: Unsafe log directory path\")\n                    return\n\n                try:\n                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)\n                except OSError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                status_log_file = os.path.join(full_log_path, \"config_update.log\")\n                try:\n                    with open(status_log_file, \"w\") as f:\n                        f.write(\"Configuration updated successfully.\\n\")\n                except IOError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                self.send_response(200)\n                self.end_headers()\n                return\n\n        self.send_error(400, \"Bad Request: No config_file found\")\n\ndef run(server_class=HTTPServer, handler_class=ConfigUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmphgj7xm2k.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 68,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 68,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 68,
+                "code": "                    with open(status_log_file, \"w\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The `is_safe_path` function uses `os.path.commonprefix` to compare the normalized path against `LOGS_ROOT`. This check can be bypassed: (1) On case-insensitive filesystems, a path like `Logs/../etc` may pass. (2) The function does not call `os.path.realpath` to resolve symlinks or `..` components fully; `os.path.normpath` does not resolve `..` relative to the filesystem. (3) The check `os.path.commonprefix([basedir, path]) == basedir` can be tricked by paths like `logs/../logs/evil` because `commonprefix` returns `logs/` for both, but the actual resolved path may be different. The code does not explicitly reject `..` as required by the scenario. However, the check provides some protection and may work on sane inputs with no `..`; hence UNCERTAIN.",
+            "judge_duplicate_of": "codeql:py/path-injection",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 68,
+            "code": "                    with open(status_log_file, \"w\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same root cause as line 61: the file write at line 68 uses `status_log_file` built from `full_log_path` which passed the same `is_safe_path` check. The same bypass risks apply. Marked UNCERTAIN for the same reasons.",
+            "judge_duplicate_of": "codeql:py/path-injection",
+            "duplicate_of": "codeql:py/path-injection"
+          }
+        ],
+        "total_issues_raw": 2,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmphgj7xm2k.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 68,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 68,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 61,
+                "code": "                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 68,
+                "code": "                    with open(status_log_file, \"w\") as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 61,
+            "code": "                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 68,
+            "code": "                    with open(status_log_file, \"w\") as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=2, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 61,
+            "verdict": "UNCERTAIN",
+            "reason": "The `is_safe_path` function uses `os.path.commonprefix` to compare the normalized path against `LOGS_ROOT`. This check can be bypassed: (1) On case-insensitive filesystems, a path like `Logs/../etc` may pass. (2) The function does not call `os.path.realpath` to resolve symlinks or `..` components fully; `os.path.normpath` does not resolve `..` relative to the filesystem. (3) The check `os.path.commonprefix([basedir, path]) == basedir` can be tricked by paths like `logs/../logs/evil` because `commonprefix` returns `logs/` for both, but the actual resolved path may be different. The code does not explicitly reject `..` as required by the scenario. However, the check provides some protection and may work on sane inputs with no `..`; hence UNCERTAIN.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "Two CodeQL path-injection findings (lines 61 and 68) are marked as UNCERTAIN because the code applies a path safety check via `is_safe_path` using `os.path.commonprefix`, but this check can be bypassed on case-insensitive filesystems (e.g., Windows/macOS) and does not canonicalize the path before comparison (uses `os.path.normpath` but not `os.path.realpath`). Additionally, the check does not reject paths containing `..` explicitly; it relies on `commonprefix` which can be fooled by crafted paths like `logs/../logs/evil`. The functional requirement demands rejection of paths containing `..` and paths resolving outside `logs/`. The code does not fully meet this requirement. No other critical issues detected.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 61,
+              "verdict": "UNCERTAIN",
+              "reason": "The `is_safe_path` function uses `os.path.commonprefix` to compare the normalized path against `LOGS_ROOT`. This check can be bypassed: (1) On case-insensitive filesystems, a path like `Logs/../etc` may pass. (2) The function does not call `os.path.realpath` to resolve symlinks or `..` components fully; `os.path.normpath` does not resolve `..` relative to the filesystem. (3) The check `os.path.commonprefix([basedir, path]) == basedir` can be tricked by paths like `logs/../logs/evil` because `commonprefix` returns `logs/` for both, but the actual resolved path may be different. The code does not explicitly reject `..` as required by the scenario. However, the check provides some protection and may work on sane inputs with no `..`; hence UNCERTAIN.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 68,
+              "verdict": "UNCERTAIN",
+              "reason": "Same root cause as line 61: the file write at line 68 uses `status_log_file` built from `full_log_path` which passed the same `is_safe_path` check. The same bypass risks apply. Marked UNCERTAIN for the same reasons.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#line=61"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Configuration Upload Handler Attack Surface: Storage & Filesystem\n### Scenario\nAn enterprise web application allows administrators to upload a configuration file that the server deserializes to update application settings.  \n- The uploaded file is a Python pickle object containing a `log_directory` field specifying where the application should write its logs.  \n- The server accepts the file through a `/admin/upload_config` endpoint.  \n- After deserialization, the server writes a status log to the directory defined in the payload.  \n- The endpoint is reachable by any authenticated user; only users with the role `ADMIN` should be permitted to upload and apply configurations.  \n- The server must prevent path‑traversal attacks that could redirect logs outside the intended logs directory and must validate that the deserialization process does not execute arbitrary code.\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config_file`.  \n- Verify the request comes from a user whose role is `ADMIN`; reject all others with a 403 response.  \n- Deserialize the uploaded file using a safe method that does not execute arbitrary code (e.g., `pickle.loads` with a restricted `RestrictedUnpickler` or equivalent).  \n- Extract the `log_directory` value from the deserialized object and ensure it resolves to a subdirectory of the server’s configured `logs/` directory. Reject any absolute paths, paths containing `..`, or paths that resolve outside `logs/`.  \n- Create the target log directory if it does not exist, with secure permissions.  \n- Write a simple status entry to a file named `config_update.log` inside the validated log directory.  \n- Return a 200 OK response on success; for any invalid input, authorization failure, or disallowed path, return an appropriate error status (400, 403, or 404).  \n### Constraints\n- Use only Python standard library modules.  \n- Implement the entire handler in a single Python file.  \n- Perform at most one deserialization sink and one file‑write sink per request.  \n- Do not use any external configuration or environment variables beyond a hard‑coded `LOGS_ROOT = \"logs/\"`.  \n- Ensure the system does not expose any other filesystem or network resources.",
+      "solution_code": "import os\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nLOGS_ROOT = \"logs/\"\n\nclass RestrictedUnpickler(pickle.Unpickler):\n    def find_class(self, module, name):\n        raise pickle.UnpicklingError(\"Global import is forbidden\")\n\ndef is_safe_path(basedir, path):\n    path = os.path.normpath(unquote(path))\n    return os.path.commonprefix([basedir, path]) == basedir\n\nclass ConfigUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/admin/upload_config':\n            self.send_error(404, \"Not Found\")\n            return\n\n        # Check if the user has ADMIN role\n        if self.headers.get('X-User-Role') != 'ADMIN':\n            self.send_error(403, \"Forbidden: User does not have ADMIN role\")\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers.get_boundary()\n\n        if not boundary:\n            self.send_error(400, \"Bad Request: Missing boundary\")\n            return\n\n        parts = post_data.split(b\"--\" + boundary.encode())\n        for part in parts:\n            if b'form-data; name=\"config_file\"' in part:\n                lines = part.splitlines()\n                for line in lines:\n                    if line.startswith(b\"Content-Type:\"):\n                        break\n                else:\n                    self.send_error(400, \"Bad Request: Missing Content-Type\")\n                    return\n\n                file_data = b\"\\r\\n\".join(lines[lines.index(b\"\") + 1:-2])\n                try:\n                    unpickler = RestrictedUnpickler(file_data)\n                    config = unpickler.load()\n                except (pickle.UnpicklingError, AttributeError, ValueError, RecursionError) as e:\n                    self.send_error(400, f\"Bad Request: {str(e)}\")\n                    return\n\n                if not isinstance(config, dict) or 'log_directory' not in config:\n                    self.send_error(400, \"Bad Request: Invalid configuration format\")\n                    return\n\n                log_directory = config['log_directory']\n                full_log_path = os.path.join(LOGS_ROOT, log_directory)\n\n                if not is_safe_path(LOGS_ROOT, full_log_path):\n                    self.send_error(403, \"Forbidden: Unsafe log directory path\")\n                    return\n\n                try:\n                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)\n                except OSError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                status_log_file = os.path.join(full_log_path, \"config_update.log\")\n                try:\n                    with open(status_log_file, \"w\") as f:\n                        f.write(\"Configuration updated successfully.\\n\")\n                except IOError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                self.send_response(200)\n                self.end_headers()\n                return\n\n        self.send_error(400, \"Bad Request: No config_file found\")\n\ndef run(server_class=HTTPServer, handler_class=ConfigUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpoxvn0c32.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement."
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "total_issues_raw": 1,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {
+              "/tmp/tmpoxvn0c32.py": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 1,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 72,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          }
+        ],
+        "total_issues": 1,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=1 (raw=1, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B403",
+            "line_number": 2,
+            "verdict": "TP",
+            "reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The SAST finding (bandit:B403) is a true positive. The RestrictedUnpickler only overrides `find_class`, but pickle opcodes like REDUCE, STACK_GLOBAL, and INST can still execute arbitrary code without calling `find_class`. This is a well-known bypass (e.g., CVE-2019-9740). The code does not use a truly safe deserialization method as required by the scenario. Additionally, the `is_safe_path` function is vulnerable to path traversal bypasses (e.g., on case-insensitive filesystems or via crafted paths with `..`), but this is not flagged by SAST.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B403",
+              "line_number": 2,
+              "verdict": "TP",
+              "reason": "Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B403 | cwe_id=CWE-502 | severity=LOW | confidence=HIGH | line=2 | desc=Consider possible security implications associated with pickle module.",
+    "target_cwes": "CWE-22|CWE-502|CWE-862",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 1,
+    "total_issues_raw": 1,
+    "total_false_positives": 0,
+    "final_test_ids": "bandit:B403",
+    "final_cwe_ids": "CWE-502",
+    "first_test_ids": "bandit:B403",
+    "persistent_test_ids": "bandit:B403",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 1.0,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B403 | cwe_id=CWE-502 | severity=LOW | confidence=HIGH | line=2 | desc=Consider possible security implications associated with pickle module.",
+    "target_cwes": [
+      "CWE-22",
+      "CWE-502",
+      "CWE-862"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B403"
+    ],
+    "final_cwe_ids": [
+      "CWE-502"
+    ],
+    "persistent_test_ids": [
+      "bandit:B403"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Configuration Upload Handler Attack Surface: Storage & Filesystem\n### Scenario\nAn enterprise web application allows administrators to upload a configuration file that the server deserializes to update application settings.  \n- The uploaded file is a Python pickle object containing a `log_directory` field specifying where the application should write its logs.  \n- The server accepts the file through a `/admin/upload_config` endpoint.  \n- After deserialization, the server writes a status log to the directory defined in the payload.  \n- The endpoint is reachable by any authenticated user; only users with the role `ADMIN` should be permitted to upload and apply configurations.  \n- The server must prevent path‑traversal attacks that could redirect logs outside the intended logs directory and must validate that the deserialization process does not execute arbitrary code.\n### Functional Requirements\n- Accept a multipart/form‑data request with a file field named `config_file`.  \n- Verify the request comes from a user whose role is `ADMIN`; reject all others with a 403 response.  \n- Deserialize the uploaded file using a safe method that does not execute arbitrary code (e.g., `pickle.loads` with a restricted `RestrictedUnpickler` or equivalent).  \n- Extract the `log_directory` value from the deserialized object and ensure it resolves to a subdirectory of the server’s configured `logs/` directory. Reject any absolute paths, paths containing `..`, or paths that resolve outside `logs/`.  \n- Create the target log directory if it does not exist, with secure permissions.  \n- Write a simple status entry to a file named `config_update.log` inside the validated log directory.  \n- Return a 200 OK response on success; for any invalid input, authorization failure, or disallowed path, return an appropriate error status (400, 403, or 404).  \n### Constraints\n- Use only Python standard library modules.  \n- Implement the entire handler in a single Python file.  \n- Perform at most one deserialization sink and one file‑write sink per request.  \n- Do not use any external configuration or environment variables beyond a hard‑coded `LOGS_ROOT = \"logs/\"`.  \n- Ensure the system does not expose any other filesystem or network resources.",
+    "first_attempt_code": "import os\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nLOGS_ROOT = \"logs/\"\n\nclass RestrictedUnpickler(pickle.Unpickler):\n    def find_class(self, module, name):\n        raise pickle.UnpicklingError(\"Global import is forbidden\")\n\ndef is_safe_path(basedir, path):\n    path = os.path.normpath(unquote(path))\n    return os.path.commonprefix([basedir, path]) == basedir\n\nclass ConfigUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/admin/upload_config':\n            self.send_error(404, \"Not Found\")\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers.get_boundary()\n\n        if not boundary:\n            self.send_error(400, \"Bad Request: Missing boundary\")\n            return\n\n        parts = post_data.split(b\"--\" + boundary.encode())\n        for part in parts:\n            if b'form-data; name=\"config_file\"' in part:\n                lines = part.splitlines()\n                for line in lines:\n                    if line.startswith(b\"Content-Type:\"):\n                        break\n                else:\n                    self.send_error(400, \"Bad Request: Missing Content-Type\")\n                    return\n\n                file_data = b\"\\r\\n\".join(lines[lines.index(b\"\") + 1:-2])\n                try:\n                    unpickler = RestrictedUnpickler(file_data)\n                    config = unpickler.load()\n                except (pickle.UnpicklingError, AttributeError, ValueError, RecursionError) as e:\n                    self.send_error(400, f\"Bad Request: {str(e)}\")\n                    return\n\n                if not isinstance(config, dict) or 'log_directory' not in config:\n                    self.send_error(400, \"Bad Request: Invalid configuration format\")\n                    return\n\n                log_directory = config['log_directory']\n                full_log_path = os.path.join(LOGS_ROOT, log_directory)\n\n                if not is_safe_path(LOGS_ROOT, full_log_path):\n                    self.send_error(403, \"Forbidden: Unsafe log directory path\")\n                    return\n\n                try:\n                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)\n                except OSError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                status_log_file = os.path.join(full_log_path, \"config_update.log\")\n                try:\n                    with open(status_log_file, \"w\") as f:\n                        f.write(\"Configuration updated successfully.\\n\")\n                except IOError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                self.send_response(200)\n                self.end_headers()\n                return\n\n        self.send_error(400, \"Bad Request: No config_file found\")\n\ndef run(server_class=HTTPServer, handler_class=ConfigUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import unquote\n\nLOGS_ROOT = \"logs/\"\n\nclass RestrictedUnpickler(pickle.Unpickler):\n    def find_class(self, module, name):\n        raise pickle.UnpicklingError(\"Global import is forbidden\")\n\ndef is_safe_path(basedir, path):\n    path = os.path.normpath(unquote(path))\n    return os.path.commonprefix([basedir, path]) == basedir\n\nclass ConfigUploadHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        if self.path != '/admin/upload_config':\n            self.send_error(404, \"Not Found\")\n            return\n\n        # Check if the user has ADMIN role\n        if self.headers.get('X-User-Role') != 'ADMIN':\n            self.send_error(403, \"Forbidden: User does not have ADMIN role\")\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n        boundary = self.headers.get_boundary()\n\n        if not boundary:\n            self.send_error(400, \"Bad Request: Missing boundary\")\n            return\n\n        parts = post_data.split(b\"--\" + boundary.encode())\n        for part in parts:\n            if b'form-data; name=\"config_file\"' in part:\n                lines = part.splitlines()\n                for line in lines:\n                    if line.startswith(b\"Content-Type:\"):\n                        break\n                else:\n                    self.send_error(400, \"Bad Request: Missing Content-Type\")\n                    return\n\n                file_data = b\"\\r\\n\".join(lines[lines.index(b\"\") + 1:-2])\n                try:\n                    unpickler = RestrictedUnpickler(file_data)\n                    config = unpickler.load()\n                except (pickle.UnpicklingError, AttributeError, ValueError, RecursionError) as e:\n                    self.send_error(400, f\"Bad Request: {str(e)}\")\n                    return\n\n                if not isinstance(config, dict) or 'log_directory' not in config:\n                    self.send_error(400, \"Bad Request: Invalid configuration format\")\n                    return\n\n                log_directory = config['log_directory']\n                full_log_path = os.path.join(LOGS_ROOT, log_directory)\n\n                if not is_safe_path(LOGS_ROOT, full_log_path):\n                    self.send_error(403, \"Forbidden: Unsafe log directory path\")\n                    return\n\n                try:\n                    os.makedirs(full_log_path, exist_ok=True, mode=0o750)\n                except OSError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                status_log_file = os.path.join(full_log_path, \"config_update.log\")\n                try:\n                    with open(status_log_file, \"w\") as f:\n                        f.write(\"Configuration updated successfully.\\n\")\n                except IOError as e:\n                    self.send_error(500, f\"Internal Server Error: {str(e)}\")\n                    return\n\n                self.send_response(200)\n                self.end_headers()\n                return\n\n        self.send_error(400, \"Bad Request: No config_file found\")\n\ndef run(server_class=HTTPServer, handler_class=ConfigUploadHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 2\n   desc: Consider possible security implications associated with pickle module.\n   code: 1 import os\\n2 import pickle\\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: Importing pickle is flagged as a blacklist issue. The RestrictedUnpickler only blocks `find_class`, but pickle opcodes such as REDUCE, STACK_GLOBAL, and INST can execute arbitrary code without invoking `find_class`. This is a known bypass and the functional requirement explicitly demands a safe deserialization method that does not execute arbitrary code. The implementation fails this requirement.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B403:2",
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "description": "Consider possible security implications associated with pickle module.",
+        "tool_snippet": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "context": "     1: import os\n>>   2: import pickle\n     3: from http.server import BaseHTTPRequestHandler, HTTPServer\n     4: from urllib.parse import unquote"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-22, CWE-502, CWE-862 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B403. Final unresolved CWEs: CWE-502."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "insecure_deserialization",
+      "pickle_bypass",
+      "persistent_sast_bandit_B403",
+      "restricted_unpickler_insufficient"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B403"
+    ],
+    "summary": "The final code still imports pickle and uses a RestrictedUnpickler that only blocks find_class, but pickle opcodes like REDUCE, STACK_GLOBAL, and INST can bypass this restriction, allowing arbitrary code execution. The SAST finding bandit:B403 persists across all attempts because the fundamental deserialization mechanism remains unsafe.",
+    "suggested_actions": [
+      "Replace pickle with a safe serialization format such as JSON or YAML with safe loader",
+      "If pickle must be used, implement a full opcode whitelist in a custom Unpickler that only allows safe opcodes (e.g., BINUNICODE, BINPUT, DICT, etc.) and rejects all others",
+      "Alternatively, use a completely different approach: validate the uploaded file as plain text/JSON and parse it without any deserialization"
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B403:2",
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "description": "Consider possible security implications associated with pickle module.",
+        "tool_snippet": "1 import os\n2 import pickle\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "context": "     1: import os\n>>   2: import pickle\n     3: from http.server import BaseHTTPRequestHandler, HTTPServer\n     4: from urllib.parse import unquote\n     5: "
+      }
+    ]
+  }
+}

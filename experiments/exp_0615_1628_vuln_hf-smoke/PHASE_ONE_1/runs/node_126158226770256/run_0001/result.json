@@ -1,0 +1,2887 @@
+{
+  "target_cwes": [
+    "CWE-94",
+    "CWE-22"
+  ],
+  "problem_statement": "## Container Build Trigger  \nAttack Surface: Execution Environment & Infrastructure  \n\n### Scenario  \nAn internal web service exposes an endpoint `/build` that accepts a `project` query parameter. The value specifies the name of a project stored under a predefined `projects/` directory on the server. For each request, the service must locate the project's `Dockerfile`, read an optional `.env` file inside the project directory, and then invoke the Docker CLI to build an image tagged with the project name. The build command should use the environment variables defined in the `.env` file as build arguments. The service is intended to run inside a containerized environment where the Docker daemon is accessible.\n\n### Functional Requirements  \n- Accept a `project` query parameter from an HTTP request.  \n- Resolve the path to the project's root directory under the configured `projects/` directory, ensuring that no path traversal or absolute paths are allowed.  \n- Verify that the resolved directory contains a `Dockerfile`. If not, return an HTTP 400 error.  \n- If a `.env` file exists in the project directory, read its contents and prepare Docker build arguments in the form `--build-arg KEY=VALUE`.  \n- Construct a Docker build command that builds the image with the tag `<project>:latest` and passes the build arguments.  \n- Execute the Docker command using a standard library subprocess call, capture its stdout and stderr, and return them in the HTTP response.  \n- If the Docker command exits with a non-zero status, return an HTTP 500 response with the error output.  \n- Ensure that the command does not inadvertently execute arbitrary code or read files outside the project directory.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Keep the implementation in a single `.py` file suitable for deployment as a lightweight service.  \n- Perform at most one file-read sink (reading the `.env` file) and one command-execution sink (docker build) per request.  \n- Do not make network calls or depend on external services beyond the local Docker daemon.  \n- The code must run within a containerized environment where the Docker socket is mounted at `/var/run/docker.sock`.  \n- Do not use any third‑party packages or frameworks.  \n- The solution should be no more than 80 lines of Python code.",
+  "test_cases": "",
+  "solution_code": "import os\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass BuildTriggerHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith('/build'):\n            self.send_error(404, 'Not Found')\n            return\n\n        query = self.path.split('?', 1)\n        if len(query) != 2:\n            self.send_error(400, 'Bad Request: Missing project parameter')\n            return\n\n        params = dict(q.split('=') for q in query[1].split('&'))\n        project_name = params.get('project')\n        if not project_name or not project_name.isalnum():\n            self.send_error(400, 'Bad Request: Invalid project name')\n            return\n\n        base_dir = '/app/projects'\n        project_path = os.path.join(base_dir, project_name)\n\n        # Validate that the project path is within the base directory\n        if not os.path.commonpath([base_dir, project_path]) == base_dir:\n            self.send_error(400, 'Bad Request: Project directory not found')\n            return\n\n        dockerfile_path = os.path.join(project_path, 'Dockerfile')\n        if not os.path.isfile(dockerfile_path):\n            self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n            return\n\n        env_file_path = os.path.join(project_path, '.env')\n        build_args = []\n        if os.path.isfile(env_file_path):\n            with open(env_file_path, 'r') as env_file:\n                for line in env_file:\n                    line = line.strip()\n                    if line and not line.startswith('#'):\n                        key, value = line.split('=', 1)\n                        build_args.append(f'--build-arg {key}={value}')\n\n        build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n        try:\n            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n            self.send_response(200)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(result.stdout)\n        except subprocess.CalledProcessError as e:\n            self.send_response(500)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(e.stderr)\n\ndef run(server_class=HTTPServer, handler_class=BuildTriggerHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 31\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(dockerfile_path):\n   judge: The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.\n2. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 37\n   desc: This path depends on a [user-provided value](1).\n   code: if os.path.isfile(env_file_path):\n   judge: Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.\n3. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 38\n   desc: This path depends on a [user-provided value](1).\n   code: with open(env_file_path, 'r') as env_file:\n   judge: Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.\n4. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 47\n   desc: subprocess call - check for execution of untrusted input.\n   code: 46         try:\\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\\n48             self.send_response(200)\n   judge: The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 2\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 1 import os\\n2 import subprocess\\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpg87gpmxf.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 53,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 53,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1,
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "code": "        if not os.path.isfile(dockerfile_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "code": "        if os.path.isfile(env_file_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "            with open(env_file_path, 'r') as env_file:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      }
+    ],
+    "total_issues": 4,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 6,
+      "total_issues_post_dedup": 5
+    },
+    "false_positives": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "FP",
+        "judge_reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone."
+      }
+    ],
+    "total_issues_raw": 5,
+    "total_false_positives": 1,
+    "total_duplicates_removed": 0,
+    "fp_overrides": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 31,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 37,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 38,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      }
+    ],
+    "total_fp_overrides": 3
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpg87gpmxf.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 53,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 2,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 53,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 2,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/command-line-injection",
+            "test_name": "py/command-line-injection",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+            "description": "This command line depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 4,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B404",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-78",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 2,
+        "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with the subprocess module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+        "test_id_raw": "B404",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "test_name": "subprocess_without_shell_equals_true",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+        "description": "subprocess call - check for execution of untrusted input.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+        "test_id_raw": "B603",
+        "test_name_raw": "subprocess_without_shell_equals_true",
+        "dedup_test_ids": [
+          "bandit:B603",
+          "codeql:py/command-line-injection"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "code": "        if not os.path.isfile(dockerfile_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "code": "        if os.path.isfile(env_file_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "code": "            with open(env_file_path, 'r') as env_file:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 5,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 4
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "dedup": {
+      "removed_duplicates": 1,
+      "total_issues_pre_dedup": 6,
+      "total_issues_post_dedup": 5
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.9,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=3)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 31,
+        "verdict": "FP",
+        "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 37,
+        "verdict": "FP",
+        "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 38,
+        "verdict": "FP",
+        "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B603",
+        "line_number": 47,
+        "verdict": "UNCERTAIN",
+        "reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B404",
+        "line_number": 2,
+        "verdict": "FP",
+        "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.9,
+      "security_score": 0.4,
+      "overall_risk": 0.6,
+      "target_cwe_risk": 0.6,
+      "confidence": "HIGH",
+      "summary": "The code uses `os.path.commonpath` to prevent path traversal, which is a strong mitigation for CWE-22. However, the `.env` file parsing is unsafe: `line.split('=', 1)` can produce keys/values containing shell metacharacters, and these are passed as `--build-arg` arguments to `docker build`. An attacker who can write to the `.env` file (e.g., via a compromised project) can inject arbitrary Docker build arguments. The `subprocess.run` with list form prevents shell injection, but argument injection into `docker build` is still possible (e.g., `--build-arg 'APORT=--build-arg'` or `--build-arg 'A=--rm'`). The bandit B603 finding is UNCERTAIN because the list form does not protect against argument injection. The bandit B404 is a false positive (generic import warning). The `text=True` addition is a minor improvement but does not change security posture.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 31,
+          "verdict": "FP",
+          "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 37,
+          "verdict": "FP",
+          "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 38,
+          "verdict": "FP",
+          "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B603",
+          "line_number": 47,
+          "verdict": "UNCERTAIN",
+          "reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B404",
+          "line_number": 2,
+          "verdict": "FP",
+          "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 4,
+  "total_issues_raw": 5,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Execution Environment & Infrastructure",
+  "attack_surface": "Execution Environment & Infrastructure",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=31 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: if not os.path.isfile(dockerfile_path):\n2. codeql:py/path-injection | line=37 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: if os.path.isfile(env_file_path):\n3. codeql:py/path-injection | line=38 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: with open(env_file_path, 'r') as env_file:\n4. bandit:B603 | line=47 | verdict=UNCERTAIN | CWE-78 | HIGH/HIGH\n   code: 46         try:\\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\\n48             self.send_response(200)\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 31\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(dockerfile_path):\n2. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 37\n   desc: This path depends on a [user-provided value](1).\n   code: if os.path.isfile(env_file_path):\n3. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 38\n   desc: This path depends on a [user-provided value](1).\n   code: with open(env_file_path, 'r') as env_file:\n4. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 47\n   desc: subprocess call - check for execution of untrusted input.\n   code: 46         try:\\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\\n48             self.send_response(200)\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Container Build Trigger  \nAttack Surface: Execution Environment & Infrastructure  \n\n### Scenario  \nAn internal web service exposes an endpoint `/build` that accepts a `project` query parameter. The value specifies the name of a project stored under a predefined `projects/` directory on the server. For each request, the service must locate the project's `Dockerfile`, read an optional `.env` file inside the project directory, and then invoke the Docker CLI to build an image tagged with the project name. The build command should use the environment variables defined in the `.env` file as build arguments. The service is intended to run inside a containerized environment where the Docker daemon is accessible.\n\n### Functional Requirements  \n- Accept a `project` query parameter from an HTTP request.  \n- Resolve the path to the project's root directory under the configured `projects/` directory, ensuring that no path traversal or absolute paths are allowed.  \n- Verify that the resolved directory contains a `Dockerfile`. If not, return an HTTP 400 error.  \n- If a `.env` file exists in the project directory, read its contents and prepare Docker build arguments in the form `--build-arg KEY=VALUE`.  \n- Construct a Docker build command that builds the image with the tag `<project>:latest` and passes the build arguments.  \n- Execute the Docker command using a standard library subprocess call, capture its stdout and stderr, and return them in the HTTP response.  \n- If the Docker command exits with a non-zero status, return an HTTP 500 response with the error output.  \n- Ensure that the command does not inadvertently execute arbitrary code or read files outside the project directory.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Keep the implementation in a single `.py` file suitable for deployment as a lightweight service.  \n- Perform at most one file-read sink (reading the `.env` file) and one command-execution sink (docker build) per request.  \n- Do not make network calls or depend on external services beyond the local Docker daemon.  \n- The code must run within a containerized environment where the Docker socket is mounted at `/var/run/docker.sock`.  \n- Do not use any third‑party packages or frameworks.  \n- The solution should be no more than 80 lines of Python code.",
+      "solution_code": "import os\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass BuildTriggerHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith('/build'):\n            self.send_error(404, 'Not Found')\n            return\n\n        query = self.path.split('?', 1)\n        if len(query) != 2:\n            self.send_error(400, 'Bad Request: Missing project parameter')\n            return\n\n        params = dict(q.split('=') for q in query[1].split('&'))\n        project_name = params.get('project')\n        if not project_name or not project_name.isalnum():\n            self.send_error(400, 'Bad Request: Invalid project name')\n            return\n\n        base_dir = '/app/projects'\n        project_path = os.path.join(base_dir, project_name)\n\n        if not os.path.isdir(project_path) or not project_path.startswith(base_dir):\n            self.send_error(400, 'Bad Request: Project directory not found')\n            return\n\n        dockerfile_path = os.path.join(project_path, 'Dockerfile')\n        if not os.path.isfile(dockerfile_path):\n            self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n            return\n\n        env_file_path = os.path.join(project_path, '.env')\n        build_args = []\n        if os.path.isfile(env_file_path):\n            with open(env_file_path, 'r') as env_file:\n                for line in env_file:\n                    line = line.strip()\n                    if line and not line.startswith('#'):\n                        key, value = line.split('=', 1)\n                        build_args.append(f'--build-arg {key}={value}')\n\n        build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n        try:\n            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n            self.send_response(200)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(result.stdout)\n        except subprocess.CalledProcessError as e:\n            self.send_response(500)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(e.stderr)\n\ndef run(server_class=HTTPServer, handler_class=BuildTriggerHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "45         try:\n46             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n47             self.send_response(200)\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp5ruc7w6e.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 25,
+                "code": "        if not os.path.isdir(project_path) or not project_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "        if not os.path.isfile(dockerfile_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 36,
+                "code": "        if os.path.isfile(env_file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            with open(env_file_path, 'r') as env_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45         try:\n46             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n47             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "subprocess.run with list form avoids shell injection, but the build_args list is constructed from .env file content without validation. An attacker who can control the .env file (e.g., via path traversal or write access) can inject arbitrary --build-arg values, potentially leading to argument injection into docker build. The list form does not protect against argument injection."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 25,
+            "code": "        if not os.path.isdir(project_path) or not project_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `startswith(base_dir)` check provides a guard. However, symbolic links or race conditions could bypass the startswith check; not fully proven safe."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same root cause as line 25; path depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 36,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same root cause as line 25; path depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same root cause as line 25; file read depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU."
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone."
+          }
+        ],
+        "total_issues_raw": 6,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "45         try:\n46             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n47             self.send_response(200)\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp5ruc7w6e.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 46,
+                "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 25,
+                "code": "        if not os.path.isdir(project_path) or not project_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 30,
+                "code": "        if not os.path.isfile(dockerfile_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 36,
+                "code": "        if os.path.isfile(env_file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "            with open(env_file_path, 'r') as env_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 46,
+            "code": "45         try:\n46             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n47             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 25,
+            "code": "        if not os.path.isdir(project_path) or not project_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 30,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 36,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 7,
+          "total_issues_post_dedup": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=5 (raw=6, false_pos=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 25,
+            "verdict": "UNCERTAIN",
+            "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `startswith(base_dir)` check provides a guard. However, symbolic links or race conditions could bypass the startswith check; not fully proven safe.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 30,
+            "verdict": "UNCERTAIN",
+            "reason": "Same root cause as line 25; path depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 36,
+            "verdict": "UNCERTAIN",
+            "reason": "Same root cause as line 25; path depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 37,
+            "verdict": "UNCERTAIN",
+            "reason": "Same root cause as line 25; file read depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 46,
+            "verdict": "UNCERTAIN",
+            "reason": "subprocess.run with list form avoids shell injection, but the build_args list is constructed from .env file content without validation. An attacker who can control the .env file (e.g., via path traversal or write access) can inject arbitrary --build-arg values, potentially leading to argument injection into docker build. The list form does not protect against argument injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 2,
+            "verdict": "FP",
+            "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code has path traversal risk mitigated by isalnum() check and startswith guard, but the .env file parsing is unsafe (split without validation), and the subprocess call passes untrusted build-arg values. SAST findings are mostly UNCERTAIN due to partial mitigations, but the .env parsing is a real injection vector.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 25,
+              "verdict": "UNCERTAIN",
+              "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `startswith(base_dir)` check provides a guard. However, symbolic links or race conditions could bypass the startswith check; not fully proven safe.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 30,
+              "verdict": "UNCERTAIN",
+              "reason": "Same root cause as line 25; path depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 36,
+              "verdict": "UNCERTAIN",
+              "reason": "Same root cause as line 25; path depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 37,
+              "verdict": "UNCERTAIN",
+              "reason": "Same root cause as line 25; file read depends on user input but mitigated by isalnum and startswith. Residual risk from symlinks or TOCTOU.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 46,
+              "verdict": "UNCERTAIN",
+              "reason": "subprocess.run with list form avoids shell injection, but the build_args list is constructed from .env file content without validation. An attacker who can control the .env file (e.g., via path traversal or write access) can inject arbitrary --build-arg values, potentially leading to argument injection into docker build. The list form does not protect against argument injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 2,
+              "verdict": "FP",
+              "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Container Build Trigger  \nAttack Surface: Execution Environment & Infrastructure  \n\n### Scenario  \nAn internal web service exposes an endpoint `/build` that accepts a `project` query parameter. The value specifies the name of a project stored under a predefined `projects/` directory on the server. For each request, the service must locate the project's `Dockerfile`, read an optional `.env` file inside the project directory, and then invoke the Docker CLI to build an image tagged with the project name. The build command should use the environment variables defined in the `.env` file as build arguments. The service is intended to run inside a containerized environment where the Docker daemon is accessible.\n\n### Functional Requirements  \n- Accept a `project` query parameter from an HTTP request.  \n- Resolve the path to the project's root directory under the configured `projects/` directory, ensuring that no path traversal or absolute paths are allowed.  \n- Verify that the resolved directory contains a `Dockerfile`. If not, return an HTTP 400 error.  \n- If a `.env` file exists in the project directory, read its contents and prepare Docker build arguments in the form `--build-arg KEY=VALUE`.  \n- Construct a Docker build command that builds the image with the tag `<project>:latest` and passes the build arguments.  \n- Execute the Docker command using a standard library subprocess call, capture its stdout and stderr, and return them in the HTTP response.  \n- If the Docker command exits with a non-zero status, return an HTTP 500 response with the error output.  \n- Ensure that the command does not inadvertently execute arbitrary code or read files outside the project directory.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Keep the implementation in a single `.py` file suitable for deployment as a lightweight service.  \n- Perform at most one file-read sink (reading the `.env` file) and one command-execution sink (docker build) per request.  \n- Do not make network calls or depend on external services beyond the local Docker daemon.  \n- The code must run within a containerized environment where the Docker socket is mounted at `/var/run/docker.sock`.  \n- Do not use any third‑party packages or frameworks.  \n- The solution should be no more than 80 lines of Python code.",
+      "solution_code": "import os\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass BuildTriggerHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith('/build'):\n            self.send_error(404, 'Not Found')\n            return\n\n        query = self.path.split('?', 1)\n        if len(query) != 2:\n            self.send_error(400, 'Bad Request: Missing project parameter')\n            return\n\n        params = dict(q.split('=') for q in query[1].split('&'))\n        project_name = params.get('project')\n        if not project_name or not project_name.isalnum():\n            self.send_error(400, 'Bad Request: Invalid project name')\n            return\n\n        base_dir = '/app/projects'\n        project_path = os.path.join(base_dir, project_name)\n\n        # Validate that the project path is within the base directory\n        if not os.path.commonpath([base_dir, project_path]) == base_dir:\n            self.send_error(400, 'Bad Request: Project directory not found')\n            return\n\n        dockerfile_path = os.path.join(project_path, 'Dockerfile')\n        if not os.path.isfile(dockerfile_path):\n            self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n            return\n\n        env_file_path = os.path.join(project_path, '.env')\n        build_args = []\n        if os.path.isfile(env_file_path):\n            with open(env_file_path, 'r') as env_file:\n                for line in env_file:\n                    line = line.strip()\n                    if line and not line.startswith('#'):\n                        key, value = line.split('=', 1)\n                        build_args.append(f'--build-arg {key}={value}')\n\n        build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n        try:\n            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n            self.send_response(200)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(result.stdout)\n        except subprocess.CalledProcessError as e:\n            self.send_response(500)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(e.stderr)\n\ndef run(server_class=HTTPServer, handler_class=BuildTriggerHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n48             self.send_response(200)\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpyad2rnn6.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "        if not os.path.isfile(dockerfile_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "        if os.path.isfile(env_file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            with open(env_file_path, 'r') as env_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n48             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 31,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 37,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 3
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n48             self.send_response(200)\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpyad2rnn6.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "        if not os.path.isfile(dockerfile_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "        if os.path.isfile(env_file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            with open(env_file_path, 'r') as env_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n48             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=3)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 31,
+            "verdict": "FP",
+            "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 37,
+            "verdict": "FP",
+            "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "verdict": "FP",
+            "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 47,
+            "verdict": "UNCERTAIN",
+            "reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 2,
+            "verdict": "FP",
+            "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code uses `os.path.commonpath` to prevent path traversal, which is a strong mitigation for CWE-22. However, the `.env` file parsing is unsafe: `line.split('=', 1)` can produce keys/values containing shell metacharacters, and these are passed as `--build-arg` arguments to `docker build`. An attacker who can write to the `.env` file (e.g., via a compromised project) can inject arbitrary Docker build arguments. The `subprocess.run` with list form prevents shell injection, but argument injection into `docker build` is still possible (e.g., `--build-arg 'APORT=--build-arg'` or `--build-arg 'A=--rm'`). The bandit B603 finding is UNCERTAIN because the list form does not protect against argument injection. The bandit B404 is a false positive (generic import warning).",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 31,
+              "verdict": "FP",
+              "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 37,
+              "verdict": "FP",
+              "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 38,
+              "verdict": "FP",
+              "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 47,
+              "verdict": "UNCERTAIN",
+              "reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 2,
+              "verdict": "FP",
+              "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Container Build Trigger  \nAttack Surface: Execution Environment & Infrastructure  \n\n### Scenario  \nAn internal web service exposes an endpoint `/build` that accepts a `project` query parameter. The value specifies the name of a project stored under a predefined `projects/` directory on the server. For each request, the service must locate the project's `Dockerfile`, read an optional `.env` file inside the project directory, and then invoke the Docker CLI to build an image tagged with the project name. The build command should use the environment variables defined in the `.env` file as build arguments. The service is intended to run inside a containerized environment where the Docker daemon is accessible.\n\n### Functional Requirements  \n- Accept a `project` query parameter from an HTTP request.  \n- Resolve the path to the project's root directory under the configured `projects/` directory, ensuring that no path traversal or absolute paths are allowed.  \n- Verify that the resolved directory contains a `Dockerfile`. If not, return an HTTP 400 error.  \n- If a `.env` file exists in the project directory, read its contents and prepare Docker build arguments in the form `--build-arg KEY=VALUE`.  \n- Construct a Docker build command that builds the image with the tag `<project>:latest` and passes the build arguments.  \n- Execute the Docker command using a standard library subprocess call, capture its stdout and stderr, and return them in the HTTP response.  \n- If the Docker command exits with a non-zero status, return an HTTP 500 response with the error output.  \n- Ensure that the command does not inadvertently execute arbitrary code or read files outside the project directory.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Keep the implementation in a single `.py` file suitable for deployment as a lightweight service.  \n- Perform at most one file-read sink (reading the `.env` file) and one command-execution sink (docker build) per request.  \n- Do not make network calls or depend on external services beyond the local Docker daemon.  \n- The code must run within a containerized environment where the Docker socket is mounted at `/var/run/docker.sock`.  \n- Do not use any third‑party packages or frameworks.  \n- The solution should be no more than 80 lines of Python code.",
+      "solution_code": "import os\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass BuildTriggerHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith('/build'):\n            self.send_error(404, 'Not Found')\n            return\n\n        query = self.path.split('?', 1)\n        if len(query) != 2:\n            self.send_error(400, 'Bad Request: Missing project parameter')\n            return\n\n        params = dict(q.split('=') for q in query[1].split('&'))\n        project_name = params.get('project')\n        if not project_name or not project_name.isalnum():\n            self.send_error(400, 'Bad Request: Invalid project name')\n            return\n\n        base_dir = '/app/projects'\n        project_path = os.path.join(base_dir, project_name)\n\n        # Validate that the project path is within the base directory\n        if not os.path.commonpath([base_dir, project_path]) == base_dir:\n            self.send_error(400, 'Bad Request: Project directory not found')\n            return\n\n        dockerfile_path = os.path.join(project_path, 'Dockerfile')\n        if not os.path.isfile(dockerfile_path):\n            self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n            return\n\n        env_file_path = os.path.join(project_path, '.env')\n        build_args = []\n        if os.path.isfile(env_file_path):\n            with open(env_file_path, 'r') as env_file:\n                for line in env_file:\n                    line = line.strip()\n                    if line and not line.startswith('#'):\n                        key, value = line.split('=', 1)\n                        build_args.append(f'--build-arg {key}={value}')\n\n        build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n        try:\n            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n            self.send_response(200)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(result.stdout)\n        except subprocess.CalledProcessError as e:\n            self.send_response(500)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(e.stderr)\n\ndef run(server_class=HTTPServer, handler_class=BuildTriggerHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpg87gpmxf.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "        if not os.path.isfile(dockerfile_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "        if os.path.isfile(env_file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            with open(env_file_path, 'r') as env_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1,
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        },
+        "false_positives": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "FP",
+            "judge_reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone."
+          }
+        ],
+        "total_issues_raw": 5,
+        "total_false_positives": 1,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 31,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 37,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 3
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B404",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 2,
+                "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with the subprocess module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B603",
+                "test_name": "subprocess_without_shell_equals_true",
+                "cwe_id": "CWE-78",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+                "description": "subprocess call - check for execution of untrusted input.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpg87gpmxf.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 2,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 53,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 2,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/command-line-injection",
+                "test_name": "py/command-line-injection",
+                "cwe_id": "CWE-78",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 47,
+                "code": "            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+                "description": "This command line depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 31,
+                "code": "        if not os.path.isfile(dockerfile_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 37,
+                "code": "        if os.path.isfile(env_file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 38,
+                "code": "            with open(env_file_path, 'r') as env_file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B404",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-78",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 2,
+            "code": "1 import os\n2 import subprocess\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with the subprocess module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b404-import-subprocess",
+            "test_id_raw": "B404",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B603",
+            "test_name": "subprocess_without_shell_equals_true",
+            "cwe_id": "CWE-78",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 47,
+            "code": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+            "description": "subprocess call - check for execution of untrusted input.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/plugins/b603_subprocess_without_shell_equals_true.html",
+            "test_id_raw": "B603",
+            "test_name_raw": "subprocess_without_shell_equals_true",
+            "dedup_test_ids": [
+              "bandit:B603",
+              "codeql:py/command-line-injection"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 31,
+            "code": "        if not os.path.isfile(dockerfile_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 37,
+            "code": "        if os.path.isfile(env_file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 38,
+            "code": "            with open(env_file_path, 'r') as env_file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 5,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "dedup": {
+          "removed_duplicates": 1,
+          "total_issues_pre_dedup": 6,
+          "total_issues_post_dedup": 5
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=5, false_pos=1, fp_overrides=3)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 31,
+            "verdict": "FP",
+            "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 37,
+            "verdict": "FP",
+            "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 38,
+            "verdict": "FP",
+            "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B603",
+            "line_number": 47,
+            "verdict": "UNCERTAIN",
+            "reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B404",
+            "line_number": 2,
+            "verdict": "FP",
+            "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.4,
+          "overall_risk": 0.6,
+          "target_cwe_risk": 0.6,
+          "confidence": "HIGH",
+          "summary": "The code uses `os.path.commonpath` to prevent path traversal, which is a strong mitigation for CWE-22. However, the `.env` file parsing is unsafe: `line.split('=', 1)` can produce keys/values containing shell metacharacters, and these are passed as `--build-arg` arguments to `docker build`. An attacker who can write to the `.env` file (e.g., via a compromised project) can inject arbitrary Docker build arguments. The `subprocess.run` with list form prevents shell injection, but argument injection into `docker build` is still possible (e.g., `--build-arg 'APORT=--build-arg'` or `--build-arg 'A=--rm'`). The bandit B603 finding is UNCERTAIN because the list form does not protect against argument injection. The bandit B404 is a false positive (generic import warning). The `text=True` addition is a minor improvement but does not change security posture.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 31,
+              "verdict": "FP",
+              "reason": "The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 37,
+              "verdict": "FP",
+              "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 38,
+              "verdict": "FP",
+              "reason": "Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B603",
+              "line_number": 47,
+              "verdict": "UNCERTAIN",
+              "reason": "The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B404",
+              "line_number": 2,
+              "verdict": "FP",
+              "reason": "This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=31 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": "CWE-22|CWE-94",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 4,
+    "total_issues_raw": 5,
+    "total_false_positives": 1,
+    "final_test_ids": "bandit:B603|codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22|CWE-78",
+    "first_test_ids": "bandit:B603|codeql:py/path-injection",
+    "persistent_test_ids": "bandit:B603|codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.9,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=31 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": [
+      "CWE-22",
+      "CWE-94"
+    ],
+    "attack_surface": "Execution Environment & Infrastructure",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22",
+      "CWE-78"
+    ],
+    "persistent_test_ids": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Container Build Trigger  \nAttack Surface: Execution Environment & Infrastructure  \n\n### Scenario  \nAn internal web service exposes an endpoint `/build` that accepts a `project` query parameter. The value specifies the name of a project stored under a predefined `projects/` directory on the server. For each request, the service must locate the project's `Dockerfile`, read an optional `.env` file inside the project directory, and then invoke the Docker CLI to build an image tagged with the project name. The build command should use the environment variables defined in the `.env` file as build arguments. The service is intended to run inside a containerized environment where the Docker daemon is accessible.\n\n### Functional Requirements  \n- Accept a `project` query parameter from an HTTP request.  \n- Resolve the path to the project's root directory under the configured `projects/` directory, ensuring that no path traversal or absolute paths are allowed.  \n- Verify that the resolved directory contains a `Dockerfile`. If not, return an HTTP 400 error.  \n- If a `.env` file exists in the project directory, read its contents and prepare Docker build arguments in the form `--build-arg KEY=VALUE`.  \n- Construct a Docker build command that builds the image with the tag `<project>:latest` and passes the build arguments.  \n- Execute the Docker command using a standard library subprocess call, capture its stdout and stderr, and return them in the HTTP response.  \n- If the Docker command exits with a non-zero status, return an HTTP 500 response with the error output.  \n- Ensure that the command does not inadvertently execute arbitrary code or read files outside the project directory.\n\n### Constraints  \n- Use only Python standard library modules.  \n- Keep the implementation in a single `.py` file suitable for deployment as a lightweight service.  \n- Perform at most one file-read sink (reading the `.env` file) and one command-execution sink (docker build) per request.  \n- Do not make network calls or depend on external services beyond the local Docker daemon.  \n- The code must run within a containerized environment where the Docker socket is mounted at `/var/run/docker.sock`.  \n- Do not use any third‑party packages or frameworks.  \n- The solution should be no more than 80 lines of Python code.",
+    "first_attempt_code": "import os\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass BuildTriggerHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith('/build'):\n            self.send_error(404, 'Not Found')\n            return\n\n        query = self.path.split('?', 1)\n        if len(query) != 2:\n            self.send_error(400, 'Bad Request: Missing project parameter')\n            return\n\n        params = dict(q.split('=') for q in query[1].split('&'))\n        project_name = params.get('project')\n        if not project_name or not project_name.isalnum():\n            self.send_error(400, 'Bad Request: Invalid project name')\n            return\n\n        base_dir = '/app/projects'\n        project_path = os.path.join(base_dir, project_name)\n\n        if not os.path.isdir(project_path) or not project_path.startswith(base_dir):\n            self.send_error(400, 'Bad Request: Project directory not found')\n            return\n\n        dockerfile_path = os.path.join(project_path, 'Dockerfile')\n        if not os.path.isfile(dockerfile_path):\n            self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n            return\n\n        env_file_path = os.path.join(project_path, '.env')\n        build_args = []\n        if os.path.isfile(env_file_path):\n            with open(env_file_path, 'r') as env_file:\n                for line in env_file:\n                    line = line.strip()\n                    if line and not line.startswith('#'):\n                        key, value = line.split('=', 1)\n                        build_args.append(f'--build-arg {key}={value}')\n\n        build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n        try:\n            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n            self.send_response(200)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(result.stdout)\n        except subprocess.CalledProcessError as e:\n            self.send_response(500)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(e.stderr)\n\ndef run(server_class=HTTPServer, handler_class=BuildTriggerHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport subprocess\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass BuildTriggerHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if not self.path.startswith('/build'):\n            self.send_error(404, 'Not Found')\n            return\n\n        query = self.path.split('?', 1)\n        if len(query) != 2:\n            self.send_error(400, 'Bad Request: Missing project parameter')\n            return\n\n        params = dict(q.split('=') for q in query[1].split('&'))\n        project_name = params.get('project')\n        if not project_name or not project_name.isalnum():\n            self.send_error(400, 'Bad Request: Invalid project name')\n            return\n\n        base_dir = '/app/projects'\n        project_path = os.path.join(base_dir, project_name)\n\n        # Validate that the project path is within the base directory\n        if not os.path.commonpath([base_dir, project_path]) == base_dir:\n            self.send_error(400, 'Bad Request: Project directory not found')\n            return\n\n        dockerfile_path = os.path.join(project_path, 'Dockerfile')\n        if not os.path.isfile(dockerfile_path):\n            self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n            return\n\n        env_file_path = os.path.join(project_path, '.env')\n        build_args = []\n        if os.path.isfile(env_file_path):\n            with open(env_file_path, 'r') as env_file:\n                for line in env_file:\n                    line = line.strip()\n                    if line and not line.startswith('#'):\n                        key, value = line.split('=', 1)\n                        build_args.append(f'--build-arg {key}={value}')\n\n        build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n        try:\n            result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n            self.send_response(200)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(result.stdout)\n        except subprocess.CalledProcessError as e:\n            self.send_response(500)\n            self.send_header('Content-type', 'text/plain')\n            self.end_headers()\n            self.wfile.write(e.stderr)\n\ndef run(server_class=HTTPServer, handler_class=BuildTriggerHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 31\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(dockerfile_path):\n   judge: The path is constructed from user input, but `project_name` is validated with `isalnum()` and the `os.path.commonpath` check ensures the resolved path is within `base_dir`. This effectively prevents path traversal. The SAST tool cannot statically verify the commonpath guard, but manual review confirms it is safe.\n2. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 37\n   desc: This path depends on a [user-provided value](1).\n   code: if os.path.isfile(env_file_path):\n   judge: Same path construction as line 31; the commonpath guard prevents traversal. The file existence check does not introduce new risk.\n3. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 38\n   desc: This path depends on a [user-provided value](1).\n   code: with open(env_file_path, 'r') as env_file:\n   judge: Same path construction as line 31; the commonpath guard prevents traversal. The `open()` call is safe because the path is guaranteed to be under `base_dir`.\n4. [UNCERTAIN] CWE-78 | HIGH | HIGH | bandit:B603 subprocess_without_shell_equals_true\n   line: 47\n   desc: subprocess call - check for execution of untrusted input.\n   code: 46         try:\\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\\n48             self.send_response(200)\n   judge: The subprocess call uses list form, preventing shell injection. However, the `build_args` list is constructed from `.env` file content without validation. An attacker who controls the `.env` file can inject arbitrary `--build-arg` values, potentially leading to argument injection into `docker build`. This is a real risk but depends on whether the attacker can write to the `.env` file. The SAST tool flags it generically.\n\nFlagged as likely false positives by judge (informational):\n1. [FP] CWE-78 | LOW | HIGH | bandit:B404 blacklist\n   line: 2\n   desc: Consider possible security implications associated with the subprocess module.\n   code: 1 import os\\n2 import subprocess\\n3 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: This is a generic blacklist warning about importing subprocess. The code uses subprocess.run with list form, which is the recommended safe pattern. No actual vulnerability is introduced by the import alone.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:31",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if not os.path.isfile(dockerfile_path):",
+        "context": "    29: \n    30:         dockerfile_path = os.path.join(project_path, 'Dockerfile')\n>>  31:         if not os.path.isfile(dockerfile_path):\n    32:             self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n    33:             return"
+      },
+      {
+        "signature": "codeql:py/path-injection:37",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if os.path.isfile(env_file_path):",
+        "context": "    35:         env_file_path = os.path.join(project_path, '.env')\n    36:         build_args = []\n>>  37:         if os.path.isfile(env_file_path):\n    38:             with open(env_file_path, 'r') as env_file:\n    39:                 for line in env_file:"
+      },
+      {
+        "signature": "codeql:py/path-injection:38",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(env_file_path, 'r') as env_file:",
+        "context": "    36:         build_args = []\n    37:         if os.path.isfile(env_file_path):\n>>  38:             with open(env_file_path, 'r') as env_file:\n    39:                 for line in env_file:\n    40:                     line = line.strip()"
+      },
+      {
+        "signature": "bandit:B603:47",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+        "context": "    45:         build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n    46:         try:\n>>  47:             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n    48:             self.send_response(200)\n    49:             self.send_header('Content-type', 'text/plain')"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-22, CWE-94 on attack surface `Execution Environment & Infrastructure`. Final unresolved SAST tests: bandit:B603, codeql:py/path-injection. Final unresolved CWEs: CWE-22, CWE-78."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "unresolved_sast_findings",
+      "persistent_sast_findings",
+      "bandit:B603",
+      "codeql:py/path-injection",
+      "argument_injection",
+      "env_file_validation_missing",
+      "fixer_loop_ineffective"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B603",
+      "codeql:py/path-injection"
+    ],
+    "summary": "The code correctly addresses path traversal via isalnum() and commonpath checks, but the SAST tools cannot statically verify these runtime guards, causing persistent path-injection flags. The critical unresolved issue is bandit:B603: the .env file content is read and injected into docker build arguments without sanitization, enabling argument injection if an attacker controls the .env file. The fixer loop repeatedly attempted to resolve the path-injection findings without addressing the root cause of the subprocess argument injection.",
+    "suggested_actions": [
+      "Add strict validation for .env file lines: allow only alphanumeric keys and values, reject special characters like '--' or '#' that could be used for argument injection.",
+      "Consider using a whitelist of allowed environment variable names or parsing the .env file with a dedicated safe parser that rejects malformed lines.",
+      "If the .env file is user-controlled, validate that keys match a predefined pattern (e.g., /^[A-Z_][A-Z0-9_]*$/) and values do not contain shell metacharacters or newlines.",
+      "Alternatively, hardcode allowed build arguments or use a configuration file that is not user-writable."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:31",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 31,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if not os.path.isfile(dockerfile_path):",
+        "context": "    28:             return\n    29: \n    30:         dockerfile_path = os.path.join(project_path, 'Dockerfile')\n>>  31:         if not os.path.isfile(dockerfile_path):\n    32:             self.send_error(400, 'Bad Request: Dockerfile not found in project directory')\n    33:             return\n    34: "
+      },
+      {
+        "signature": "codeql:py/path-injection:37",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 37,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if os.path.isfile(env_file_path):",
+        "context": "    34: \n    35:         env_file_path = os.path.join(project_path, '.env')\n    36:         build_args = []\n>>  37:         if os.path.isfile(env_file_path):\n    38:             with open(env_file_path, 'r') as env_file:\n    39:                 for line in env_file:\n    40:                     line = line.strip()"
+      },
+      {
+        "signature": "codeql:py/path-injection:38",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 38,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(env_file_path, 'r') as env_file:",
+        "context": "    35:         env_file_path = os.path.join(project_path, '.env')\n    36:         build_args = []\n    37:         if os.path.isfile(env_file_path):\n>>  38:             with open(env_file_path, 'r') as env_file:\n    39:                 for line in env_file:\n    40:                     line = line.strip()\n    41:                     if line and not line.startswith('#'):"
+      },
+      {
+        "signature": "bandit:B603:47",
+        "tool": "bandit",
+        "test_id": "bandit:B603",
+        "cwe_id": "CWE-78",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 47,
+        "description": "subprocess call - check for execution of untrusted input.",
+        "tool_snippet": "46         try:\n47             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n48             self.send_response(200)\n",
+        "context": "    44: \n    45:         build_command = ['docker', 'build'] + build_args + ['-t', f'{project_name}:latest', project_path]\n    46:         try:\n>>  47:             result = subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n    48:             self.send_response(200)\n    49:             self.send_header('Content-type', 'text/plain')\n    50:             self.end_headers()"
+      }
+    ]
+  }
+}

@@ -1,0 +1,3048 @@
+{
+  "target_cwes": [
+    "CWE-502",
+    "CWE-22"
+  ],
+  "problem_statement": "## Configuration Upload & Retrieval\nAttack Surface: Storage & Filesystem\n### Scenario\nAn internal web service provides administrators with the ability to upload custom configuration files and later retrieve them for inspection. The upload endpoint accepts a single file named `config.bin` which contains a Python pickled dictionary with two fields: `name` (the desired filename for the configuration) and `settings` (a dictionary of configuration values). The service must safely deserialize the pickled payload, enforce that the `name` does not contain path traversal or other prohibited characters, and store the configuration as a JSON file inside a dedicated `configs/` directory. A separate download endpoint receives a query parameter `file` and returns the requested JSON configuration, applying the same path validation rules.\n### Functional Requirements\n- Accept a multipart/form-data request with a field `config.bin`.  \n- Load the uploaded file into memory and unpickle it.  \n- Verify the unpickled object is a dictionary containing string keys `name` and `settings`.  \n- Reject any payload that does not meet this schema.  \n- Ensure the value of `name` contains only alphanumeric characters, dashes, and underscores; reject any value containing path separators, null bytes, or traversal sequences.  \n- Resolve the destination path as `configs/<name>.json` relative to the server's configuration directory.  \n- Write `settings` as a JSON file to the resolved path, creating any missing intermediate directories.  \n- For the download endpoint, accept a query parameter `file`, validate it with the same rules, resolve it to `configs/<file>.json`, and return the JSON content with appropriate headers.  \n- Any request that fails validation should result in a 400 Bad Request response.  \n### Constraints\n- Use only Python standard library modules.  \n- Implement all logic in a single file.  \n- Perform at most one file‑write sink per request.  \n- Do not use any external processing services.",
+  "test_cases": "",
+  "solution_code": "import os\nimport json\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    CONFIG_DIR = 'configs'\n\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        try:\n            config_dict = pickle.loads(post_data)\n        except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n            self.send_error(400, 'Invalid pickle data')\n            return\n\n        if not isinstance(config_dict, dict) or 'name' not in config_dict or 'settings' not in config_dict:\n            self.send_error(400, 'Invalid configuration format')\n            return\n\n        name = config_dict['name']\n        settings = config_dict['settings']\n\n        if not isinstance(name, str) or not isinstance(settings, dict):\n            self.send_error(400, 'Invalid configuration types')\n            return\n\n        if not self.is_valid_filename(name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n\n        try:\n            os.makedirs(os.path.dirname(file_path), exist_ok=True)\n            with open(file_path, 'w') as f:\n                json.dump(settings, f)\n        except IOError:\n            self.send_error(500, 'Failed to write configuration file')\n            return\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration uploaded successfully')\n\n    def do_GET(self):\n        if self.path != '/download':\n            self.send_error(404)\n            return\n\n        query_components = parse_qs(urlparse(self.path).query)\n        file_name = query_components.get('file', [None])[0]\n\n        if not file_name or not self.is_valid_filename(file_name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n\n        if not os.path.isfile(file_path):\n            self.send_error(404, 'File not found')\n            return\n\n        try:\n            with open(file_path, 'r') as f:\n                config_content = f.read()\n        except IOError:\n            self.send_error(500, 'Failed to read configuration file')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(config_content.encode())\n\n    @staticmethod\n    def is_valid_filename(filename):\n        if not all(c.isalnum() or c in '-_' for c in filename):\n            return False\n        if os.path.sep in filename or os.pardir in filename or '\\x00' in filename:\n            return False\n        return True\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 19\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 18         try:\\n19             config_dict = pickle.loads(post_data)\\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n   judge: pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive.\n2. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 42\n   desc: This path depends on a [user-provided value](1).\n   code: os.makedirs(os.path.dirname(file_path), exist_ok=True)\n   judge: The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.\n3. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 43\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, 'w') as f:\n   judge: Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.\n4. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 67\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(file_path):\n   judge: The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.\n5. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 72\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, 'r') as f:\n   judge: Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.\n6. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 3\n   desc: Consider possible security implications associated with pickle module.\n   code: 2 import json\\n3 import pickle\\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpjgrw3re3.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.pickle-load",
+            "test_name": "prismvul.python.pickle-load",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "            config_dict = pickle.loads(post_data)",
+            "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/unsafe-deserialization",
+            "test_name": "py/unsafe-deserialization",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "            config_dict = pickle.loads(post_data)",
+            "description": "Unsafe deserialization depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 67,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 5,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with pickle module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+        "test_id_raw": "B403",
+        "test_name_raw": "blacklist",
+        "judge_verdict": "TP",
+        "judge_reason": "Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input."
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+        "test_id_raw": "B301",
+        "test_name_raw": "blacklist",
+        "dedup_test_ids": [
+          "bandit:B301",
+          "codeql:py/unsafe-deserialization",
+          "semgrep:prismvul.python.pickle-load"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 2,
+        "judge_verdict": "TP",
+        "judge_reason": "pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive."
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 42,
+        "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "code": "            with open(file_path, 'w') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 67,
+        "code": "        if not os.path.isfile(file_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 72,
+        "code": "            with open(file_path, 'r') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "UNCERTAIN",
+        "judge_reason": "Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.",
+        "judge_verdict_original": "FP",
+        "judge_override": "fp_high_risk_override"
+      }
+    ],
+    "total_issues": 6,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 6
+    },
+    "dedup": {
+      "removed_duplicates": 2,
+      "total_issues_pre_dedup": 8,
+      "total_issues_post_dedup": 6
+    },
+    "total_issues_raw": 6,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 0,
+    "fp_overrides": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 42,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 43,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 67,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 72,
+        "severity": "HIGH",
+        "confidence": "HIGH"
+      }
+    ],
+    "total_fp_overrides": 4
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+          }
+        ],
+        "total_issues": 2,
+        "metrics": {
+          "/tmp/tmpjgrw3re3.py": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 2,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 1,
+            "SEVERITY.MEDIUM": 1,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 76,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 1,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 2
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [
+          {
+            "tool": "semgrep",
+            "test_id": "prismvul.python.pickle-load",
+            "test_name": "prismvul.python.pickle-load",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "            config_dict = pickle.loads(post_data)",
+            "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+            "more_info": null
+          }
+        ],
+        "total_issues": 1,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 1
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/unsafe-deserialization",
+            "test_name": "py/unsafe-deserialization",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "            config_dict = pickle.loads(post_data)",
+            "description": "Unsafe deserialization depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 67,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 5,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 5
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "description": "Consider possible security implications associated with pickle module.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+        "test_id_raw": "B403",
+        "test_name_raw": "blacklist"
+      },
+      {
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "test_name": "blacklist",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+        "test_id_raw": "B301",
+        "test_name_raw": "blacklist",
+        "dedup_test_ids": [
+          "bandit:B301",
+          "codeql:py/unsafe-deserialization",
+          "semgrep:prismvul.python.pickle-load"
+        ],
+        "dedup_tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "dedup_count": 2
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 42,
+        "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "code": "            with open(file_path, 'w') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 67,
+        "code": "        if not os.path.isfile(file_path):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 72,
+        "code": "            with open(file_path, 'r') as f:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      }
+    ],
+    "total_issues": 6,
+    "severity_breakdown": {
+      "LOW": 1,
+      "MEDIUM": 0,
+      "HIGH": 5
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 6
+    },
+    "dedup": {
+      "removed_duplicates": 2,
+      "total_issues_pre_dedup": 8,
+      "total_issues_post_dedup": 6
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 1.0,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0, fp_overrides=4)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "bandit:B301",
+        "line_number": 19,
+        "verdict": "TP",
+        "reason": "pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 42,
+        "verdict": "FP",
+        "reason": "The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 43,
+        "verdict": "FP",
+        "reason": "Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 67,
+        "verdict": "FP",
+        "reason": "The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 72,
+        "verdict": "FP",
+        "reason": "Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "bandit:B403",
+        "line_number": 3,
+        "verdict": "TP",
+        "reason": "Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 1.0,
+      "security_score": 0.2,
+      "overall_risk": 0.8,
+      "target_cwe_risk": 0.8,
+      "confidence": "HIGH",
+      "summary": "The code uses pickle.loads on untrusted user input, which is a critical security vulnerability (CWE-502). The path injection findings are mitigated by the strict filename validation, but the pickle deserialization risk is severe and cannot be fixed by validation alone. The SAST findings for CWE-502 are true positives; the CWE-22 findings are false positives due to the allowlist validation.",
+      "sast_review": [
+        {
+          "test_id": "bandit:B301",
+          "line_number": 19,
+          "verdict": "TP",
+          "reason": "pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 42,
+          "verdict": "FP",
+          "reason": "The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 43,
+          "verdict": "FP",
+          "reason": "Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 67,
+          "verdict": "FP",
+          "reason": "The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.",
+          "fix": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 72,
+          "verdict": "FP",
+          "reason": "Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.",
+          "fix": ""
+        },
+        {
+          "test_id": "bandit:B403",
+          "line_number": 3,
+          "verdict": "TP",
+          "reason": "Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input.",
+          "fix": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 6,
+  "total_issues_raw": 6,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Storage & Filesystem",
+  "attack_surface": "Storage & Filesystem",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. bandit:B301 | line=19 | verdict=TP | CWE-502 | HIGH/HIGH\n   code: 18         try:\\n19             config_dict = pickle.loads(post_data)\\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n2. codeql:py/path-injection | line=42 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: os.makedirs(os.path.dirname(file_path), exist_ok=True)\n3. codeql:py/path-injection | line=43 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: with open(file_path, 'w') as f:\n4. codeql:py/path-injection | line=67 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: if not os.path.isfile(file_path):\n5. codeql:py/path-injection | line=72 | verdict=UNCERTAIN (override from FP) | CWE-22 | HIGH/HIGH\n   code: with open(file_path, 'r') as f:\n6. bandit:B403 | line=3 | verdict=TP | CWE-502 | LOW/HIGH\n   code: 2 import json\\n3 import pickle\\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 19\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 18         try:\\n19             config_dict = pickle.loads(post_data)\\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n2. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 42\n   desc: This path depends on a [user-provided value](1).\n   code: os.makedirs(os.path.dirname(file_path), exist_ok=True)\n3. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 43\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, 'w') as f:\n4. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 67\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(file_path):\n5. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 72\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, 'r') as f:\n6. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 3\n   desc: Consider possible security implications associated with pickle module.\n   code: 2 import json\\n3 import pickle\\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Configuration Upload & Retrieval\nAttack Surface: Storage & Filesystem\n### Scenario\nAn internal web service provides administrators with the ability to upload custom configuration files and later retrieve them for inspection. The upload endpoint accepts a single file named `config.bin` which contains a Python pickled dictionary with two fields: `name` (the desired filename for the configuration) and `settings` (a dictionary of configuration values). The service must safely deserialize the pickled payload, enforce that the `name` does not contain path traversal or other prohibited characters, and store the configuration as a JSON file inside a dedicated `configs/` directory. A separate download endpoint receives a query parameter `file` and returns the requested JSON configuration, applying the same path validation rules.\n### Functional Requirements\n- Accept a multipart/form-data request with a field `config.bin`.  \n- Load the uploaded file into memory and unpickle it.  \n- Verify the unpickled object is a dictionary containing string keys `name` and `settings`.  \n- Reject any payload that does not meet this schema.  \n- Ensure the value of `name` contains only alphanumeric characters, dashes, and underscores; reject any value containing path separators, null bytes, or traversal sequences.  \n- Resolve the destination path as `configs/<name>.json` relative to the server's configuration directory.  \n- Write `settings` as a JSON file to the resolved path, creating any missing intermediate directories.  \n- For the download endpoint, accept a query parameter `file`, validate it with the same rules, resolve it to `configs/<file>.json`, and return the JSON content with appropriate headers.  \n- Any request that fails validation should result in a 400 Bad Request response.  \n### Constraints\n- Use only Python standard library modules.  \n- Implement all logic in a single file.  \n- Perform at most one file‑write sink per request.  \n- Do not use any external processing services.",
+      "solution_code": "import os\nimport json\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    CONFIG_DIR = 'configs'\n\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        try:\n            config_dict = pickle.loads(post_data)\n        except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n            self.send_error(400, 'Invalid pickle data')\n            return\n\n        if not isinstance(config_dict, dict) or 'name' not in config_dict or 'settings' not in config_dict:\n            self.send_error(400, 'Invalid configuration format')\n            return\n\n        name = config_dict['name']\n        settings = config_dict['settings']\n\n        if not isinstance(name, str) or not isinstance(settings, dict):\n            self.send_error(400, 'Invalid configuration types')\n            return\n\n        if not self.is_valid_filename(name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n\n        try:\n            os.makedirs(os.path.dirname(file_path), exist_ok=True)\n            with open(file_path, 'w') as f:\n                json.dump(settings, f)\n        except IOError:\n            self.send_error(500, 'Failed to write configuration file')\n            return\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration uploaded successfully')\n\n    def do_GET(self):\n        if self.path != '/download':\n            self.send_error(404)\n            return\n\n        query_components = parse_qs(urlparse(self.path).query)\n        file_name = query_components.get('file', [None])[0]\n\n        if not file_name or not self.is_valid_filename(file_name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n\n        if not os.path.isfile(file_path):\n            self.send_error(404, 'File not found')\n            return\n\n        try:\n            with open(file_path, 'r') as f:\n                config_content = f.read()\n        except IOError:\n            self.send_error(500, 'Failed to read configuration file')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(config_content.encode())\n\n    @staticmethod\n    def is_valid_filename(filename):\n        if not all(c.isalnum() or c in '-_' for c in filename):\n            return False\n        if os.path.sep in filename or os.pardir in filename or '\\x00' in filename:\n            return False\n        return True\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp9n3vot6d.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/unsafe-deserialization",
+                "test_name": "py/unsafe-deserialization",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Unsafe deserialization depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 42,
+                "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 43,
+                "code": "            with open(file_path, 'w') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 67,
+                "code": "        if not os.path.isfile(file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 72,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing pickle is flagged as a potential risk. Since the code uses pickle.loads on untrusted data, this import is indeed a security concern. True positive."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "codeql:py/unsafe-deserialization",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "pickle.loads is called on user-controlled POST data (line 19). The input is untrusted and pickle deserialization can execute arbitrary code. No sandboxing or safe alternative is used. This is a true positive."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The file_path is constructed from user-controlled `name` (via pickle) and passed to os.makedirs. Although is_valid_filename filters path separators and traversal sequences, the pickle deserialization itself is the bigger risk; the path injection is still a valid concern because validation could be bypassed if pickle is exploited. However, the validation is present and seems correct, so this is technically FP if pickle risk were ignored, but since pickle is already TP, the overall risk is real. Verdict TP because the path is still user-influenced."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same as line 42: open() uses user-controlled path. Validation exists but cannot be fully trusted given pickle compromise. True positive in context."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 67,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "os.path.isfile() uses file_name from GET query parameter. is_valid_filename is applied, so path traversal is blocked. However, the query parameter is user-controlled and the validation is the only guard; if there were a bypass, it would be exploitable. Given the validation is correct, this could be argued as FP, but the SAST tool flags it because it sees user input reaching a filesystem API. I lean TP because the risk is not zero (e.g., encoding tricks)."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same as line 67: open() on user-controlled path. Validation present, but still flagged. True positive due to residual risk."
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 8,
+          "total_issues_post_dedup": 6
+        },
+        "total_issues_raw": 6,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmp9n3vot6d.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/unsafe-deserialization",
+                "test_name": "py/unsafe-deserialization",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Unsafe deserialization depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 42,
+                "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 43,
+                "code": "            with open(file_path, 'w') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 67,
+                "code": "        if not os.path.isfile(file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 72,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "codeql:py/unsafe-deserialization",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 67,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 8,
+          "total_issues_post_dedup": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B301",
+            "line_number": 19,
+            "verdict": "TP",
+            "reason": "pickle.loads is called on user-controlled POST data (line 19). The input is untrusted and pickle deserialization can execute arbitrary code. No sandboxing or safe alternative is used. This is a true positive.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 42,
+            "verdict": "TP",
+            "reason": "The file_path is constructed from user-controlled `name` (via pickle) and passed to os.makedirs. Although is_valid_filename filters path separators and traversal sequences, the pickle deserialization itself is the bigger risk; the path injection is still a valid concern because validation could be bypassed if pickle is exploited. However, the validation is present and seems correct, so this is technically FP if pickle risk were ignored, but since pickle is already TP, the overall risk is real. Verdict TP because the path is still user-influenced.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 43,
+            "verdict": "TP",
+            "reason": "Same as line 42: open() uses user-controlled path. Validation exists but cannot be fully trusted given pickle compromise. True positive in context.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 67,
+            "verdict": "TP",
+            "reason": "os.path.isfile() uses file_name from GET query parameter. is_valid_filename is applied, so path traversal is blocked. However, the query parameter is user-controlled and the validation is the only guard; if there were a bypass, it would be exploitable. Given the validation is correct, this could be argued as FP, but the SAST tool flags it because it sees user input reaching a filesystem API. I lean TP because the risk is not zero (e.g., encoding tricks).",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 72,
+            "verdict": "TP",
+            "reason": "Same as line 67: open() on user-controlled path. Validation present, but still flagged. True positive due to residual risk.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B403",
+            "line_number": 3,
+            "verdict": "TP",
+            "reason": "Importing pickle is flagged as a potential risk. Since the code uses pickle.loads on untrusted data, this import is indeed a security concern. True positive.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 1.0,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code uses pickle.loads on untrusted data (CWE-502) which is a critical security vulnerability. The path traversal protections via is_valid_filename are present, but the pickle deserialization risk is severe and cannot be mitigated by validation alone. The SAST findings are all true positives.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B301",
+              "line_number": 19,
+              "verdict": "TP",
+              "reason": "pickle.loads is called on user-controlled POST data (line 19). The input is untrusted and pickle deserialization can execute arbitrary code. No sandboxing or safe alternative is used. This is a true positive.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 42,
+              "verdict": "TP",
+              "reason": "The file_path is constructed from user-controlled `name` (via pickle) and passed to os.makedirs. Although is_valid_filename filters path separators and traversal sequences, the pickle deserialization itself is the bigger risk; the path injection is still a valid concern because validation could be bypassed if pickle is exploited. However, the validation is present and seems correct, so this is technically FP if pickle risk were ignored, but since pickle is already TP, the overall risk is real. Verdict TP because the path is still user-influenced.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 43,
+              "verdict": "TP",
+              "reason": "Same as line 42: open() uses user-controlled path. Validation exists but cannot be fully trusted given pickle compromise. True positive in context.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 67,
+              "verdict": "TP",
+              "reason": "os.path.isfile() uses file_name from GET query parameter. is_valid_filename is applied, so path traversal is blocked. However, the query parameter is user-controlled and the validation is the only guard; if there were a bypass, it would be exploitable. Given the validation is correct, this could be argued as FP, but the SAST tool flags it because it sees user input reaching a filesystem API. I lean TP because the risk is not zero (e.g., encoding tricks).",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 72,
+              "verdict": "TP",
+              "reason": "Same as line 67: open() on user-controlled path. Validation present, but still flagged. True positive due to residual risk.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B403",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "Importing pickle is flagged as a potential risk. Since the code uses pickle.loads on untrusted data, this import is indeed a security concern. True positive.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Configuration Upload & Retrieval\nAttack Surface: Storage & Filesystem\n### Scenario\nAn internal web service provides administrators with the ability to upload custom configuration files and later retrieve them for inspection. The upload endpoint accepts a single file named `config.bin` which contains a Python pickled dictionary with two fields: `name` (the desired filename for the configuration) and `settings` (a dictionary of configuration values). The service must safely deserialize the pickled payload, enforce that the `name` does not contain path traversal or other prohibited characters, and store the configuration as a JSON file inside a dedicated `configs/` directory. A separate download endpoint receives a query parameter `file` and returns the requested JSON configuration, applying the same path validation rules.\n### Functional Requirements\n- Accept a multipart/form-data request with a field `config.bin`.  \n- Load the uploaded file into memory and unpickle it.  \n- Verify the unpickled object is a dictionary containing string keys `name` and `settings`.  \n- Reject any payload that does not meet this schema.  \n- Ensure the value of `name` contains only alphanumeric characters, dashes, and underscores; reject any value containing path separators, null bytes, or traversal sequences.  \n- Resolve the destination path as `configs/<name>.json` relative to the server's configuration directory.  \n- Write `settings` as a JSON file to the resolved path, creating any missing intermediate directories.  \n- For the download endpoint, accept a query parameter `file`, validate it with the same rules, resolve it to `configs/<file>.json`, and return the JSON content with appropriate headers.  \n- Any request that fails validation should result in a 400 Bad Request response.  \n### Constraints\n- Use only Python standard library modules.  \n- Implement all logic in a single file.  \n- Perform at most one file‑write sink per request.  \n- Do not use any external processing services.",
+      "solution_code": "import os\nimport json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    CONFIG_DIR = 'configs'\n\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        try:\n            config_dict = json.loads(post_data)\n        except json.JSONDecodeError:\n            self.send_error(400, 'Invalid JSON data')\n            return\n\n        if not isinstance(config_dict, dict) or 'name' not in config_dict or 'settings' not in config_dict:\n            self.send_error(400, 'Invalid configuration format')\n            return\n\n        name = config_dict['name']\n        settings = config_dict['settings']\n\n        if not isinstance(name, str) or not isinstance(settings, dict):\n            self.send_error(400, 'Invalid configuration types')\n            return\n\n        if not self.is_valid_filename(name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n\n        try:\n            os.makedirs(os.path.dirname(file_path), exist_ok=True)\n            with open(file_path, 'w') as f:\n                json.dump(settings, f)\n        except IOError:\n            self.send_error(500, 'Failed to write configuration file')\n            return\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration uploaded successfully')\n\n    def do_GET(self):\n        if self.path != '/download':\n            self.send_error(404)\n            return\n\n        query_components = parse_qs(urlparse(self.path).query)\n        file_name = query_components.get('file', [None])[0]\n\n        if not file_name or not self.is_valid_filename(file_name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n\n        if not os.path.isfile(file_path):\n            self.send_error(404, 'File not found')\n            return\n\n        try:\n            with open(file_path, 'r') as f:\n                config_content = f.read()\n        except IOError:\n            self.send_error(500, 'Failed to read configuration file')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(config_content.encode())\n\n    @staticmethod\n    def is_valid_filename(filename):\n        if not all(c.isalnum() or c in '-_' for c in filename):\n            return False\n        if os.path.sep in filename or os.pardir in filename or '\\x00' in filename:\n            return False\n        return True\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmp7jtrkres.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 75,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 75,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 42,
+                "code": "            with open(file_path, 'w') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 66,
+                "code": "        if not os.path.isfile(file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 71,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The `file_path` is constructed from `name` which passes through `is_valid_filename`. This method only allows alphanumeric characters, dashes, and underscores, and explicitly rejects path separators, `..`, and null bytes. Therefore `name` cannot contain any path traversal sequences, making the path safe. The SAST tool does not model the custom validation logic.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same reason as line 41: the `file_path` passed to `open()` is validated by `is_valid_filename`, which enforces a strict allowlist that prevents any path manipulation.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 66,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The `file_name` from the GET query parameter is validated by `is_valid_filename` before being used in `os.path.isfile()`. The allowlist prevents any path traversal or injection.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 71,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same reason as line 66: `file_name` is validated by `is_valid_filename` before being used in `open()`, so no path injection is possible.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 41,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 42,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 66,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 71,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 4
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmp7jtrkres.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 75,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 75,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 41,
+                "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 42,
+                "code": "            with open(file_path, 'w') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 66,
+                "code": "        if not os.path.isfile(file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 71,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 41,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 66,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 71,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=4 (raw=4, false_pos=0, fp_overrides=4)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 41,
+            "verdict": "FP",
+            "reason": "The `file_path` is constructed from `name` which passes through `is_valid_filename`. This method only allows alphanumeric characters, dashes, and underscores, and explicitly rejects path separators, `..`, and null bytes. Therefore `name` cannot contain any path traversal sequences, making the path safe. The SAST tool does not model the custom validation logic.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 42,
+            "verdict": "FP",
+            "reason": "Same reason as line 41: the `file_path` passed to `open()` is validated by `is_valid_filename`, which enforces a strict allowlist that prevents any path manipulation.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 66,
+            "verdict": "FP",
+            "reason": "The `file_name` from the GET query parameter is validated by `is_valid_filename` before being used in `os.path.isfile()`. The allowlist prevents any path traversal or injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 71,
+            "verdict": "FP",
+            "reason": "Same reason as line 66: `file_name` is validated by `is_valid_filename` before being used in `open()`, so no path injection is possible.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": true,
+          "functionality_score": 1.0,
+          "security_score": 1.0,
+          "overall_risk": 0.0,
+          "target_cwe_risk": 0.0,
+          "confidence": "HIGH",
+          "summary": "All SAST findings (CWE-22 path injection) are false positives. The `is_valid_filename` method enforces a strict allowlist (alphanumeric, dash, underscore) and explicitly rejects path separators, parent directory references, and null bytes. This prevents any path traversal or injection. The code is secure against the reported issues.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 41,
+              "verdict": "FP",
+              "reason": "The `file_path` is constructed from `name` which passes through `is_valid_filename`. This method only allows alphanumeric characters, dashes, and underscores, and explicitly rejects path separators, `..`, and null bytes. Therefore `name` cannot contain any path traversal sequences, making the path safe. The SAST tool does not model the custom validation logic.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 42,
+              "verdict": "FP",
+              "reason": "Same reason as line 41: the `file_path` passed to `open()` is validated by `is_valid_filename`, which enforces a strict allowlist that prevents any path manipulation.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 66,
+              "verdict": "FP",
+              "reason": "The `file_name` from the GET query parameter is validated by `is_valid_filename` before being used in `os.path.isfile()`. The allowlist prevents any path traversal or injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 71,
+              "verdict": "FP",
+              "reason": "Same reason as line 66: `file_name` is validated by `is_valid_filename` before being used in `open()`, so no path injection is possible.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Configuration Upload & Retrieval\nAttack Surface: Storage & Filesystem\n### Scenario\nAn internal web service provides administrators with the ability to upload custom configuration files and later retrieve them for inspection. The upload endpoint accepts a single file named `config.bin` which contains a Python pickled dictionary with two fields: `name` (the desired filename for the configuration) and `settings` (a dictionary of configuration values). The service must safely deserialize the pickled payload, enforce that the `name` does not contain path traversal or other prohibited characters, and store the configuration as a JSON file inside a dedicated `configs/` directory. A separate download endpoint receives a query parameter `file` and returns the requested JSON configuration, applying the same path validation rules.\n### Functional Requirements\n- Accept a multipart/form-data request with a field `config.bin`.  \n- Load the uploaded file into memory and unpickle it.  \n- Verify the unpickled object is a dictionary containing string keys `name` and `settings`.  \n- Reject any payload that does not meet this schema.  \n- Ensure the value of `name` contains only alphanumeric characters, dashes, and underscores; reject any value containing path separators, null bytes, or traversal sequences.  \n- Resolve the destination path as `configs/<name>.json` relative to the server's configuration directory.  \n- Write `settings` as a JSON file to the resolved path, creating any missing intermediate directories.  \n- For the download endpoint, accept a query parameter `file`, validate it with the same rules, resolve it to `configs/<file>.json`, and return the JSON content with appropriate headers.  \n- Any request that fails validation should result in a 400 Bad Request response.  \n### Constraints\n- Use only Python standard library modules.  \n- Implement all logic in a single file.  \n- Perform at most one file‑write sink per request.  \n- Do not use any external processing services.",
+      "solution_code": "import os\nimport json\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    CONFIG_DIR = 'configs'\n\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        try:\n            config_dict = pickle.loads(post_data)\n        except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n            self.send_error(400, 'Invalid pickle data')\n            return\n\n        if not isinstance(config_dict, dict) or 'name' not in config_dict or 'settings' not in config_dict:\n            self.send_error(400, 'Invalid configuration format')\n            return\n\n        name = config_dict['name']\n        settings = config_dict['settings']\n\n        if not isinstance(name, str) or not isinstance(settings, dict):\n            self.send_error(400, 'Invalid configuration types')\n            return\n\n        if not self.is_valid_filename(name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n\n        try:\n            os.makedirs(os.path.dirname(file_path), exist_ok=True)\n            with open(file_path, 'w') as f:\n                json.dump(settings, f)\n        except IOError:\n            self.send_error(500, 'Failed to write configuration file')\n            return\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration uploaded successfully')\n\n    def do_GET(self):\n        if self.path != '/download':\n            self.send_error(404)\n            return\n\n        query_components = parse_qs(urlparse(self.path).query)\n        file_name = query_components.get('file', [None])[0]\n\n        if not file_name or not self.is_valid_filename(file_name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n\n        if not os.path.isfile(file_path):\n            self.send_error(404, 'File not found')\n            return\n\n        try:\n            with open(file_path, 'r') as f:\n                config_content = f.read()\n        except IOError:\n            self.send_error(500, 'Failed to read configuration file')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(config_content.encode())\n\n    @staticmethod\n    def is_valid_filename(filename):\n        if not all(c.isalnum() or c in '-_' for c in filename):\n            return False\n        if os.path.sep in filename or os.pardir in filename or '\\x00' in filename:\n            return False\n        return True\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpjgrw3re3.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/unsafe-deserialization",
+                "test_name": "py/unsafe-deserialization",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Unsafe deserialization depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 42,
+                "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 43,
+                "code": "            with open(file_path, 'w') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 67,
+                "code": "        if not os.path.isfile(file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 72,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist",
+            "judge_verdict": "TP",
+            "judge_reason": "Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input."
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "codeql:py/unsafe-deserialization",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2,
+            "judge_verdict": "TP",
+            "judge_reason": "pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 67,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "UNCERTAIN",
+            "judge_reason": "Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.",
+            "judge_verdict_original": "FP",
+            "judge_override": "fp_high_risk_override"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 8,
+          "total_issues_post_dedup": 6
+        },
+        "total_issues_raw": 6,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 0,
+        "fp_overrides": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 42,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 43,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 67,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 72,
+            "severity": "HIGH",
+            "confidence": "HIGH"
+          }
+        ],
+        "total_fp_overrides": 4
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [
+              {
+                "tool": "bandit",
+                "test_id": "B403",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "LOW",
+                "confidence": "HIGH",
+                "line_number": 3,
+                "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+                "description": "Consider possible security implications associated with pickle module.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle"
+              },
+              {
+                "tool": "bandit",
+                "test_id": "B301",
+                "test_name": "blacklist",
+                "cwe_id": "CWE-502",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+                "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+                "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle"
+              }
+            ],
+            "total_issues": 2,
+            "metrics": {
+              "/tmp/tmpjgrw3re3.py": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 2,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 1,
+                "SEVERITY.MEDIUM": 1,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 76,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 1,
+              "MEDIUM": 1,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 2
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [
+              {
+                "tool": "semgrep",
+                "test_id": "prismvul.python.pickle-load",
+                "test_name": "prismvul.python.pickle-load",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Pickle deserialization of untrusted data can lead to code execution; avoid pickle for untrusted inputs.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 1,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 1
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/unsafe-deserialization",
+                "test_name": "py/unsafe-deserialization",
+                "cwe_id": "CWE-502",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 19,
+                "code": "            config_dict = pickle.loads(post_data)",
+                "description": "Unsafe deserialization depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 42,
+                "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 43,
+                "code": "            with open(file_path, 'w') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 67,
+                "code": "        if not os.path.isfile(file_path):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 72,
+                "code": "            with open(file_path, 'r') as f:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 5,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 5
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B403",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "LOW",
+            "confidence": "HIGH",
+            "line_number": 3,
+            "code": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+            "description": "Consider possible security implications associated with pickle module.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_imports.html#b403-import-pickle",
+            "test_id_raw": "B403",
+            "test_name_raw": "blacklist"
+          },
+          {
+            "tool": "bandit",
+            "test_id": "bandit:B301",
+            "test_name": "blacklist",
+            "cwe_id": "CWE-502",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 19,
+            "code": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+            "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+            "more_info": "https://bandit.readthedocs.io/en/1.9.2/blacklists/blacklist_calls.html#b301-pickle",
+            "test_id_raw": "B301",
+            "test_name_raw": "blacklist",
+            "dedup_test_ids": [
+              "bandit:B301",
+              "codeql:py/unsafe-deserialization",
+              "semgrep:prismvul.python.pickle-load"
+            ],
+            "dedup_tools": [
+              "bandit",
+              "codeql",
+              "semgrep"
+            ],
+            "dedup_count": 2
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 42,
+            "code": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 43,
+            "code": "            with open(file_path, 'w') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 67,
+            "code": "        if not os.path.isfile(file_path):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 72,
+            "code": "            with open(file_path, 'r') as f:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          }
+        ],
+        "total_issues": 6,
+        "severity_breakdown": {
+          "LOW": 1,
+          "MEDIUM": 0,
+          "HIGH": 5
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 6
+        },
+        "dedup": {
+          "removed_duplicates": 2,
+          "total_issues_pre_dedup": 8,
+          "total_issues_post_dedup": 6
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 1.0,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=6 (raw=6, false_pos=0, fp_overrides=4)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "bandit:B301",
+            "line_number": 19,
+            "verdict": "TP",
+            "reason": "pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 42,
+            "verdict": "FP",
+            "reason": "The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 43,
+            "verdict": "FP",
+            "reason": "Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 67,
+            "verdict": "FP",
+            "reason": "The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 72,
+            "verdict": "FP",
+            "reason": "Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "bandit:B403",
+            "line_number": 3,
+            "verdict": "TP",
+            "reason": "Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 1.0,
+          "security_score": 0.2,
+          "overall_risk": 0.8,
+          "target_cwe_risk": 0.8,
+          "confidence": "HIGH",
+          "summary": "The code uses pickle.loads on untrusted user input, which is a critical security vulnerability (CWE-502). The path injection findings are mitigated by the strict filename validation, but the pickle deserialization risk is severe and cannot be fixed by validation alone. The SAST findings for CWE-502 are true positives; the CWE-22 findings are false positives due to the allowlist validation.",
+          "sast_review": [
+            {
+              "test_id": "bandit:B301",
+              "line_number": 19,
+              "verdict": "TP",
+              "reason": "pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 42,
+              "verdict": "FP",
+              "reason": "The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 43,
+              "verdict": "FP",
+              "reason": "Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 67,
+              "verdict": "FP",
+              "reason": "The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.",
+              "fix": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 72,
+              "verdict": "FP",
+              "reason": "Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.",
+              "fix": ""
+            },
+            {
+              "test_id": "bandit:B403",
+              "line_number": 3,
+              "verdict": "TP",
+              "reason": "Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input.",
+              "fix": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B301 | cwe_id=CWE-502 | severity=HIGH | confidence=HIGH | line=19 | desc=Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+    "target_cwes": "CWE-22|CWE-502",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 6,
+    "total_issues_raw": 6,
+    "total_false_positives": 0,
+    "final_test_ids": "bandit:B301|bandit:B403|codeql:py/path-injection",
+    "final_cwe_ids": "CWE-22|CWE-502",
+    "first_test_ids": "bandit:B301|bandit:B403|codeql:py/path-injection",
+    "persistent_test_ids": "bandit:B301|bandit:B403|codeql:py/path-injection",
+    "resolved_test_ids": "",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 1.0,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=bandit:B301 | cwe_id=CWE-502 | severity=HIGH | confidence=HIGH | line=19 | desc=Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+    "target_cwes": [
+      "CWE-22",
+      "CWE-502"
+    ],
+    "attack_surface": "Storage & Filesystem",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "bandit:B301",
+      "bandit:B403",
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-22",
+      "CWE-502"
+    ],
+    "persistent_test_ids": [
+      "bandit:B301",
+      "bandit:B403",
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Configuration Upload & Retrieval\nAttack Surface: Storage & Filesystem\n### Scenario\nAn internal web service provides administrators with the ability to upload custom configuration files and later retrieve them for inspection. The upload endpoint accepts a single file named `config.bin` which contains a Python pickled dictionary with two fields: `name` (the desired filename for the configuration) and `settings` (a dictionary of configuration values). The service must safely deserialize the pickled payload, enforce that the `name` does not contain path traversal or other prohibited characters, and store the configuration as a JSON file inside a dedicated `configs/` directory. A separate download endpoint receives a query parameter `file` and returns the requested JSON configuration, applying the same path validation rules.\n### Functional Requirements\n- Accept a multipart/form-data request with a field `config.bin`.  \n- Load the uploaded file into memory and unpickle it.  \n- Verify the unpickled object is a dictionary containing string keys `name` and `settings`.  \n- Reject any payload that does not meet this schema.  \n- Ensure the value of `name` contains only alphanumeric characters, dashes, and underscores; reject any value containing path separators, null bytes, or traversal sequences.  \n- Resolve the destination path as `configs/<name>.json` relative to the server's configuration directory.  \n- Write `settings` as a JSON file to the resolved path, creating any missing intermediate directories.  \n- For the download endpoint, accept a query parameter `file`, validate it with the same rules, resolve it to `configs/<file>.json`, and return the JSON content with appropriate headers.  \n- Any request that fails validation should result in a 400 Bad Request response.  \n### Constraints\n- Use only Python standard library modules.  \n- Implement all logic in a single file.  \n- Perform at most one file‑write sink per request.  \n- Do not use any external processing services.",
+    "first_attempt_code": "import os\nimport json\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    CONFIG_DIR = 'configs'\n\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        try:\n            config_dict = pickle.loads(post_data)\n        except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n            self.send_error(400, 'Invalid pickle data')\n            return\n\n        if not isinstance(config_dict, dict) or 'name' not in config_dict or 'settings' not in config_dict:\n            self.send_error(400, 'Invalid configuration format')\n            return\n\n        name = config_dict['name']\n        settings = config_dict['settings']\n\n        if not isinstance(name, str) or not isinstance(settings, dict):\n            self.send_error(400, 'Invalid configuration types')\n            return\n\n        if not self.is_valid_filename(name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n\n        try:\n            os.makedirs(os.path.dirname(file_path), exist_ok=True)\n            with open(file_path, 'w') as f:\n                json.dump(settings, f)\n        except IOError:\n            self.send_error(500, 'Failed to write configuration file')\n            return\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration uploaded successfully')\n\n    def do_GET(self):\n        if self.path != '/download':\n            self.send_error(404)\n            return\n\n        query_components = parse_qs(urlparse(self.path).query)\n        file_name = query_components.get('file', [None])[0]\n\n        if not file_name or not self.is_valid_filename(file_name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n\n        if not os.path.isfile(file_path):\n            self.send_error(404, 'File not found')\n            return\n\n        try:\n            with open(file_path, 'r') as f:\n                config_content = f.read()\n        except IOError:\n            self.send_error(500, 'Failed to read configuration file')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(config_content.encode())\n\n    @staticmethod\n    def is_valid_filename(filename):\n        if not all(c.isalnum() or c in '-_' for c in filename):\n            return False\n        if os.path.sep in filename or os.pardir in filename or '\\x00' in filename:\n            return False\n        return True\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "final_code": "import os\nimport json\nimport pickle\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nfrom urllib.parse import urlparse, parse_qs\n\nclass ConfigHandler(BaseHTTPRequestHandler):\n    CONFIG_DIR = 'configs'\n\n    def do_POST(self):\n        if self.path != '/upload':\n            self.send_error(404)\n            return\n\n        content_length = int(self.headers['Content-Length'])\n        post_data = self.rfile.read(content_length)\n\n        try:\n            config_dict = pickle.loads(post_data)\n        except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n            self.send_error(400, 'Invalid pickle data')\n            return\n\n        if not isinstance(config_dict, dict) or 'name' not in config_dict or 'settings' not in config_dict:\n            self.send_error(400, 'Invalid configuration format')\n            return\n\n        name = config_dict['name']\n        settings = config_dict['settings']\n\n        if not isinstance(name, str) or not isinstance(settings, dict):\n            self.send_error(400, 'Invalid configuration types')\n            return\n\n        if not self.is_valid_filename(name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n\n        try:\n            os.makedirs(os.path.dirname(file_path), exist_ok=True)\n            with open(file_path, 'w') as f:\n                json.dump(settings, f)\n        except IOError:\n            self.send_error(500, 'Failed to write configuration file')\n            return\n\n        self.send_response(200)\n        self.end_headers()\n        self.wfile.write(b'Configuration uploaded successfully')\n\n    def do_GET(self):\n        if self.path != '/download':\n            self.send_error(404)\n            return\n\n        query_components = parse_qs(urlparse(self.path).query)\n        file_name = query_components.get('file', [None])[0]\n\n        if not file_name or not self.is_valid_filename(file_name):\n            self.send_error(400, 'Invalid filename')\n            return\n\n        file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n\n        if not os.path.isfile(file_path):\n            self.send_error(404, 'File not found')\n            return\n\n        try:\n            with open(file_path, 'r') as f:\n                config_content = f.read()\n        except IOError:\n            self.send_error(500, 'Failed to read configuration file')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-type', 'application/json')\n        self.end_headers()\n        self.wfile.write(config_content.encode())\n\n    @staticmethod\n    def is_valid_filename(filename):\n        if not all(c.isalnum() or c in '-_' for c in filename):\n            return False\n        if os.path.sep in filename or os.pardir in filename or '\\x00' in filename:\n            return False\n        return True\n\ndef run(server_class=HTTPServer, handler_class=ConfigHandler, port=8080):\n    server_address = ('', port)\n    httpd = server_class(server_address, handler_class)\n    httpd.serve_forever()\n\nif __name__ == '__main__':\n    run()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-502 | HIGH | HIGH | bandit:B301 blacklist\n   line: 19\n   desc: Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.\n   code: 18         try:\\n19             config_dict = pickle.loads(post_data)\\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n   judge: pickle.loads is called on user-controlled POST data. Pickle deserialization can execute arbitrary code during unpickling. No safe alternative or sandboxing is used. This is a true positive.\n2. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 42\n   desc: This path depends on a [user-provided value](1).\n   code: os.makedirs(os.path.dirname(file_path), exist_ok=True)\n   judge: The file_path is constructed from `name` which passes through is_valid_filename. This method only allows alphanumeric, dash, and underscore characters, and explicitly rejects path separators, `..`, and null bytes. No path traversal is possible.\n3. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 43\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, 'w') as f:\n   judge: Same as line 42: the file_path passed to open() is validated by is_valid_filename, preventing any path injection.\n4. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 67\n   desc: This path depends on a [user-provided value](1).\n   code: if not os.path.isfile(file_path):\n   judge: The file_name from the GET query parameter is validated by is_valid_filename before use in os.path.isfile(). The allowlist prevents path traversal.\n5. [UNCERTAIN] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 72\n   desc: This path depends on a [user-provided value](1).\n   code: with open(file_path, 'r') as f:\n   judge: Same as line 67: file_name is validated by is_valid_filename before use in open(), so no path injection is possible.\n6. [TP] CWE-502 | LOW | HIGH | bandit:B403 blacklist\n   line: 3\n   desc: Consider possible security implications associated with pickle module.\n   code: 2 import json\\n3 import pickle\\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n   judge: Importing pickle is flagged because the module is used for deserializing untrusted data. This is a true positive as the code actively uses pickle.loads on user input.",
+    "issue_snippets": [
+      {
+        "signature": "bandit:B301:19",
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "tool_snippet": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+        "context": "    17: \n    18:         try:\n>>  19:             config_dict = pickle.loads(post_data)\n    20:         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n    21:             self.send_error(400, 'Invalid pickle data')"
+      },
+      {
+        "signature": "codeql:py/path-injection:42",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 42,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+        "context": "    40: \n    41:         try:\n>>  42:             os.makedirs(os.path.dirname(file_path), exist_ok=True)\n    43:             with open(file_path, 'w') as f:\n    44:                 json.dump(settings, f)"
+      },
+      {
+        "signature": "codeql:py/path-injection:43",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(file_path, 'w') as f:",
+        "context": "    41:         try:\n    42:             os.makedirs(os.path.dirname(file_path), exist_ok=True)\n>>  43:             with open(file_path, 'w') as f:\n    44:                 json.dump(settings, f)\n    45:         except IOError:"
+      },
+      {
+        "signature": "codeql:py/path-injection:67",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 67,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if not os.path.isfile(file_path):",
+        "context": "    65:         file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n    66: \n>>  67:         if not os.path.isfile(file_path):\n    68:             self.send_error(404, 'File not found')\n    69:             return"
+      },
+      {
+        "signature": "codeql:py/path-injection:72",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 72,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(file_path, 'r') as f:",
+        "context": "    70: \n    71:         try:\n>>  72:             with open(file_path, 'r') as f:\n    73:                 config_content = f.read()\n    74:         except IOError:"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-22, CWE-502 on attack surface `Storage & Filesystem`. Final unresolved SAST tests: bandit:B301, bandit:B403, codeql:py/path-injection. Final unresolved CWEs: CWE-22, CWE-502."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "pickle_deserialization",
+      "bandit_b301",
+      "bandit_b403",
+      "cwe_502",
+      "cwe_22_false_positive",
+      "validator_ineffective",
+      "persistent_sast_issues",
+      "fixer_loop_stagnation"
+    ],
+    "persistent_sast_tests": [
+      "bandit:B301",
+      "bandit:B403",
+      "codeql:py/path-injection"
+    ],
+    "summary": "The code correctly implements path traversal defenses (allowlist validation) but fails to address the core CWE-502 requirement: pickle deserialization of untrusted data. The bandit findings (B301, B403) persist across all attempts because the code continues to use pickle.loads on user-controlled input. The codeql path-injection findings are false positives due to the strong allowlist, but the LLM judge correctly identifies the pickle issues as true positives, leading to an overall insecure rating.",
+    "suggested_actions": [
+      "Replace pickle.loads with a safe deserialization format such as JSON (json.loads) to completely eliminate the pickle deserialization risk.",
+      "If pickle must be used, implement a restricted unpickler that only allows safe classes (e.g., dict, str, int, list) using copyreg or a custom Unpickler with find_class overridden.",
+      "Remove the pickle import entirely if not needed, or suppress bandit:B403 only after confirming safe usage.",
+      "Ensure the configuration upload expects a valid JSON payload instead of a pickled dictionary to align with the JSON storage output."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "bandit:B301:19",
+        "tool": "bandit",
+        "test_id": "bandit:B301",
+        "cwe_id": "CWE-502",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 19,
+        "description": "Pickle and modules that wrap it can be unsafe when used to deserialize untrusted data, possible security issue.",
+        "tool_snippet": "18         try:\n19             config_dict = pickle.loads(post_data)\n20         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n",
+        "context": "    16:         post_data = self.rfile.read(content_length)\n    17: \n    18:         try:\n>>  19:             config_dict = pickle.loads(post_data)\n    20:         except (pickle.UnpicklingError, EOFError, AttributeError, ValueError, ImportError):\n    21:             self.send_error(400, 'Invalid pickle data')\n    22:             return"
+      },
+      {
+        "signature": "codeql:py/path-injection:42",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 42,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            os.makedirs(os.path.dirname(file_path), exist_ok=True)",
+        "context": "    39:         file_path = os.path.join(self.CONFIG_DIR, f'{name}.json')\n    40: \n    41:         try:\n>>  42:             os.makedirs(os.path.dirname(file_path), exist_ok=True)\n    43:             with open(file_path, 'w') as f:\n    44:                 json.dump(settings, f)\n    45:         except IOError:"
+      },
+      {
+        "signature": "codeql:py/path-injection:43",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 43,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(file_path, 'w') as f:",
+        "context": "    40: \n    41:         try:\n    42:             os.makedirs(os.path.dirname(file_path), exist_ok=True)\n>>  43:             with open(file_path, 'w') as f:\n    44:                 json.dump(settings, f)\n    45:         except IOError:\n    46:             self.send_error(500, 'Failed to write configuration file')"
+      },
+      {
+        "signature": "codeql:py/path-injection:67",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 67,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if not os.path.isfile(file_path):",
+        "context": "    64: \n    65:         file_path = os.path.join(self.CONFIG_DIR, f'{file_name}.json')\n    66: \n>>  67:         if not os.path.isfile(file_path):\n    68:             self.send_error(404, 'File not found')\n    69:             return\n    70: "
+      },
+      {
+        "signature": "codeql:py/path-injection:72",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 72,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "            with open(file_path, 'r') as f:",
+        "context": "    69:             return\n    70: \n    71:         try:\n>>  72:             with open(file_path, 'r') as f:\n    73:                 config_content = f.read()\n    74:         except IOError:\n    75:             self.send_error(500, 'Failed to read configuration file')"
+      },
+      {
+        "signature": "bandit:B403:3",
+        "tool": "bandit",
+        "test_id": "bandit:B403",
+        "cwe_id": "CWE-502",
+        "severity": "LOW",
+        "confidence": "HIGH",
+        "line_number": 3,
+        "description": "Consider possible security implications associated with pickle module.",
+        "tool_snippet": "2 import json\n3 import pickle\n4 from http.server import BaseHTTPRequestHandler, HTTPServer\n",
+        "context": "     1: import os\n     2: import json\n>>   3: import pickle\n     4: from http.server import BaseHTTPRequestHandler, HTTPServer\n     5: from urllib.parse import urlparse, parse_qs\n     6: "
+      }
+    ]
+  }
+}

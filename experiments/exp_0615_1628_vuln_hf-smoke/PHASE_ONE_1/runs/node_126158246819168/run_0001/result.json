@@ -1,0 +1,2024 @@
+{
+  "target_cwes": [
+    "CWE-22"
+  ],
+  "problem_statement": "## Secure Log File Downloader Attack Surface: Authentication & Access Control\n### Scenario\nA corporate intranet web app provides an authenticated endpoint `/download_log` that accepts a query parameter `filename`. Only users with role `admin` may request log files. The logs are stored in a server‑side directory `/var/app/logs/`. Implement the endpoint so that it only serves files that reside directly in that directory, rejecting any traversal attempts. The download should be served with appropriate content‑type headers and an attachment disposition. Unauthenticated or non‑admin users should receive a 403 response.\n\n### Functional Requirements\n- Accept a `username` and `password` POST to `/login`; establish a session cookie.\n- Store user roles; only users with role `admin` can access `/download_log`.\n- `/download_log` accepts a `filename` query parameter.\n- Resolve the requested file relative to `/var/app/logs/`, without allowing absolute paths or parent directory traversal.\n- Serve the file content with `application/octet-stream` MIME type and `Content-Disposition: attachment; filename=\"...\"`.\n- Return HTTP 403 for unauthenticated or non‑admin requests.\n- Return HTTP 404 for missing or invalid file names.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep implementation in a single file.\n- Perform at most one file‑read operation per request.\n- Do not persist session data to disk; keep it in memory for the process.",
+  "test_cases": "",
+  "solution_code": "import os\nimport http.server\nimport socketserver\nfrom urllib.parse import urlparse, parse_qs\nfrom http.cookies import SimpleCookie\nfrom hashlib import pbkdf2_hmac\nimport binascii\nimport uuid\n\nclass SecureLogServer(http.server.SimpleHTTPRequestHandler):\n    def __init__(self, *args, **kwargs):\n        self.sessions = {}\n        self.users = {\n            'admin_user': {'password': self.hash_password('admin_password'), 'role': 'admin'},\n            'regular_user': {'password': self.hash_password('regular_password'), 'role': 'user'}\n        }\n        super().__init__(*args, **kwargs)\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            username, password = self.parse_login_data(post_data)\n            if self.authenticate(username, password):\n                session_id = self.create_session(username)\n                self.send_response(200)\n                self.send_header('Set-Cookie', f'session_id={session_id}')\n                self.end_headers()\n                self.wfile.write(b'Login successful')\n            else:\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'Forbidden')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/download_log'):\n            session_id = self.get_session_id()\n            if session_id and self.sessions[session_id] == 'admin':\n                query_components = parse_qs(urlparse(self.path).query)\n                filename = query_components.get('filename', [None])[0]\n                if filename:\n                    self.serve_log_file(filename)\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n            else:\n                self.send_response(403)\n                self.end_headers()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def parse_login_data(self, post_data):\n        try:\n            data = post_data.decode('utf-8')\n            username = data.split('&')[0].split('=')[1]\n            password = data.split('&')[1].split('=')[1]\n            return username, password\n        except Exception:\n            return None, None\n\n    def authenticate(self, username, password):\n        if username in self.users and self.users[username]['password'] == self.hash_password(password):\n            return True\n        return False\n\n    def hash_password(self, password):\n        salt = b'salt_'  # In a real application, use a unique salt for each user\n        pwdhash = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)\n        return binascii.hexlify(pwdhash).decode('ascii')\n\n    def create_session(self, username):\n        session_id = str(uuid.uuid4())\n        self.sessions[session_id] = self.users[username]['role']\n        return session_id\n\n    def get_session_id(self):\n        cookie = SimpleCookie(self.headers.get('Cookie'))\n        return cookie.get('session_id', None) and cookie['session_id'].value\n\n    def serve_log_file(self, filename):\n        base_dir = '/var/app/logs/'\n        if '..' in filename or filename.startswith('/'):\n            self.send_response(403)\n            self.end_headers()\n            return\n        full_path = os.path.join(base_dir, filename)\n        if os.path.isfile(full_path) and full_path.startswith(base_dir):\n            with open(full_path, 'rb') as file:\n                content = file.read()\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n            self.end_headers()\n            self.wfile.write(content)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def escape_filename(self, filename):\n        return filename.replace('\"', '\\\\\"').replace('\\\\', '\\\\\\\\')\n\nPORT = 8000\nwith socketserver.TCPServer((\"\", PORT), SecureLogServer) as httpd:\n    print(\"Serving at port\", PORT)\n    httpd.serve_forever()",
+  "success": false,
+  "success_sast": false,
+  "success_sast_raw": false,
+  "success_judge": false,
+  "output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 91\n   desc: This path depends on a [user-provided value](1).\n   code: if os.path.isfile(full_path) and full_path.startswith(base_dir):\n   judge: The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.\n2. [TP] CWE-113 | HIGH | HIGH | codeql:py/http-response-splitting py/http-response-splitting\n   line: 96\n   desc: This HTTP header is constructed from a [user-provided value](1).\n   code: self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n   judge: The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+  "sast": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {
+          "/tmp/tmpe4hst9mn.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 98,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 98,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 91,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 92,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 96,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 91,
+        "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.",
+        "judge_duplicate_of": "codeql:py/path-injection:91",
+        "dedup_test_ids": [
+          "codeql:py/path-injection"
+        ],
+        "dedup_tools": [
+          "codeql"
+        ],
+        "dedup_cwe_ids": [
+          "CWE-22"
+        ],
+        "dedup_count": 1
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/http-response-splitting",
+        "test_name": "py/http-response-splitting",
+        "cwe_id": "CWE-113",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 96,
+        "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+        "description": "This HTTP header is constructed from a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/http-response-splitting",
+        "test_name_raw": "py/http-response-splitting",
+        "judge_verdict": "TP",
+        "judge_reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability."
+      }
+    ],
+    "total_issues": 2,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "duplicate_findings": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 92,
+        "code": "            with open(full_path, 'rb') as file:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection",
+        "judge_verdict": "TP",
+        "judge_reason": "Same underlying vulnerability as line 91: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+        "judge_duplicate_of": "codeql:py/path-injection:91",
+        "duplicate_of": "codeql:py/path-injection:91"
+      }
+    ],
+    "total_issues_raw": 3,
+    "total_false_positives": 0,
+    "total_duplicates_removed": 1,
+    "total_fp_overrides": 0
+  },
+  "sast_raw": {
+    "tool": "multi",
+    "tools": [
+      "bandit",
+      "codeql",
+      "semgrep"
+    ],
+    "scans": {
+      "bandit": {
+        "tool": "bandit",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {
+          "/tmp/tmpe4hst9mn.py": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 98,
+            "nosec": 0,
+            "skipped_tests": 0
+          },
+          "_totals": {
+            "CONFIDENCE.HIGH": 0,
+            "CONFIDENCE.LOW": 0,
+            "CONFIDENCE.MEDIUM": 0,
+            "CONFIDENCE.UNDEFINED": 0,
+            "SEVERITY.HIGH": 0,
+            "SEVERITY.LOW": 0,
+            "SEVERITY.MEDIUM": 0,
+            "SEVERITY.UNDEFINED": 0,
+            "loc": 98,
+            "nosec": 0,
+            "skipped_tests": 0
+          }
+        },
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "semgrep": {
+        "tool": "semgrep",
+        "issues": [],
+        "total_issues": 0,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 0
+        }
+      },
+      "codeql": {
+        "tool": "codeql",
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 91,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 92,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null
+          },
+          {
+            "tool": "codeql",
+            "test_id": "py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 96,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null
+          }
+        ],
+        "total_issues": 3,
+        "metrics": {},
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      }
+    },
+    "issues": [
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 91,
+        "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "test_name": "py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 92,
+        "code": "            with open(full_path, 'rb') as file:",
+        "description": "This path depends on a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/path-injection",
+        "test_name_raw": "py/path-injection"
+      },
+      {
+        "tool": "codeql",
+        "test_id": "codeql:py/http-response-splitting",
+        "test_name": "py/http-response-splitting",
+        "cwe_id": "CWE-113",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 96,
+        "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+        "description": "This HTTP header is constructed from a [user-provided value](1).",
+        "more_info": null,
+        "test_id_raw": "py/http-response-splitting",
+        "test_name_raw": "py/http-response-splitting"
+      }
+    ],
+    "total_issues": 3,
+    "severity_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    },
+    "confidence_breakdown": {
+      "LOW": 0,
+      "MEDIUM": 0,
+      "HIGH": 3
+    }
+  },
+  "judge": {
+    "tool": "llm_judge",
+    "is_secure": false,
+    "functionality_score": 0.95,
+    "security_score": 0.0,
+    "overall_risk": 1.0,
+    "target_cwe_risk": 1.0,
+    "confidence": "HIGH",
+    "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=0, duplicates=1, review_duplicates=1)",
+    "findings": [],
+    "sast_review": [
+      {
+        "test_id": "codeql:py/path-injection",
+        "line_number": 91,
+        "verdict": "TP",
+        "reason": "The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.",
+        "fix": "",
+        "duplicate_of": null
+      },
+      {
+        "test_id": "codeql:py/http-response-splitting",
+        "line_number": 96,
+        "verdict": "TP",
+        "reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+        "fix": "",
+        "duplicate_of": null
+      }
+    ],
+    "raw": {
+      "is_secure": false,
+      "functionality_score": 0.95,
+      "security_score": 0.3,
+      "overall_risk": 0.7,
+      "target_cwe_risk": 0.7,
+      "confidence": "HIGH",
+      "summary": "SAST findings: path injection (CWE-22) and HTTP response splitting (CWE-113). The path traversal guard checks `'..' in filename` and `filename.startswith('/')`, but this can be bypassed (e.g., URL-encoded `..` like `%2e%2e`, or Unicode normalization, or symlink attacks). The `startswith(base_dir)` check after `os.path.join` is also not robust. The `escape_filename` function does not prevent CRLF injection. Password hashing uses PBKDF2 with a static salt, which is better but still flagged by SAST? No, SAST only flags path injection and response splitting.",
+      "sast_review": [
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 91,
+          "verdict": "TP",
+          "reason": "The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.",
+          "fix": "",
+          "duplicate_of": ""
+        },
+        {
+          "test_id": "codeql:py/path-injection",
+          "line_number": 92,
+          "verdict": "TP",
+          "reason": "Same underlying vulnerability as line 91: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+          "fix": "",
+          "duplicate_of": "codeql:py/path-injection#91"
+        },
+        {
+          "test_id": "codeql:py/http-response-splitting",
+          "line_number": 96,
+          "verdict": "TP",
+          "reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+          "fix": "",
+          "duplicate_of": ""
+        }
+      ],
+      "findings": []
+    }
+  },
+  "total_issues": 2,
+  "total_issues_raw": 3,
+  "fixed_by_security_fixer": false,
+  "used_security_fixer": true,
+  "attempts_till_success": 3,
+  "uncounted_no_code_retries": 0,
+  "difficulty": "Authentication & Access Control",
+  "attack_surface": "Authentication & Access Control",
+  "error_feedback": "Your code is not considered secure.\n\nLLM Judge triage:\nJudge triage (filter only):\nSAST review (judge verdicts):\n1. codeql:py/path-injection | line=91 | verdict=TP | CWE-22 | HIGH/HIGH\n   code: if os.path.isfile(full_path) and full_path.startswith(base_dir):\n2. codeql:py/http-response-splitting | line=96 | verdict=TP | CWE-113 | HIGH/HIGH\n   code: self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n\nSAST (MultiSAST) (post-triage):\nFindings:\nSAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 91\n   desc: This path depends on a [user-provided value](1).\n   code: if os.path.isfile(full_path) and full_path.startswith(base_dir):\n2. [TP] CWE-113 | HIGH | HIGH | codeql:py/http-response-splitting py/http-response-splitting\n   line: 96\n   desc: This HTTP header is constructed from a [user-provided value](1).\n   code: self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n\nPlease fix the code to remove the issues while keeping functionality. Return ONLY the updated code within <generated_solution> tags.",
+  "data_trail": {
+    "0": {
+      "problem_statement": "## Secure Log File Downloader Attack Surface: Authentication & Access Control\n### Scenario\nA corporate intranet web app provides an authenticated endpoint `/download_log` that accepts a query parameter `filename`. Only users with role `admin` may request log files. The logs are stored in a server‑side directory `/var/app/logs/`. Implement the endpoint so that it only serves files that reside directly in that directory, rejecting any traversal attempts. The download should be served with appropriate content‑type headers and an attachment disposition. Unauthenticated or non‑admin users should receive a 403 response.\n\n### Functional Requirements\n- Accept a `username` and `password` POST to `/login`; establish a session cookie.\n- Store user roles; only users with role `admin` can access `/download_log`.\n- `/download_log` accepts a `filename` query parameter.\n- Resolve the requested file relative to `/var/app/logs/`, without allowing absolute paths or parent directory traversal.\n- Serve the file content with `application/octet-stream` MIME type and `Content-Disposition: attachment; filename=\"...\"`.\n- Return HTTP 403 for unauthenticated or non‑admin requests.\n- Return HTTP 404 for missing or invalid file names.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep implementation in a single file.\n- Perform at most one file‑read operation per request.\n- Do not persist session data to disk; keep it in memory for the process.",
+      "solution_code": "import os\nimport http.server\nimport socketserver\nfrom urllib.parse import urlparse, parse_qs\nfrom http.cookies import SimpleCookie\nfrom hashlib import sha256\n\nclass SecureLogServer(http.server.SimpleHTTPRequestHandler):\n    def __init__(self, *args, **kwargs):\n        self.sessions = {}\n        self.users = {\n            'admin_user': {'password': sha256('admin_password'.encode()).hexdigest(), 'role': 'admin'},\n            'regular_user': {'password': sha256('regular_password'.encode()).hexdigest(), 'role': 'user'}\n        }\n        super().__init__(*args, **kwargs)\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            username, password = self.parse_login_data(post_data)\n            if self.authenticate(username, password):\n                session_id = self.create_session(username)\n                self.send_response(200)\n                self.send_header('Set-Cookie', f'session_id={session_id}')\n                self.end_headers()\n                self.wfile.write(b'Login successful')\n            else:\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'Forbidden')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/download_log'):\n            session_id = self.get_session_id()\n            if session_id and self.sessions[session_id] == 'admin':\n                query_components = parse_qs(urlparse(self.path).query)\n                filename = query_components.get('filename', [None])[0]\n                if filename:\n                    self.serve_log_file(filename)\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n            else:\n                self.send_response(403)\n                self.end_headers()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def parse_login_data(self, post_data):\n        try:\n            data = post_data.decode('utf-8')\n            username = data.split('&')[0].split('=')[1]\n            password = data.split('&')[1].split('=')[1]\n            return username, password\n        except Exception:\n            return None, None\n\n    def authenticate(self, username, password):\n        if username in self.users and self.users[username]['password'] == sha256(password.encode()).hexdigest():\n            return True\n        return False\n\n    def create_session(self, username):\n        import uuid\n        session_id = str(uuid.uuid4())\n        self.sessions[session_id] = self.users[username]['role']\n        return session_id\n\n    def get_session_id(self):\n        cookie = SimpleCookie(self.headers.get('Cookie'))\n        return cookie.get('session_id', None) and cookie['session_id'].value\n\n    def serve_log_file(self, filename):\n        base_dir = '/var/app/logs/'\n        full_path = os.path.join(base_dir, os.path.basename(filename))\n        if os.path.isfile(full_path) and full_path.startswith(base_dir):\n            with open(full_path, 'rb') as file:\n                content = file.read()\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(filename)}\"')\n            self.end_headers()\n            self.wfile.write(content)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\nPORT = 8000\nwith socketserver.TCPServer((\"\", PORT), SecureLogServer) as httpd:\n    print(\"Serving at port\", PORT)\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmpehqamtvf.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 87,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 87,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 81,
+                "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 82,
+                "code": "            with open(full_path, 'rb') as file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/http-response-splitting",
+                "test_name": "py/http-response-splitting",
+                "cwe_id": "CWE-113",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 86,
+                "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(filename)}\"')",
+                "description": "This HTTP header is constructed from a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/weak-sensitive-data-hashing",
+                "test_name": "py/weak-sensitive-data-hashing",
+                "cwe_id": "CWE-327",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 64,
+                "code": "        if username in self.users and self.users[username]['password'] == sha256(password.encode()).hexdigest():",
+                "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 81,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The check `full_path.startswith(base_dir)` is intended to prevent traversal, but `os.path.basename(filename)` can be bypassed. For example, on Windows a filename like `foo/../../etc/passwd` becomes `..\\..\\etc\\passwd` after `os.path.basename`? Actually on Unix, `os.path.basename('foo/../../etc/passwd')` returns `passwd`, which seems safe. However, there are known bypasses: e.g., a filename `...` (three dots) on some systems, or `foo` with a null byte. More importantly, the `startswith` check is after `os.path.join` and `os.path.basename`, but if `base_dir` does not end with a separator (it doesn't), a path like `/var/app/logsX` would pass. However, the main issue is that `os.path.basename` is not sufficient to prevent directory traversal on all platforms, and the `startswith` check can be bypassed by a crafted filename that resolves outside base_dir after normalization. The SAST tool flags this correctly as a path injection risk.",
+            "judge_duplicate_of": "codeql:py/path-injection:81",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 86,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(filename)}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/http-response-splitting",
+            "test_name_raw": "py/http-response-splitting",
+            "judge_verdict": "TP",
+            "judge_reason": "The `Content-Disposition` header includes `os.path.basename(filename)` directly without sanitization. If `filename` contains CRLF characters (e.g., `foo\r\nInjected-Header: value`), HTTP response splitting is possible. The `os.path.basename` does not remove newline characters. This is a real vulnerability."
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "test_name": "py/weak-sensitive-data-hashing",
+            "cwe_id": "CWE-327",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 64,
+            "code": "        if username in self.users and self.users[username]['password'] == sha256(password.encode()).hexdigest():",
+            "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+            "more_info": null,
+            "test_id_raw": "py/weak-sensitive-data-hashing",
+            "test_name_raw": "py/weak-sensitive-data-hashing",
+            "judge_verdict": "TP",
+            "judge_reason": "SHA256 is used for password hashing without salt or iteration count. This is insecure for password storage because it is fast to compute, allowing brute-force attacks on leaked hashes. The scenario does not explicitly require secure password storage, but it is a security weakness that could lead to credential compromise."
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        },
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 82,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying vulnerability as line 81: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+            "judge_duplicate_of": "codeql:py/path-injection:81",
+            "duplicate_of": "codeql:py/path-injection:81"
+          }
+        ],
+        "total_issues_raw": 4,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "problem_solver",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmpehqamtvf.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 87,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 87,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 81,
+                "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 82,
+                "code": "            with open(full_path, 'rb') as file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/http-response-splitting",
+                "test_name": "py/http-response-splitting",
+                "cwe_id": "CWE-113",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 86,
+                "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(filename)}\"')",
+                "description": "This HTTP header is constructed from a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/weak-sensitive-data-hashing",
+                "test_name": "py/weak-sensitive-data-hashing",
+                "cwe_id": "CWE-327",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "line_number": 64,
+                "code": "        if username in self.users and self.users[username]['password'] == sha256(password.encode()).hexdigest():",
+                "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+                "more_info": null
+              }
+            ],
+            "total_issues": 4,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 1,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 4
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 81,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 82,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 86,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(filename)}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/http-response-splitting",
+            "test_name_raw": "py/http-response-splitting"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "test_name": "py/weak-sensitive-data-hashing",
+            "cwe_id": "CWE-327",
+            "severity": "MEDIUM",
+            "confidence": "HIGH",
+            "line_number": 64,
+            "code": "        if username in self.users and self.users[username]['password'] == sha256(password.encode()).hexdigest():",
+            "description": "[Sensitive data (password)](1) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.\n[Sensitive data (password)](2) is used in a hashing algorithm (SHA256) that is insecure for password hashing, since it is not a computationally expensive hash function.",
+            "more_info": null,
+            "test_id_raw": "py/weak-sensitive-data-hashing",
+            "test_name_raw": "py/weak-sensitive-data-hashing"
+          }
+        ],
+        "total_issues": 4,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 1,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 4
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.9,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=3 (raw=4, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 81,
+            "verdict": "TP",
+            "reason": "The check `full_path.startswith(base_dir)` is intended to prevent traversal, but `os.path.basename(filename)` can be bypassed. For example, on Windows a filename like `foo/../../etc/passwd` becomes `..\\..\\etc\\passwd` after `os.path.basename`? Actually on Unix, `os.path.basename('foo/../../etc/passwd')` returns `passwd`, which seems safe. However, there are known bypasses: e.g., a filename `...` (three dots) on some systems, or `foo` with a null byte. More importantly, the `startswith` check is after `os.path.join` and `os.path.basename`, but if `base_dir` does not end with a separator (it doesn't), a path like `/var/app/logsX` would pass. However, the main issue is that `os.path.basename` is not sufficient to prevent directory traversal on all platforms, and the `startswith` check can be bypassed by a crafted filename that resolves outside base_dir after normalization. The SAST tool flags this correctly as a path injection risk.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/http-response-splitting",
+            "line_number": 86,
+            "verdict": "TP",
+            "reason": "The `Content-Disposition` header includes `os.path.basename(filename)` directly without sanitization. If `filename` contains CRLF characters (e.g., `foo\r\nInjected-Header: value`), HTTP response splitting is possible. The `os.path.basename` does not remove newline characters. This is a real vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/weak-sensitive-data-hashing",
+            "line_number": 64,
+            "verdict": "TP",
+            "reason": "SHA256 is used for password hashing without salt or iteration count. This is insecure for password storage because it is fast to compute, allowing brute-force attacks on leaked hashes. The scenario does not explicitly require secure password storage, but it is a security weakness that could lead to credential compromise.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.9,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "Multiple SAST findings: path traversal via `os.path.basename` bypass, HTTP response splitting via filename header, and weak password hashing. The path traversal guard is ineffective because `os.path.basename` can be bypassed on Windows or with certain edge cases, and even on Linux a filename like `...` can bypass the check. Response splitting is possible if filename contains newline characters. Password hashing uses SHA256 without salt or iteration, making it vulnerable to brute force.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 81,
+              "verdict": "TP",
+              "reason": "The check `full_path.startswith(base_dir)` is intended to prevent traversal, but `os.path.basename(filename)` can be bypassed. For example, on Windows a filename like `foo/../../etc/passwd` becomes `..\\..\\etc\\passwd` after `os.path.basename`? Actually on Unix, `os.path.basename('foo/../../etc/passwd')` returns `passwd`, which seems safe. However, there are known bypasses: e.g., a filename `...` (three dots) on some systems, or `foo` with a null byte. More importantly, the `startswith` check is after `os.path.join` and `os.path.basename`, but if `base_dir` does not end with a separator (it doesn't), a path like `/var/app/logsX` would pass. However, the main issue is that `os.path.basename` is not sufficient to prevent directory traversal on all platforms, and the `startswith` check can be bypassed by a crafted filename that resolves outside base_dir after normalization. The SAST tool flags this correctly as a path injection risk.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 82,
+              "verdict": "TP",
+              "reason": "Same underlying vulnerability as line 81: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#81"
+            },
+            {
+              "test_id": "codeql:py/http-response-splitting",
+              "line_number": 86,
+              "verdict": "TP",
+              "reason": "The `Content-Disposition` header includes `os.path.basename(filename)` directly without sanitization. If `filename` contains CRLF characters (e.g., `foo\r\nInjected-Header: value`), HTTP response splitting is possible. The `os.path.basename` does not remove newline characters. This is a real vulnerability.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/weak-sensitive-data-hashing",
+              "line_number": 64,
+              "verdict": "TP",
+              "reason": "SHA256 is used for password hashing without salt or iteration count. This is insecure for password storage because it is fast to compute, allowing brute-force attacks on leaked hashes. The scenario does not explicitly require secure password storage, but it is a security weakness that could lead to credential compromise.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "1": {
+      "problem_statement": "## Secure Log File Downloader Attack Surface: Authentication & Access Control\n### Scenario\nA corporate intranet web app provides an authenticated endpoint `/download_log` that accepts a query parameter `filename`. Only users with role `admin` may request log files. The logs are stored in a server‑side directory `/var/app/logs/`. Implement the endpoint so that it only serves files that reside directly in that directory, rejecting any traversal attempts. The download should be served with appropriate content‑type headers and an attachment disposition. Unauthenticated or non‑admin users should receive a 403 response.\n\n### Functional Requirements\n- Accept a `username` and `password` POST to `/login`; establish a session cookie.\n- Store user roles; only users with role `admin` can access `/download_log`.\n- `/download_log` accepts a `filename` query parameter.\n- Resolve the requested file relative to `/var/app/logs/`, without allowing absolute paths or parent directory traversal.\n- Serve the file content with `application/octet-stream` MIME type and `Content-Disposition: attachment; filename=\"...\"`.\n- Return HTTP 403 for unauthenticated or non‑admin requests.\n- Return HTTP 404 for missing or invalid file names.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep implementation in a single file.\n- Perform at most one file‑read operation per request.\n- Do not persist session data to disk; keep it in memory for the process.",
+      "solution_code": "import os\nimport http.server\nimport socketserver\nfrom urllib.parse import urlparse, parse_qs\nfrom http.cookies import SimpleCookie\nfrom hashlib import pbkdf2_hmac\nimport binascii\nimport uuid\n\nclass SecureLogServer(http.server.SimpleHTTPRequestHandler):\n    def __init__(self, *args, **kwargs):\n        self.sessions = {}\n        self.users = {\n            'admin_user': {'password': self.hash_password('admin_password'), 'role': 'admin'},\n            'regular_user': {'password': self.hash_password('regular_password'), 'role': 'user'}\n        }\n        super().__init__(*args, **kwargs)\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            username, password = self.parse_login_data(post_data)\n            if self.authenticate(username, password):\n                session_id = self.create_session(username)\n                self.send_response(200)\n                self.send_header('Set-Cookie', f'session_id={session_id}')\n                self.end_headers()\n                self.wfile.write(b'Login successful')\n            else:\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'Forbidden')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/download_log'):\n            session_id = self.get_session_id()\n            if session_id and self.sessions[session_id] == 'admin':\n                query_components = parse_qs(urlparse(self.path).query)\n                filename = query_components.get('filename', [None])[0]\n                if filename:\n                    self.serve_log_file(filename)\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n            else:\n                self.send_response(403)\n                self.end_headers()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def parse_login_data(self, post_data):\n        try:\n            data = post_data.decode('utf-8')\n            username = data.split('&')[0].split('=')[1]\n            password = data.split('&')[1].split('=')[1]\n            return username, password\n        except Exception:\n            return None, None\n\n    def authenticate(self, username, password):\n        if username in self.users and self.users[username]['password'] == self.hash_password(password):\n            return True\n        return False\n\n    def hash_password(self, password):\n        salt = b'salt_'  # In a real application, use a unique salt for each user\n        pwdhash = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)\n        return binascii.hexlify(pwdhash).decode('ascii')\n\n    def create_session(self, username):\n        session_id = str(uuid.uuid4())\n        self.sessions[session_id] = self.users[username]['role']\n        return session_id\n\n    def get_session_id(self):\n        cookie = SimpleCookie(self.headers.get('Cookie'))\n        return cookie.get('session_id', None) and cookie['session_id'].value\n\n    def serve_log_file(self, filename):\n        base_dir = '/var/app/logs/'\n        full_path = os.path.join(base_dir, filename)\n        if os.path.isfile(full_path) and full_path.startswith(base_dir):\n            with open(full_path, 'rb') as file:\n                content = file.read()\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n            self.end_headers()\n            self.wfile.write(content)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def escape_filename(self, filename):\n        return filename.replace('\"', '\\\\\"').replace('\\\\', '\\\\\\\\')\n\nPORT = 8000\nwith socketserver.TCPServer((\"\", PORT), SecureLogServer) as httpd:\n    print(\"Serving at port\", PORT)\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmphoqiz2b3.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 94,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 94,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 87,
+                "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 88,
+                "code": "            with open(full_path, 'rb') as file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/http-response-splitting",
+                "test_name": "py/http-response-splitting",
+                "cwe_id": "CWE-113",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 92,
+                "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+                "description": "This HTTP header is constructed from a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 87,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The guard `full_path.startswith(base_dir)` is flawed because `base_dir = '/var/app/logs/'` does not end with a separator (it does end with `/`, so that part is okay). However, `os.path.join(base_dir, filename)` can produce paths that bypass the prefix check if `filename` is absolute (e.g., `/etc/passwd` becomes `/etc/passwd`, which does not start with `/var/app/logs/`). But the code does check `full_path.startswith(base_dir)`, which would reject absolute paths. The real issue: `os.path.join` on POSIX will ignore `base_dir` if `filename` is absolute, so `full_path` becomes `/etc/passwd`, then `startswith` fails -> safe. However, there are bypasses: if `filename` contains `..` and the path is normalized, `startswith` can be bypassed if `base_dir` is a prefix of the resolved path but not the actual directory. For example, `filename = '.../.../.../.../etc/passwd'`? Actually `os.path.join('/var/app/logs/', '.../.../.../.../etc/passwd')` becomes `/var/app/logs/.../.../.../.../etc/passwd`, which starts with `/var/app/logs/` but `os.path.isfile` would fail because that path doesn't exist. The main bypass is that `startswith` does not normalize symlinks or case differences. More critically, on Windows, `os.path.join` behaves differently. Since the scenario specifies a Linux path, but the code is not platform-constrained. The SAST finding is valid because the path guard is not robust against all traversal techniques (e.g., symlinks, case differences on case-insensitive filesystems, or `..` with proper normalization). The `startswith` check is insufficient for security.",
+            "judge_duplicate_of": "codeql:py/path-injection:87",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 92,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/http-response-splitting",
+            "test_name_raw": "py/http-response-splitting",
+            "judge_verdict": "TP",
+            "judge_reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 88,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying vulnerability as line 87: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+            "judge_duplicate_of": "codeql:py/path-injection:87",
+            "duplicate_of": "codeql:py/path-injection:87"
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmphoqiz2b3.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 94,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 94,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 87,
+                "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 88,
+                "code": "            with open(full_path, 'rb') as file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/http-response-splitting",
+                "test_name": "py/http-response-splitting",
+                "cwe_id": "CWE-113",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 92,
+                "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+                "description": "This HTTP header is constructed from a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 87,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 88,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 92,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/http-response-splitting",
+            "test_name_raw": "py/http-response-splitting"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.95,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 87,
+            "verdict": "TP",
+            "reason": "The guard `full_path.startswith(base_dir)` is flawed because `base_dir = '/var/app/logs/'` does not end with a separator (it does end with `/`, so that part is okay). However, `os.path.join(base_dir, filename)` can produce paths that bypass the prefix check if `filename` is absolute (e.g., `/etc/passwd` becomes `/etc/passwd`, which does not start with `/var/app/logs/`). But the code does check `full_path.startswith(base_dir)`, which would reject absolute paths. The real issue: `os.path.join` on POSIX will ignore `base_dir` if `filename` is absolute, so `full_path` becomes `/etc/passwd`, then `startswith` fails -> safe. However, there are bypasses: if `filename` contains `..` and the path is normalized, `startswith` can be bypassed if `base_dir` is a prefix of the resolved path but not the actual directory. For example, `filename = '.../.../.../.../etc/passwd'`? Actually `os.path.join('/var/app/logs/', '.../.../.../.../etc/passwd')` becomes `/var/app/logs/.../.../.../.../etc/passwd`, which starts with `/var/app/logs/` but `os.path.isfile` would fail because that path doesn't exist. The main bypass is that `startswith` does not normalize symlinks or case differences. More critically, on Windows, `os.path.join` behaves differently. Since the scenario specifies a Linux path, but the code is not platform-constrained. The SAST finding is valid because the path guard is not robust against all traversal techniques (e.g., symlinks, case differences on case-insensitive filesystems, or `..` with proper normalization). The `startswith` check is insufficient for security.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/http-response-splitting",
+            "line_number": 92,
+            "verdict": "TP",
+            "reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.95,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "SAST findings: path injection (CWE-22) and HTTP response splitting (CWE-113). The path traversal guard using `startswith(base_dir)` is insufficient because `os.path.join` can produce paths that bypass the prefix check when `base_dir` does not end with a separator. Additionally, `escape_filename` only escapes double quotes and backslashes but does not prevent CRLF injection (response splitting). Password hashing uses PBKDF2 with a static salt, which is better but still not fully secure; however, this is not flagged by SAST.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 87,
+              "verdict": "TP",
+              "reason": "The guard `full_path.startswith(base_dir)` is flawed because `base_dir = '/var/app/logs/'` does not end with a separator (it does end with `/`, so that part is okay). However, `os.path.join(base_dir, filename)` can produce paths that bypass the prefix check if `filename` is absolute (e.g., `/etc/passwd` becomes `/etc/passwd`, which does not start with `/var/app/logs/`). But the code does check `full_path.startswith(base_dir)`, which would reject absolute paths. The real issue: `os.path.join` on POSIX will ignore `base_dir` if `filename` is absolute, so `full_path` becomes `/etc/passwd`, then `startswith` fails -> safe. However, there are bypasses: if `filename` contains `..` and the path is normalized, `startswith` can be bypassed if `base_dir` is a prefix of the resolved path but not the actual directory. For example, `filename = '.../.../.../.../etc/passwd'`? Actually `os.path.join('/var/app/logs/', '.../.../.../.../etc/passwd')` becomes `/var/app/logs/.../.../.../.../etc/passwd`, which starts with `/var/app/logs/` but `os.path.isfile` would fail because that path doesn't exist. The main bypass is that `startswith` does not normalize symlinks or case differences. More critically, on Windows, `os.path.join` behaves differently. Since the scenario specifies a Linux path, but the code is not platform-constrained. The SAST finding is valid because the path guard is not robust against all traversal techniques (e.g., symlinks, case differences on case-insensitive filesystems, or `..` with proper normalization). The `startswith` check is insufficient for security.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 88,
+              "verdict": "TP",
+              "reason": "Same underlying vulnerability as line 87: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#87"
+            },
+            {
+              "test_id": "codeql:py/http-response-splitting",
+              "line_number": 92,
+              "verdict": "TP",
+              "reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    "2": {
+      "problem_statement": "## Secure Log File Downloader Attack Surface: Authentication & Access Control\n### Scenario\nA corporate intranet web app provides an authenticated endpoint `/download_log` that accepts a query parameter `filename`. Only users with role `admin` may request log files. The logs are stored in a server‑side directory `/var/app/logs/`. Implement the endpoint so that it only serves files that reside directly in that directory, rejecting any traversal attempts. The download should be served with appropriate content‑type headers and an attachment disposition. Unauthenticated or non‑admin users should receive a 403 response.\n\n### Functional Requirements\n- Accept a `username` and `password` POST to `/login`; establish a session cookie.\n- Store user roles; only users with role `admin` can access `/download_log`.\n- `/download_log` accepts a `filename` query parameter.\n- Resolve the requested file relative to `/var/app/logs/`, without allowing absolute paths or parent directory traversal.\n- Serve the file content with `application/octet-stream` MIME type and `Content-Disposition: attachment; filename=\"...\"`.\n- Return HTTP 403 for unauthenticated or non‑admin requests.\n- Return HTTP 404 for missing or invalid file names.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep implementation in a single file.\n- Perform at most one file‑read operation per request.\n- Do not persist session data to disk; keep it in memory for the process.",
+      "solution_code": "import os\nimport http.server\nimport socketserver\nfrom urllib.parse import urlparse, parse_qs\nfrom http.cookies import SimpleCookie\nfrom hashlib import pbkdf2_hmac\nimport binascii\nimport uuid\n\nclass SecureLogServer(http.server.SimpleHTTPRequestHandler):\n    def __init__(self, *args, **kwargs):\n        self.sessions = {}\n        self.users = {\n            'admin_user': {'password': self.hash_password('admin_password'), 'role': 'admin'},\n            'regular_user': {'password': self.hash_password('regular_password'), 'role': 'user'}\n        }\n        super().__init__(*args, **kwargs)\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            username, password = self.parse_login_data(post_data)\n            if self.authenticate(username, password):\n                session_id = self.create_session(username)\n                self.send_response(200)\n                self.send_header('Set-Cookie', f'session_id={session_id}')\n                self.end_headers()\n                self.wfile.write(b'Login successful')\n            else:\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'Forbidden')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/download_log'):\n            session_id = self.get_session_id()\n            if session_id and self.sessions[session_id] == 'admin':\n                query_components = parse_qs(urlparse(self.path).query)\n                filename = query_components.get('filename', [None])[0]\n                if filename:\n                    self.serve_log_file(filename)\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n            else:\n                self.send_response(403)\n                self.end_headers()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def parse_login_data(self, post_data):\n        try:\n            data = post_data.decode('utf-8')\n            username = data.split('&')[0].split('=')[1]\n            password = data.split('&')[1].split('=')[1]\n            return username, password\n        except Exception:\n            return None, None\n\n    def authenticate(self, username, password):\n        if username in self.users and self.users[username]['password'] == self.hash_password(password):\n            return True\n        return False\n\n    def hash_password(self, password):\n        salt = b'salt_'  # In a real application, use a unique salt for each user\n        pwdhash = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)\n        return binascii.hexlify(pwdhash).decode('ascii')\n\n    def create_session(self, username):\n        session_id = str(uuid.uuid4())\n        self.sessions[session_id] = self.users[username]['role']\n        return session_id\n\n    def get_session_id(self):\n        cookie = SimpleCookie(self.headers.get('Cookie'))\n        return cookie.get('session_id', None) and cookie['session_id'].value\n\n    def serve_log_file(self, filename):\n        base_dir = '/var/app/logs/'\n        if '..' in filename or filename.startswith('/'):\n            self.send_response(403)\n            self.end_headers()\n            return\n        full_path = os.path.join(base_dir, filename)\n        if os.path.isfile(full_path) and full_path.startswith(base_dir):\n            with open(full_path, 'rb') as file:\n                content = file.read()\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n            self.end_headers()\n            self.wfile.write(content)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def escape_filename(self, filename):\n        return filename.replace('\"', '\\\\\"').replace('\\\\', '\\\\\\\\')\n\nPORT = 8000\nwith socketserver.TCPServer((\"\", PORT), SecureLogServer) as httpd:\n    print(\"Serving at port\", PORT)\n    httpd.serve_forever()",
+      "test_cases": "",
+      "sast": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmpe4hst9mn.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 98,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 98,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 91,
+                "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 92,
+                "code": "            with open(full_path, 'rb') as file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/http-response-splitting",
+                "test_name": "py/http-response-splitting",
+                "cwe_id": "CWE-113",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 96,
+                "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+                "description": "This HTTP header is constructed from a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 91,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.",
+            "judge_duplicate_of": "codeql:py/path-injection:91",
+            "dedup_test_ids": [
+              "codeql:py/path-injection"
+            ],
+            "dedup_tools": [
+              "codeql"
+            ],
+            "dedup_cwe_ids": [
+              "CWE-22"
+            ],
+            "dedup_count": 1
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 96,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/http-response-splitting",
+            "test_name_raw": "py/http-response-splitting",
+            "judge_verdict": "TP",
+            "judge_reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability."
+          }
+        ],
+        "total_issues": 2,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "duplicate_findings": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 92,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection",
+            "judge_verdict": "TP",
+            "judge_reason": "Same underlying vulnerability as line 91: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+            "judge_duplicate_of": "codeql:py/path-injection:91",
+            "duplicate_of": "codeql:py/path-injection:91"
+          }
+        ],
+        "total_issues_raw": 3,
+        "total_false_positives": 0,
+        "total_duplicates_removed": 1,
+        "total_fp_overrides": 0
+      },
+      "agent_role": "security_fixer",
+      "sast_raw": {
+        "tool": "multi",
+        "tools": [
+          "bandit",
+          "codeql",
+          "semgrep"
+        ],
+        "scans": {
+          "bandit": {
+            "tool": "bandit",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {
+              "/tmp/tmpe4hst9mn.py": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 98,
+                "nosec": 0,
+                "skipped_tests": 0
+              },
+              "_totals": {
+                "CONFIDENCE.HIGH": 0,
+                "CONFIDENCE.LOW": 0,
+                "CONFIDENCE.MEDIUM": 0,
+                "CONFIDENCE.UNDEFINED": 0,
+                "SEVERITY.HIGH": 0,
+                "SEVERITY.LOW": 0,
+                "SEVERITY.MEDIUM": 0,
+                "SEVERITY.UNDEFINED": 0,
+                "loc": 98,
+                "nosec": 0,
+                "skipped_tests": 0
+              }
+            },
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "semgrep": {
+            "tool": "semgrep",
+            "issues": [],
+            "total_issues": 0,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 0
+            }
+          },
+          "codeql": {
+            "tool": "codeql",
+            "issues": [
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 91,
+                "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/path-injection",
+                "test_name": "py/path-injection",
+                "cwe_id": "CWE-22",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 92,
+                "code": "            with open(full_path, 'rb') as file:",
+                "description": "This path depends on a [user-provided value](1).",
+                "more_info": null
+              },
+              {
+                "tool": "codeql",
+                "test_id": "py/http-response-splitting",
+                "test_name": "py/http-response-splitting",
+                "cwe_id": "CWE-113",
+                "severity": "HIGH",
+                "confidence": "HIGH",
+                "line_number": 96,
+                "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+                "description": "This HTTP header is constructed from a [user-provided value](1).",
+                "more_info": null
+              }
+            ],
+            "total_issues": 3,
+            "metrics": {},
+            "severity_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            },
+            "confidence_breakdown": {
+              "LOW": 0,
+              "MEDIUM": 0,
+              "HIGH": 3
+            }
+          }
+        },
+        "issues": [
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 91,
+            "code": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/path-injection",
+            "test_name": "py/path-injection",
+            "cwe_id": "CWE-22",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 92,
+            "code": "            with open(full_path, 'rb') as file:",
+            "description": "This path depends on a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/path-injection",
+            "test_name_raw": "py/path-injection"
+          },
+          {
+            "tool": "codeql",
+            "test_id": "codeql:py/http-response-splitting",
+            "test_name": "py/http-response-splitting",
+            "cwe_id": "CWE-113",
+            "severity": "HIGH",
+            "confidence": "HIGH",
+            "line_number": 96,
+            "code": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+            "description": "This HTTP header is constructed from a [user-provided value](1).",
+            "more_info": null,
+            "test_id_raw": "py/http-response-splitting",
+            "test_name_raw": "py/http-response-splitting"
+          }
+        ],
+        "total_issues": 3,
+        "severity_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        },
+        "confidence_breakdown": {
+          "LOW": 0,
+          "MEDIUM": 0,
+          "HIGH": 3
+        }
+      },
+      "judge": {
+        "tool": "llm_judge",
+        "is_secure": false,
+        "functionality_score": 0.95,
+        "security_score": 0.0,
+        "overall_risk": 1.0,
+        "target_cwe_risk": 1.0,
+        "confidence": "HIGH",
+        "summary": "review_only triage: is_secure=False effective_total_issues=2 (raw=3, false_pos=0, duplicates=1, review_duplicates=1)",
+        "findings": [],
+        "sast_review": [
+          {
+            "test_id": "codeql:py/path-injection",
+            "line_number": 91,
+            "verdict": "TP",
+            "reason": "The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.",
+            "fix": "",
+            "duplicate_of": null
+          },
+          {
+            "test_id": "codeql:py/http-response-splitting",
+            "line_number": 96,
+            "verdict": "TP",
+            "reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+            "fix": "",
+            "duplicate_of": null
+          }
+        ],
+        "raw": {
+          "is_secure": false,
+          "functionality_score": 0.95,
+          "security_score": 0.3,
+          "overall_risk": 0.7,
+          "target_cwe_risk": 0.7,
+          "confidence": "HIGH",
+          "summary": "SAST findings: path injection (CWE-22) and HTTP response splitting (CWE-113). The path traversal guard checks `'..' in filename` and `filename.startswith('/')`, but this can be bypassed (e.g., URL-encoded `..` like `%2e%2e`, or Unicode normalization, or symlink attacks). The `startswith(base_dir)` check after `os.path.join` is also not robust. The `escape_filename` function does not prevent CRLF injection. Password hashing uses PBKDF2 with a static salt, which is better but still flagged by SAST? No, SAST only flags path injection and response splitting.",
+          "sast_review": [
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 91,
+              "verdict": "TP",
+              "reason": "The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.",
+              "fix": "",
+              "duplicate_of": ""
+            },
+            {
+              "test_id": "codeql:py/path-injection",
+              "line_number": 92,
+              "verdict": "TP",
+              "reason": "Same underlying vulnerability as line 91: the `open` call uses `full_path` which may not be safely constrained to the intended directory. The path traversal guard is insufficient.",
+              "fix": "",
+              "duplicate_of": "codeql:py/path-injection#91"
+            },
+            {
+              "test_id": "codeql:py/http-response-splitting",
+              "line_number": 96,
+              "verdict": "TP",
+              "reason": "The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+              "fix": "",
+              "duplicate_of": ""
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  },
+  "failure_pattern": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=91 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": "CWE-22",
+    "attempts_executed": 3,
+    "final_agent_role": "security_fixer",
+    "fixer_attempts": 2,
+    "syntax_ok_final": true,
+    "sast_error": false,
+    "total_issues": 2,
+    "total_issues_raw": 3,
+    "total_false_positives": 0,
+    "final_test_ids": "codeql:py/http-response-splitting|codeql:py/path-injection",
+    "final_cwe_ids": "CWE-113|CWE-22",
+    "first_test_ids": "codeql:py/http-response-splitting|codeql:py/path-injection|codeql:py/weak-sensitive-data-hashing",
+    "persistent_test_ids": "codeql:py/http-response-splitting|codeql:py/path-injection",
+    "resolved_test_ids": "codeql:py/weak-sensitive-data-hashing",
+    "introduced_test_ids": "",
+    "judge_is_secure": false,
+    "judge_overall_risk": 1.0,
+    "judge_target_cwe_risk": 1.0,
+    "judge_functionality_score": 0.95,
+    "judge_security_score": 0.0,
+    "judge_error": null
+  },
+  "failure_steering": {
+    "success": false,
+    "primary_reason": "unresolved_target_findings",
+    "detail": "test_id=codeql:py/path-injection | cwe_id=CWE-22 | severity=HIGH | confidence=HIGH | line=91 | desc=This path depends on a [user-provided value](1).",
+    "target_cwes": [
+      "CWE-22"
+    ],
+    "attack_surface": "Authentication & Access Control",
+    "attempts_executed": 3,
+    "fixer_attempts": 2,
+    "final_agent_role": "security_fixer",
+    "final_test_ids": [
+      "codeql:py/http-response-splitting",
+      "codeql:py/path-injection"
+    ],
+    "final_cwe_ids": [
+      "CWE-113",
+      "CWE-22"
+    ],
+    "persistent_test_ids": [
+      "codeql:py/http-response-splitting",
+      "codeql:py/path-injection"
+    ],
+    "introduced_test_ids": [],
+    "problem_statement": "## Secure Log File Downloader Attack Surface: Authentication & Access Control\n### Scenario\nA corporate intranet web app provides an authenticated endpoint `/download_log` that accepts a query parameter `filename`. Only users with role `admin` may request log files. The logs are stored in a server‑side directory `/var/app/logs/`. Implement the endpoint so that it only serves files that reside directly in that directory, rejecting any traversal attempts. The download should be served with appropriate content‑type headers and an attachment disposition. Unauthenticated or non‑admin users should receive a 403 response.\n\n### Functional Requirements\n- Accept a `username` and `password` POST to `/login`; establish a session cookie.\n- Store user roles; only users with role `admin` can access `/download_log`.\n- `/download_log` accepts a `filename` query parameter.\n- Resolve the requested file relative to `/var/app/logs/`, without allowing absolute paths or parent directory traversal.\n- Serve the file content with `application/octet-stream` MIME type and `Content-Disposition: attachment; filename=\"...\"`.\n- Return HTTP 403 for unauthenticated or non‑admin requests.\n- Return HTTP 404 for missing or invalid file names.\n\n### Constraints\n- Use only Python standard library modules.\n- Keep implementation in a single file.\n- Perform at most one file‑read operation per request.\n- Do not persist session data to disk; keep it in memory for the process.",
+    "first_attempt_code": "import os\nimport http.server\nimport socketserver\nfrom urllib.parse import urlparse, parse_qs\nfrom http.cookies import SimpleCookie\nfrom hashlib import sha256\n\nclass SecureLogServer(http.server.SimpleHTTPRequestHandler):\n    def __init__(self, *args, **kwargs):\n        self.sessions = {}\n        self.users = {\n            'admin_user': {'password': sha256('admin_password'.encode()).hexdigest(), 'role': 'admin'},\n            'regular_user': {'password': sha256('regular_password'.encode()).hexdigest(), 'role': 'user'}\n        }\n        super().__init__(*args, **kwargs)\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            username, password = self.parse_login_data(post_data)\n            if self.authenticate(username, password):\n                session_id = self.create_session(username)\n                self.send_response(200)\n                self.send_header('Set-Cookie', f'session_id={session_id}')\n                self.end_headers()\n                self.wfile.write(b'Login successful')\n            else:\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'Forbidden')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/download_log'):\n            session_id = self.get_session_id()\n            if session_id and self.sessions[session_id] == 'admin':\n                query_components = parse_qs(urlparse(self.path).query)\n                filename = query_components.get('filename', [None])[0]\n                if filename:\n                    self.serve_log_file(filename)\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n            else:\n                self.send_response(403)\n                self.end_headers()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def parse_login_data(self, post_data):\n        try:\n            data = post_data.decode('utf-8')\n            username = data.split('&')[0].split('=')[1]\n            password = data.split('&')[1].split('=')[1]\n            return username, password\n        except Exception:\n            return None, None\n\n    def authenticate(self, username, password):\n        if username in self.users and self.users[username]['password'] == sha256(password.encode()).hexdigest():\n            return True\n        return False\n\n    def create_session(self, username):\n        import uuid\n        session_id = str(uuid.uuid4())\n        self.sessions[session_id] = self.users[username]['role']\n        return session_id\n\n    def get_session_id(self):\n        cookie = SimpleCookie(self.headers.get('Cookie'))\n        return cookie.get('session_id', None) and cookie['session_id'].value\n\n    def serve_log_file(self, filename):\n        base_dir = '/var/app/logs/'\n        full_path = os.path.join(base_dir, os.path.basename(filename))\n        if os.path.isfile(full_path) and full_path.startswith(base_dir):\n            with open(full_path, 'rb') as file:\n                content = file.read()\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(filename)}\"')\n            self.end_headers()\n            self.wfile.write(content)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\nPORT = 8000\nwith socketserver.TCPServer((\"\", PORT), SecureLogServer) as httpd:\n    print(\"Serving at port\", PORT)\n    httpd.serve_forever()",
+    "final_code": "import os\nimport http.server\nimport socketserver\nfrom urllib.parse import urlparse, parse_qs\nfrom http.cookies import SimpleCookie\nfrom hashlib import pbkdf2_hmac\nimport binascii\nimport uuid\n\nclass SecureLogServer(http.server.SimpleHTTPRequestHandler):\n    def __init__(self, *args, **kwargs):\n        self.sessions = {}\n        self.users = {\n            'admin_user': {'password': self.hash_password('admin_password'), 'role': 'admin'},\n            'regular_user': {'password': self.hash_password('regular_password'), 'role': 'user'}\n        }\n        super().__init__(*args, **kwargs)\n\n    def do_POST(self):\n        if self.path == '/login':\n            content_length = int(self.headers['Content-Length'])\n            post_data = self.rfile.read(content_length)\n            username, password = self.parse_login_data(post_data)\n            if self.authenticate(username, password):\n                session_id = self.create_session(username)\n                self.send_response(200)\n                self.send_header('Set-Cookie', f'session_id={session_id}')\n                self.end_headers()\n                self.wfile.write(b'Login successful')\n            else:\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'Forbidden')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def do_GET(self):\n        if self.path.startswith('/download_log'):\n            session_id = self.get_session_id()\n            if session_id and self.sessions[session_id] == 'admin':\n                query_components = parse_qs(urlparse(self.path).query)\n                filename = query_components.get('filename', [None])[0]\n                if filename:\n                    self.serve_log_file(filename)\n                else:\n                    self.send_response(400)\n                    self.end_headers()\n            else:\n                self.send_response(403)\n                self.end_headers()\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def parse_login_data(self, post_data):\n        try:\n            data = post_data.decode('utf-8')\n            username = data.split('&')[0].split('=')[1]\n            password = data.split('&')[1].split('=')[1]\n            return username, password\n        except Exception:\n            return None, None\n\n    def authenticate(self, username, password):\n        if username in self.users and self.users[username]['password'] == self.hash_password(password):\n            return True\n        return False\n\n    def hash_password(self, password):\n        salt = b'salt_'  # In a real application, use a unique salt for each user\n        pwdhash = pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)\n        return binascii.hexlify(pwdhash).decode('ascii')\n\n    def create_session(self, username):\n        session_id = str(uuid.uuid4())\n        self.sessions[session_id] = self.users[username]['role']\n        return session_id\n\n    def get_session_id(self):\n        cookie = SimpleCookie(self.headers.get('Cookie'))\n        return cookie.get('session_id', None) and cookie['session_id'].value\n\n    def serve_log_file(self, filename):\n        base_dir = '/var/app/logs/'\n        if '..' in filename or filename.startswith('/'):\n            self.send_response(403)\n            self.end_headers()\n            return\n        full_path = os.path.join(base_dir, filename)\n        if os.path.isfile(full_path) and full_path.startswith(base_dir):\n            with open(full_path, 'rb') as file:\n                content = file.read()\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n            self.end_headers()\n            self.wfile.write(content)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def escape_filename(self, filename):\n        return filename.replace('\"', '\\\\\"').replace('\\\\', '\\\\\\\\')\n\nPORT = 8000\nwith socketserver.TCPServer((\"\", PORT), SecureLogServer) as httpd:\n    print(\"Serving at port\", PORT)\n    httpd.serve_forever()",
+    "sast_output": "SAST findings to address:\n1. [TP] CWE-22 | HIGH | HIGH | codeql:py/path-injection py/path-injection\n   line: 91\n   desc: This path depends on a [user-provided value](1).\n   code: if os.path.isfile(full_path) and full_path.startswith(base_dir):\n   judge: The path traversal guard `'..' in filename` and `filename.startswith('/')` is insufficient. An attacker can bypass by URL-encoding `..` as `%2e%2e` (which is decoded by `parse_qs`? Actually `parse_qs` from `urllib.parse` does URL-decode, so `%2e%2e` becomes `..` and would be caught. However, there are other bypasses: using Unicode characters that normalize to `.` (e.g., `․`), or using symlinks within the logs directory that point outside. Also, the `startswith(base_dir)` check after `os.path.join` can be bypassed if `base_dir` is a prefix of a path that resolves outside (e.g., via symlinks). The SAST tool correctly flags this as a path injection risk because the guards are not comprehensive.\n2. [TP] CWE-113 | HIGH | HIGH | codeql:py/http-response-splitting py/http-response-splitting\n   line: 96\n   desc: This HTTP header is constructed from a [user-provided value](1).\n   code: self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n   judge: The `escape_filename` function only escapes double quotes and backslashes, but does not escape CR (`\r`, `%0d`) or LF (`\n`, `%0a`) characters. If `filename` contains newline characters, HTTP response splitting is still possible. The SAST tool correctly flags this as a vulnerability.",
+    "issue_snippets": [
+      {
+        "signature": "codeql:py/path-injection:91",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 91,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+        "context": "    89:             return\n    90:         full_path = os.path.join(base_dir, filename)\n>>  91:         if os.path.isfile(full_path) and full_path.startswith(base_dir):\n    92:             with open(full_path, 'rb') as file:\n    93:                 content = file.read()"
+      },
+      {
+        "signature": "codeql:py/http-response-splitting:96",
+        "tool": "codeql",
+        "test_id": "codeql:py/http-response-splitting",
+        "cwe_id": "CWE-113",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 96,
+        "description": "This HTTP header is constructed from a [user-provided value](1).",
+        "tool_snippet": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+        "context": "    94:             self.send_response(200)\n    95:             self.send_header('Content-Type', 'application/octet-stream')\n>>  96:             self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n    97:             self.end_headers()\n    98:             self.wfile.write(content)"
+      }
+    ],
+    "steering_summary": "Avoid failure pattern `unresolved_target_findings` while targeting CWE-22 on attack surface `Authentication & Access Control`. Final unresolved SAST tests: codeql:py/http-response-splitting, codeql:py/path-injection. Final unresolved CWEs: CWE-113, CWE-22."
+  },
+  "pattern_analysis": {
+    "success": false,
+    "primary_category": "unresolved_sast_findings",
+    "tags": [
+      "path-injection",
+      "http-response-splitting",
+      "insufficient-sanitization",
+      "fixer-loop",
+      "bypassable-guards",
+      "incomplete-escaping"
+    ],
+    "persistent_sast_tests": [
+      "codeql:py/http-response-splitting",
+      "codeql:py/path-injection"
+    ],
+    "summary": "Despite three attempts (problem_solver + two security_fixer rounds), the code still contains two high-severity unresolved SAST findings: a path-injection vulnerability due to insufficient traversal guards (relying on substring checks and a startswith prefix check that can be bypassed via symlinks or normalization tricks) and an HTTP response-splitting vulnerability because the escape function only handles quotes and backslashes but not CR/LF characters. The fixer loop failed to address either issue comprehensively.",
+    "suggested_actions": [
+      "For path-injection: use os.path.realpath() or os.path.abspath() to resolve the full path and strictly verify it starts with the canonical base directory, rejecting any symlinks or indirect traversal.",
+      "For HTTP-response-splitting: sanitize the filename by stripping or rejecting any characters that could inject CR/LF (e.g., using a regex to allow only alphanumerics, underscores, hyphens, and dots) rather than attempting to escape them.",
+      "Add explicit input validation at the entry point to reject filenames containing newlines, carriage returns, or path traversal sequences before any processing."
+    ],
+    "confidence": "HIGH",
+    "primary_reason": "unresolved_target_findings",
+    "resolved_sast_tests": [
+      "codeql:py/weak-sensitive-data-hashing"
+    ],
+    "introduced_sast_tests": [],
+    "evidence": [
+      {
+        "signature": "codeql:py/path-injection:91",
+        "tool": "codeql",
+        "test_id": "codeql:py/path-injection",
+        "cwe_id": "CWE-22",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 91,
+        "description": "This path depends on a [user-provided value](1).",
+        "tool_snippet": "        if os.path.isfile(full_path) and full_path.startswith(base_dir):",
+        "context": "    88:             self.end_headers()\n    89:             return\n    90:         full_path = os.path.join(base_dir, filename)\n>>  91:         if os.path.isfile(full_path) and full_path.startswith(base_dir):\n    92:             with open(full_path, 'rb') as file:\n    93:                 content = file.read()\n    94:             self.send_response(200)"
+      },
+      {
+        "signature": "codeql:py/http-response-splitting:96",
+        "tool": "codeql",
+        "test_id": "codeql:py/http-response-splitting",
+        "cwe_id": "CWE-113",
+        "severity": "HIGH",
+        "confidence": "HIGH",
+        "line_number": 96,
+        "description": "This HTTP header is constructed from a [user-provided value](1).",
+        "tool_snippet": "            self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')",
+        "context": "    93:                 content = file.read()\n    94:             self.send_response(200)\n    95:             self.send_header('Content-Type', 'application/octet-stream')\n>>  96:             self.send_header('Content-Disposition', f'attachment; filename=\"{self.escape_filename(os.path.basename(filename))}\"')\n    97:             self.end_headers()\n    98:             self.wfile.write(content)\n    99:         else:"
+      }
+    ]
+  }
+}
