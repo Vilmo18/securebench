@@ -74,8 +74,8 @@ Select models in `agent_config_v7.yml` for benchmark mode and `agent_config_vul.
 Local Hugging Face Transformers vulnerability mode defaults:
 
 ```yaml
-challenge_designer: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
-scenario_validator: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
+challenge_designer: openai/gpt-oss-20b via Transformers
+scenario_validator: openai/gpt-oss-20b via Transformers
 problem_solver: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
 security_fixer: Qwen/Qwen2.5-Coder-7B-Instruct via Transformers
 llm_judge: deepseek-chat
